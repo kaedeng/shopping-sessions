@@ -1,0 +1,14 @@
+[package]
+name = "pqbench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+polars = { version = "0.55.2", features = ["parquet", "dtype-date"] }
+polars-core = "0.55.2"
+polars-arrow = "0.55.2"
+polars-parquet = "0.55.2"
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd", "snap", "lz4"] }
+arrow-array = "60.1.0"
+arrow-schema = "60.1.0"
