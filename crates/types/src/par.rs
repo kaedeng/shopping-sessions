@@ -159,7 +159,8 @@ fn pooled() -> bool {
 }
 
 /// Starts the threads of `workers` workers ahead of the first stage, when they are kept: a
-/// thread started while others already work waits for their page faults (see the top).
+/// thread started while others already work waits for their page faults (see the top). Call
+/// it after the mappings the caller itself still has to make.
 pub fn start(workers: usize) {
     if pooled() {
         pool::start(workers);

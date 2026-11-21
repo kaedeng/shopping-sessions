@@ -63,9 +63,12 @@ fn run() -> Result<(), String> {
     };
 
     let (data, out) = (dir("DATA_DIR", "/data"), dir("OUTPUT_DIR", "/output"));
-    // The workers' threads, before anything is mapped or allocated beside them (`types::par`).
-    par::start(types::env::number("NCPU", 8).max(1));
     let (ctx, ingest) = ingest::open(&data)?;
+    // The workers' threads (`types::par`), once the inputs are mapped: a new thread's first
+    // allocation makes its heap and takes a page fault on it, and started before, the seven
+    // of them held up the hundreds of mappings `open` makes (with two copies running the
+    // whole run was 15 ms longer at the median, 40 runs each in alternation).
+    par::start(ctx.workers);
     let parallel_alloc = ALLOC[types::env::pick("SS_ALLOC", ALLOC)] == "parallel";
     // Slot `scatter-wc`: how the person buckets are written (the parse partitions: `Ingest`).
     let scatter = types::parts::bucket_mode_from_env();
