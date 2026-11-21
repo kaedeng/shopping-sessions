@@ -650,6 +650,24 @@ unsafe fn place(
     // of a table that fits L2. Three arrays (ingest, time, user) were three lines a row, and
     // those accesses were two thirds of this stage.
     kept.clear();
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    // Emptied two slots a store, in 256-bit registers: left to the compiler this fill used
+    // 512-bit ones, the stage's only use of them (see the scan below for why that matters).
+    //
+    // SAFETY: room for `slots` records, an even number, each written before the length is
+    // set; a `PosEvent` is two words (`repr(C)`).
+    unsafe {
+        use core::arch::x86_64::*;
+        kept.reserve(slots);
+        let (low, high) = PosEvent::EMPTY.words();
+        let empty = _mm256_setr_epi64x(low as i64, high as i64, low as i64, high as i64);
+        debug_assert!(slots % 2 == 0);
+        for at in (0..slots).step_by(2) {
+            _mm256_storeu_si256(kept.as_mut_ptr().add(at).cast(), empty);
+        }
+        kept.set_len(slots);
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     kept.resize(slots, PosEvent::EMPTY);
     odd.clear();
     for (worker, out) in parsed.iter().enumerate() {
@@ -700,40 +718,48 @@ unsafe fn place(
     // The table's two columns (the `ts` of a valid kept copy, 0 for anything else, and the
     // user) and the runs, in one pass over the slots: a person's first event opens a run.
     let mut open = Open::none();
-    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq"))]
-    // Eight slots a step. When all eight are events of the open run, which is most steps, the
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"))]
+    // Four slots a step. When all four are events of the open run, which is most steps, the
     // run takes them from the registers: their order, their aliases, the last `ts`. Any other
     // step (a slot without an event, another person) goes event by event. One slot at a time
     // this pass was 18 instructions a slot, about 4% of a run at 20M.
     //
-    // SAFETY: `kept`, `times` and `users` hold `slots` entries, a multiple of 8, and a
+    // In 256-bit registers on purpose (AVX-512VL for the masks and the two-source permute):
+    // on Skylake and Cascade Lake Xeons even light 512-bit instructions lower the core's
+    // clock, and this stage has no other use for them. Eight slots a step measured the same.
+    //
+    // SAFETY: `kept`, `times` and `users` hold `slots` entries, a multiple of 4, and a
     // `PosEvent` is two words (`repr(C)`).
     unsafe {
         use core::arch::x86_64::*;
-        debug_assert!(slots % 8 == 0 && kept.len() == slots);
-        let all = |value: u64| _mm512_set1_epi64(value as i64);
-        // The first and second word of 8 records, from two loads of 4.
-        let (first_words, second_words) = (_mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14), _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15));
-        for at in (0..slots).step_by(8) {
-            let rows = kept.as_ptr().add(at).cast::<__m512i>();
-            let (a, b) = (_mm512_loadu_si512(rows), _mm512_loadu_si512(rows.add(1)));
+        debug_assert!(slots % 4 == 0 && kept.len() == slots);
+        let all = |value: u64| _mm256_set1_epi64x(value as i64);
+        // The first and second word of 4 records, from two loads of 2.
+        let (first_words, second_words) = (_mm256_setr_epi64x(0, 2, 4, 6), _mm256_setr_epi64x(1, 3, 5, 7));
+        for at in (0..slots).step_by(4) {
+            let rows = kept.as_ptr().add(at).cast::<__m256i>();
+            // The second load through `black_box`: seen as the 32 bytes after the first, the
+            // two become one 512-bit load and the permutes below 512-bit ones.
+            let (a, b) = (_mm256_loadu_si256(rows), _mm256_loadu_si256(std::hint::black_box(rows.add(1))));
             // `PosEvent`: u | ts << 32, then ingest | slot << 32 | flags << 48.
-            let (low, high) = (_mm512_permutex2var_epi64(a, first_words, b), _mm512_permutex2var_epi64(a, second_words, b));
-            let events = _mm512_test_epi64_mask(high, all(u64::from(POS_VALID) << 48));
-            let ts = _mm512_maskz_srli_epi64::<32>(events, low);
-            let u = _mm512_and_si512(low, all(0xFFFF_FFFF));
-            _mm256_storeu_si256(times.as_mut_ptr().add(at).cast(), _mm512_cvtepi64_epi32(ts));
-            _mm256_storeu_si256(users.as_mut_ptr().add(at).cast(), _mm512_cvtepi64_epi32(u));
-            let same = _mm512_cmpeq_epi64_mask(_mm512_srli_epi64::<{ ALIAS_BITS }>(u), all(u64::from(open.person)));
-            if events & same == 0xFF {
+            let (low, high) = (_mm256_permutex2var_epi64(a, first_words, b), _mm256_permutex2var_epi64(a, second_words, b));
+            let events = _mm256_test_epi64_mask(high, all(u64::from(POS_VALID) << 48));
+            let ts = _mm256_maskz_srli_epi64::<32>(events, low);
+            let u = _mm256_and_si256(low, all(0xFFFF_FFFF));
+            _mm_storeu_si128(times.as_mut_ptr().add(at).cast(), _mm256_cvtepi64_epi32(ts));
+            _mm_storeu_si128(users.as_mut_ptr().add(at).cast(), _mm256_cvtepi64_epi32(u));
+            let same = _mm256_cmpeq_epi64_mask(_mm256_srli_epi64::<{ ALIAS_BITS as i32 }>(u), all(u64::from(open.person)));
+            if events & same == 0xF {
                 // Each `ts` against the one before it, the run's last before the first.
-                let before = _mm512_alignr_epi64::<7>(ts, all(u64::from(open.last_ts)));
-                let alias = _mm512_and_si512(u, all(u64::from(ALIAS_MASK)));
-                let unfit = _mm512_cmplt_epu64_mask(ts, before) | _mm512_cmpge_epu64_mask(alias, all(u64::from(MASK_ALIASES)));
-                let bits = _mm512_sllv_epi64(all(1), _mm512_and_si512(alias, all(u64::from(MASK_ALIASES - 1))));
+                let before = _mm256_alignr_epi64::<3>(ts, all(u64::from(open.last_ts)));
+                let alias = _mm256_and_si256(u, all(u64::from(ALIAS_MASK)));
+                let unfit = _mm256_cmplt_epu64_mask(ts, before) | _mm256_cmpge_epu64_mask(alias, all(u64::from(MASK_ALIASES)));
+                let bits = _mm256_sllv_epi64(all(1), _mm256_and_si256(alias, all(u64::from(MASK_ALIASES - 1))));
+                // The four lanes' bits together.
+                let halves = _mm_or_si128(_mm256_castsi256_si128(bits), _mm256_extracti128_si256::<1>(bits));
                 open.unfit |= unfit != 0;
-                open.aliases |= _mm512_reduce_or_epi64(bits) as u64;
-                (open.last_ts, open.end) = (*times.get_unchecked(at + 7), at as u32 + 8);
+                open.aliases |= (_mm_cvtsi128_si64(halves) | _mm_extract_epi64::<1>(halves)) as u64;
+                (open.last_ts, open.end) = (*times.get_unchecked(at + 3), at as u32 + 4);
             } else {
                 let mut rest = events;
                 while rest != 0 {
@@ -744,7 +770,7 @@ unsafe fn place(
             }
         }
     }
-    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq")))]
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl")))]
     for (slot, row) in kept.iter().enumerate() {
         times[slot] = if valid(row) { row.ts() } else { 0 };
         users[slot] = row.u();
