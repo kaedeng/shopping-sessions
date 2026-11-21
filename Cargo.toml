@@ -33,7 +33,7 @@ default = [
     "dedup-partitioned",
     "sess-partitioned", "sess-purchase-side", "sort-std", "attr-sweep", "agg-dense",
     "out-arrow",
-    "fast-exit",
+    "fast-exit", "alloc-parallel",
 ]
 # types
 id-u64 = ["types/id-u64"]
@@ -62,6 +62,8 @@ agg-dense = ["sessions/agg-dense"]
 out-arrow = ["output/out-arrow"]
 # process
 fast-exit = []
+# Each stage's per-worker buffers built on the workers' own threads (`SS_ALLOC=serial|parallel`).
+alloc-parallel = []
 # Not a slot: `SS_TRACE=FILE` writes every task as a span, for ui.perfetto.dev (implementation.md).
 trace = ["types/trace"]
 # A process has one global allocator, so this one swaps at build time; no env var.

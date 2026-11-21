@@ -4,8 +4,9 @@
 //! CONTRACT (the binary depends on exactly this; the bodies are the implementer's):
 //! - `LinkTable::person(&self, id: Id) -> Id`, here
 //! - `build(pairs: &[[Id; 2]]) -> LinkTable`, slot `links-serial`
-//! - `scatter_events(table: &LinkTable, kept: &[EventRec], bucket_bits: u32, out: &mut [Vec<PersonEvent>])`
-//!   and `scatter_clicks(table: &LinkTable, clicks: &[ClickRec], bucket_bits: u32, out: &mut [Vec<ClickRec>])`,
+//! - `scatter_events(table: &LinkTable, kept: &[EventRec], bucket_bits: u32, out: &mut Parts<PersonEvent>)`
+//!   and `scatter_clicks(table: &LinkTable, clicks: &[ClickRec], bucket_bits: u32, out: &mut Parts<ClickRec>)`
+//!   (`types::parts::Parts`: one list per person bucket),
 //!   slot `lookup-prefetch`
 
 use std::hint::select_unpredictable;

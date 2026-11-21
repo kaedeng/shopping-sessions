@@ -37,10 +37,10 @@ fn parse_dir(data: &Path, ctx: &Ctx, chunk: usize, batch: usize, (parse, links):
     for task in 0..ingest.tasks() {
         ingest.parse(ctx, task, &mut out);
     }
-    for (at, part) in out.parts.iter().enumerate() {
-        assert!(part.iter().all(|e| (hash(e.id) >> (64 - ctx.part_bits)) as usize == at));
+    for at in 0..out.parts.lists() {
+        assert!(out.parts.pieces(at).iter().all(|piece| piece.iter().all(|e| (hash(e.id) >> (64 - ctx.part_bits)) as usize == at)));
     }
-    let mut events: Vec<EventRec> = out.parts.into_iter().flatten().collect();
+    let mut events: Vec<EventRec> = out.parts.iter().copied().collect();
     events.sort_by_key(event_key);
     let mut clicks = out.clicks;
     clicks.sort_by_key(|c| (c.user, c.click, c.ts, c.campaign));

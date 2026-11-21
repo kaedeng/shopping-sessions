@@ -33,11 +33,12 @@ fn main() {
         });
         let seconds = started.elapsed().as_secs_f64();
         best = best.min(seconds);
-        let events = outs.iter().flat_map(|out| &out.parts).flatten();
+        let events = outs.iter().flat_map(|out| out.parts.iter());
         let (rows, valid) = events.fold((0, 0), |(rows, valid), e| (rows + 1, valid + (e.flags & VALID) as usize));
         let clicks: usize = outs.iter().map(|out| out.clicks.len()).sum();
+        let spilled: usize = outs.iter().map(|out| out.parts.spilled()).sum();
         eprintln!(
-            "{seconds:.3} s ({:.1} ms to open, {:.1} ms to allocate): {} tasks, {rows} event rows ({valid} valid), {clicks} valid clicks, {} links",
+            "{seconds:.3} s ({:.1} ms to open, {:.1} ms to allocate): {} tasks, {rows} event rows ({valid} valid), {clicks} valid clicks, {} links, {spilled} partitions spilled",
             opened * 1e3,
             (allocated - opened) * 1e3,
             ingest.tasks(),

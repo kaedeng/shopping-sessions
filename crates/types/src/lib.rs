@@ -12,6 +12,7 @@ pub mod id;
 pub mod mem;
 #[cfg(feature = "par-counter")]
 pub mod par;
+pub mod parts;
 #[cfg(feature = "rec-32")]
 pub mod record;
 pub mod rows;

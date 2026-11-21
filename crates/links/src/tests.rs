@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use types::hash::person_hash;
 use types::id::{SLOW, pack};
+use types::parts::Parts;
 use types::record::{ClickRec, EventRec, PersonEvent, VALID};
 
 use crate::{build, scatter_clicks, scatter_events};
@@ -214,8 +215,13 @@ fn scatter_puts_each_record_in_its_persons_bucket() {
             })
             .collect();
         let kept: Vec<EventRec> = events.iter().map(|e| e.0).collect();
-        let mut out = vec![Vec::new(); 1 << bits];
-        scatter_events(&table, &kept, bits, &mut out);
+        // A room of 3 makes the busier buckets spill, so both pieces of a list are checked.
+        fn lists<T: Copy>(parts: &Parts<T>) -> Vec<Vec<T>> {
+            (0..parts.lists()).map(|list| parts.pieces(list).concat()).collect()
+        }
+        let mut parts = Parts::new(1 << bits, 3);
+        scatter_events(&table, &kept, bits, &mut parts);
+        let out = lists(&parts);
         let mut expected = vec![Vec::new(); 1 << bits];
         for (rec, user) in events.iter().filter(|e| e.0.flags & VALID != 0) {
             let person = person(user);
@@ -230,8 +236,9 @@ fn scatter_puts_each_record_in_its_persons_bucket() {
             })
             .collect();
         let recs: Vec<ClickRec> = clicks.iter().map(|c| c.0).collect();
-        let mut out = vec![Vec::new(); 1 << bits];
-        scatter_clicks(&table, &recs, bits, &mut out);
+        let mut parts = Parts::new(1 << bits, 3);
+        scatter_clicks(&table, &recs, bits, &mut parts);
+        let out = lists(&parts);
         let mut expected = vec![Vec::new(); 1 << bits];
         for (rec, user) in &clicks {
             let person = person(user);

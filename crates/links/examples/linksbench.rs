@@ -12,6 +12,7 @@ use std::time::Instant;
 use types::hash::{C1, C2, person_hash};
 use types::id::{Id, pack};
 use types::par;
+use types::parts::Parts;
 use types::record::{EventRec, PersonEvent, VALID};
 
 const ROWS: usize = 62_000_000;
@@ -136,8 +137,7 @@ fn lookup(workers: usize) {
     let per_part = rows.len().div_ceil(parts);
     let room = rows.len() / workers / (1 << BUCKET_BITS) * 9 / 8 + 64;
     let run = |with_lookup: bool| {
-        let mut out: Vec<Vec<Vec<PersonEvent>>> =
-            (0..workers).map(|_| (0..1 << BUCKET_BITS).map(|_| Vec::with_capacity(room)).collect()).collect();
+        let mut out: Vec<Parts<PersonEvent>> = (0..workers).map(|_| Parts::new(1 << BUCKET_BITS, room)).collect();
         let started = Instant::now();
         par::run(&mut out, parts, |_, buckets, part| {
             let kept = &rows[(part * per_part).min(rows.len())..((part + 1) * per_part).min(rows.len())];
@@ -148,7 +148,7 @@ fn lookup(workers: usize) {
             }
         });
         let secs = started.elapsed().as_secs_f64();
-        let check: u64 = out.iter().flatten().flatten().fold(0, |sum, e| sum.wrapping_add(e.person));
+        let check: u64 = out.iter().flat_map(Parts::iter).fold(0, |sum, e| sum.wrapping_add(e.person));
         (secs, check)
     };
     let (mut bare, mut looked) = (f64::MAX, f64::MAX);
@@ -163,11 +163,11 @@ fn lookup(workers: usize) {
 }
 
 /// The scatter `scatter_events` does, with the user as its own person.
-fn bare_scatter(kept: &[EventRec], out: &mut [Vec<PersonEvent>]) {
+fn bare_scatter(kept: &[EventRec], out: &mut Parts<PersonEvent>) {
     for r in kept {
         if r.flags & VALID != 0 {
             let person = r.user;
-            out[(person_hash(person) >> (64 - BUCKET_BITS)) as usize].push(PersonEvent { person, ts: r.ts, pay: r.pay });
+            out.push((person_hash(person) >> (64 - BUCKET_BITS)) as usize, PersonEvent { person, ts: r.ts, pay: r.pay });
         }
     }
 }
