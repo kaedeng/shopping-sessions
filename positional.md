@@ -19,7 +19,7 @@ So with the event key, an `event_id` is the row's index in a table that is dedup
 2. **Parse** (`ingest::pos`). One 16-byte `PosEvent` per event line into the list of its number's partition, a range of 2^12 to 2^16 numbers; a valid purchase's `pay` beside it; a click into the list of its person's range. The links are read beside the parse. A worker reads each chunk with one `pread` into a buffer it keeps (`Ingest::read`); the mapping is the fallback.
    - `pos-fused`, the pick (`pos::wide::fused`): no tokenizer and no fields. Per line, scalar code finds the separators (two 64-byte windows for an event line: the first three commas, then three commas and the newline; one window for a click line), checks nothing else, and copies what the decode needs: each window's separator and quote bits, and the raw bytes at the fields as words. That is 88 instructions a line. Per 8 rows the decode does the rest in registers: the quote rules (`pairs`: one subtraction shows every quote is one of a wrapping pair), where each field starts and how long it is, the fields' words with a wrapping quote shifted off (`cut`), the dates found among the table's calendar months (`Dates::date_wide`, no lookup), both IDs, `ts` in all three forms, `ingest_ts`, and for clicks the `click_id` packed (`types::id::wide::pack`). A row that is plainly ordinary becomes a record straight from the registers. A purchase keeps that record and has only its price and product read row by row. Every other row (dirty, odd, not of the usual shape) is tokenized again from its line's offset and goes through the row function `event_row`.
    - `pos-wide` and `tok-shape`, kept as `SS_POS_DECODE=wide`: the same kernels fed by a tokenizer (`Shape`: the two windows, as fields) and a collector that copies each field's words.
-3. **Place** (`place`). Each partition writes its rows into a 16-byte slot per event number, keeping the copy with the smallest `ingest`; an invalid kept copy leaves no event. Then it lists the kept purchases and the runs: stretches of the table whose events are one person's. Each click range is grouped by person with a counting scatter. The links are alias masks grown in one pass (`Links::build`): a person's mask starts with its first link and takes every link that touches it; what stays apart after a fixpoint is a second component, and that person goes to the classic lane.
+3. **Place** (`place`). Each partition writes its rows into a 16-byte slot per event number, keeping the copy with the smallest `ingest`; an invalid kept copy leaves no event. Then it lists the kept purchases and the runs: stretches of the table whose events are one person's, read 8 slots a step (a step whose slots all continue the open run is taken from the registers). Each click range is grouped by person with a counting scatter. The links are read by shape, each ID with its scrambled value (`Ingest::pos_links`), and become alias masks grown in one pass (`Links::build`): a person's mask starts with its first link and takes every link that touches it; what stays apart after a fixpoint is a second component, and that person goes to the classic lane.
 4. **Sessions**, partition by partition: a run goes straight through `sessions::positional::person`: the gaps, the purchases, the credit and the counters of the classic code, with the assists counted per stretch of sessions (`attr-interval`) instead of once per session. A run that crosses partitions belongs to the one it starts in.
 
 ## Why the output is the classic pipeline's
@@ -58,16 +58,16 @@ x86 box (Ryzen 7 7800X3D, Docker Desktop on WSL2), `ss-p20`: seed 7, 20M events.
 
 | | Classic | Positional, `pos-wide` | Positional, `pos-fused` |
 | --- | --- | --- | --- |
-| One core (`NCPU=1`), instructions | 24.9 G | 16.4 G | 10.0 G |
-| 8 cores, a core per worker, 20M | about 470 ms | 404 ms | 304 ms |
-| Two workers per core, 20M | 747 ms | 634 ms | 467 ms |
+| One core (`NCPU=1`), instructions | 24.9 G | 16.4 G | 9.7 G |
+| 8 cores, a core per worker, 20M | about 470 ms | 396 ms | 304 ms |
+| Two workers per core, 20M | 747 ms | 578 ms | 477 ms |
 | 8 cores, 60M (`ss-full`) | 2.70 s | 1.39 s | 0.84 s |
 
 The process's own total (`SS_TIMING=1`), medians; the last two columns were measured together on 2026-11-21. Wall times on this box move by about 5% between sessions, the instruction count by a fraction of a percent: steer by the count, by `perf stat`'s task clock and cycles over several rounds, and by paired runs. 60M with two processes at once is not a fair number here (the VM's 15.6 GB starts reclaiming the page cache).
 
-Stages with two workers per core at 20M: parse 262, place 81, runs 6, sessions 68, classic lane 6, output 18 ms.
+Stages with two workers per core at 20M: parse 267, place 82, runs 5, sessions 79, classic lane 6, output 24 ms. The image built from the tree, with the scorer's flags, against the same image of the tree before `pos-fused`: 860 ms against 952 ms of `docker run` wall time, of which about 350 ms is Docker's own on this box.
 
-Where an event row's instructions are now, about 200 (it was 670 before `pos-wide` and 360 with it): the per-line loop 88, the decode 84 (640 per 8 rows), the scatter 25, and the rows that take the row code about 5 averaged over all. One core, 10.0 G in all: event lines 4.3 G, place 1.2 G, sessions 1.25 G with 0.6 G more in the day rows and the click sorts, click lines 0.8 G, links 0.55 G, output 0.4 G. At 20M about 1.4% of the events take the classic lane: 6,507 of 666,666 runs.
+Where an event row's instructions are now, about 200 (it was 670 before `pos-wide` and 360 with it): the per-line loop 88, the decode 84 (640 per 8 rows), the scatter 25, and the rows that take the row code about 5 averaged over all. One core, 9.7 G in all: event lines 4.3 G, place 1.05 G, sessions 1.25 G with 0.6 G more in the day rows and the click sorts, click lines 0.8 G, links 0.4 G, output 0.4 G. At 20M about 1.4% of the events take the classic lane: 6,507 of 666,666 runs.
 
 With 8 workers the kernel takes 19% of the cycles: 7% zeroing the fresh pages of the lists, the table and the output (about 1.2 GB), the rest copying the input and mapping pages.
 
@@ -86,6 +86,7 @@ With 8 workers the kernel takes 19% of the cycles: 7% zeroing the fresh pages of
 - **Other partition sizes** (`SS_POS_SHIFT` 12 to 16) and **other chunk sizes** (128 KB to 1 MB): no difference beyond the noise with one process.
 - **The whole row code for a purchase**: 600 instructions each for 3% of the rows, 4% of the run. The decode's record is right for a purchase but for the price and the product.
 - **A counting sort of the links and a union-find per person**: replaced by the alias masks, 0.2 G instructions less, the same classification.
+- **A row's raw bytes copied as vectors** (16 or 32 bytes a field, a row's together) and taken apart 8 rows at a time in the decode, instead of a word at a time into one array per word: 9.69 G to 9.67 G instructions for 80 lines more. Not kept.
 
 ## Not done yet
 
