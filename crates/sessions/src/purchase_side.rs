@@ -5,8 +5,8 @@
 //! Contract, kept by every alternative (`sess-wide` sorts `(key, pay)` records instead):
 //! - `clear(rows)` forgets the last bucket and makes room for `rows` events;
 //! - `extend(events)` adds events as `(key, pay)`, `pay` as in `PersonEvent`;
-//! - `sort(key_bits)` orders the rows by key (slot `sort-*`) and puts a sentinel key
-//!   `u64::MAX` after the last;
+//! - `sort(key_bits, low_bits)` orders the rows by key (slot `sort-*`, whose contract the two
+//!   widths are) and puts a sentinel key `u64::MAX` after the last;
 //! - `key(i)`, `i <= rows`: the `i`-th key in order, the sentinel at `rows`;
 //! - `purchases(range, f)`: `range` is one session's rows in sorted order, every row of its
 //!   last key included, ranges ascending and disjoint; calls `f(price, category)` for each
@@ -23,7 +23,7 @@ pub struct Rows {
     side: Vec<(u64, u32)>,
     /// The first purchase not yet handed out.
     next: usize,
-    scratch: Vec<u64>,
+    scratch: crate::SortScratch,
 }
 
 impl Rows {
@@ -47,8 +47,8 @@ impl Rows {
         }));
     }
 
-    pub fn sort(&mut self, key_bits: u32) {
-        crate::sort_std::sort(&mut self.keys, key_bits, &mut self.scratch);
+    pub fn sort(&mut self, key_bits: u32, low_bits: u32) {
+        crate::key_sort()(&mut self.keys, key_bits, low_bits, &mut self.scratch);
         self.keys.push(u64::MAX);
         // Equal keys are equal timestamps of one person, so one session: their order is free.
         self.side.sort_unstable_by_key(|&(key, _)| key);

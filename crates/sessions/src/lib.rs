@@ -5,8 +5,9 @@
 //!
 //! Each slot is one module behind its feature, its own contract at the top of its file:
 //! `sess-partitioned` (the bucket pipeline), `sess-purchase-side` (where a purchase's price
-//! and category ride through the sort), `sort-std` (the key sort), `attr-sweep` (credit and
-//! assists), `agg-dense` (both tables' counters). `implementation.md` has the choices inside them.
+//! and category ride through the sort), `sort-radix`, `sort-grouped` and `sort-std` (the key sort, `SS_SORT`),
+//! `attr-sweep` (credit and assists), `agg-dense` (both tables' counters). `implementation.md` has
+//! the choices inside them.
 
 #[cfg(feature = "agg-dense")]
 mod agg_dense;
@@ -16,6 +17,10 @@ mod attr_sweep;
 mod partitioned;
 #[cfg(feature = "sess-purchase-side")]
 mod purchase_side;
+#[cfg(feature = "sort-grouped")]
+mod sort_grouped;
+#[cfg(feature = "sort-radix")]
+mod sort_radix;
 #[cfg(feature = "sort-std")]
 mod sort_std;
 #[cfg(test)]
@@ -31,6 +36,40 @@ struct Click {
     ts: u32,
     campaign: u32,
     id: Id,
+}
+
+#[cfg(not(any(feature = "sort-radix", feature = "sort-grouped", feature = "sort-std")))]
+compile_error!("sessions needs a key sort: enable `sort-radix`, `sort-grouped` or `sort-std`");
+
+/// A key sort's spare buffers, one set per worker: any length on entry, left in any state.
+#[derive(Default)]
+pub(crate) struct SortScratch {
+    keys: Vec<u64>,
+    /// `sort-grouped`: where each group's keys start. `sort-radix`: every digit's counts.
+    starts: Vec<u32>,
+}
+
+/// The sort slot's contract: `sort(keys, key_bits, low_bits, scratch)` leaves `keys` ascending.
+/// Every key is below `1 << key_bits`, and its bits from `low_bits` up are a dense group number
+/// (the bucket-local person), which an implementation may use. `keys` is a `Vec` so that one
+/// may swap it with a scratch buffer instead of copying back.
+type SortFn = fn(&mut Vec<u64>, u32, u32, &mut SortScratch);
+
+/// The key sort `SS_SORT` picks among those compiled in, read once.
+fn key_sort() -> SortFn {
+    static PICK: std::sync::OnceLock<SortFn> = std::sync::OnceLock::new();
+    *PICK.get_or_init(|| {
+        let options: &[(&str, SortFn)] = &[
+            #[cfg(feature = "sort-grouped")]
+            ("grouped", sort_grouped::sort),
+            #[cfg(feature = "sort-std")]
+            ("std", sort_std::sort),
+            #[cfg(feature = "sort-radix")]
+            ("radix", sort_radix::sort),
+        ];
+        let names: Vec<&str> = options.iter().map(|option| option.0).collect();
+        options[types::env::pick("SS_SORT", &names)].1
+    })
 }
 
 /// One worker's results and reusable buffers.

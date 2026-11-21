@@ -62,19 +62,38 @@ impl Ctx {
         let ts_end = (window_end - origin) as u32;
         let day0 = window_start.div_euclid(DAY);
 
-        let mut categories: Vec<&[u8]> = products.iter().map(|&(_, category)| category).collect();
-        categories.push(b"unknown");
-        categories.sort_unstable();
-        categories.dedup();
-        // shortcut: a category index shares 8 bits with the price in `pay` and 0xFF is null, so
-        // at most 255 categories (the generator has 21 with `unknown`); widen `pay` beyond that.
-        if categories.len() > NO_CATEGORY as usize {
-            return Err(format!("{} categories, at most 255 supported", categories.len()));
+        // The distinct names in order of first appearance, and each product's place among
+        // them: a scan of the few names per product (the last match first, since any order
+        // beats sorting one name per product, which took 4 of the lookup files' 6 ms).
+        let mut names: Vec<&[u8]> = vec![b"unknown"];
+        let mut seen: Vec<u8> = Vec::with_capacity(products.len());
+        let mut last = 0;
+        for &(_, category) in products {
+            if names[last] != category {
+                last = match names.iter().position(|name| *name == category) {
+                    Some(at) => at,
+                    // shortcut: a category index shares 8 bits with the price in `pay` and 0xFF
+                    // is null, so at most 255 categories (the generator has 21 with `unknown`);
+                    // widen `pay` beyond that.
+                    None if names.len() >= NO_CATEGORY as usize => {
+                        return Err(format!("more than {NO_CATEGORY} categories, at most {NO_CATEGORY} supported"));
+                    }
+                    None => {
+                        names.push(category);
+                        names.len() - 1
+                    }
+                };
+            }
+            seen.push(last as u8);
         }
+        // Numbered in byte order, so a larger index is a larger name.
+        let mut categories = names.clone();
+        categories.sort_unstable();
+        let rank: Vec<u8> = names.iter().map(|name| categories.binary_search(name).unwrap() as u8).collect();
         let category_of = |name: &[u8]| categories.binary_search(&name).unwrap() as u8;
         let mut product_map = IdMap::new(products.len());
-        for &(product, category) in products {
-            product_map.insert(product, category_of(category));
+        for (&(product, _), &at) in products.iter().zip(&seen) {
+            product_map.insert(product, rank[at as usize]);
         }
 
         let mut campaign_index = IdMap::new(campaigns.len());

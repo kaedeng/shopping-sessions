@@ -8,9 +8,11 @@ publish.workspace = true
 types = { path = "../types" }
 
 [features]
-default = ["sess-partitioned", "sess-purchase-side", "sort-std", "attr-sweep", "agg-dense"]
+default = ["sess-partitioned", "sess-purchase-side", "sort-std", "sort-grouped", "attr-sweep", "agg-dense"]
 sess-partitioned = []
 sess-purchase-side = []
 sort-std = []
+sort-grouped = []
+sort-radix = []
 attr-sweep = []
 agg-dense = []

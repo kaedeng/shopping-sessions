@@ -262,6 +262,17 @@ impl<T: Copy> Parts<T> {
     pub fn iter(&self) -> impl Iterator<Item = &T> {
         (0..self.lists()).flat_map(move |list| self.pieces(list)).flatten()
     }
+
+    /// Slot `free-early`: empties every list and hands the region's pages back to the kernel on
+    /// the calling thread (`mem::release`), instead of leaving them to the one thread that
+    /// exits. The lists can be filled again afterwards.
+    pub fn release(&mut self) {
+        self.lens.fill(0);
+        self.spill.iter_mut().for_each(|spill| *spill = Vec::new());
+        // SAFETY: every list is empty now, so no slot of the region is read before it is
+        // written again.
+        unsafe { crate::mem::release(self.region.ptr.as_ptr().cast(), self.region.layout.size()) };
+    }
 }
 
 /// Copies `bytes` (a multiple of 64) from `from` to `to`, both 64-byte aligned, with streaming
@@ -322,6 +333,25 @@ mod tests {
         check(|n| (n, n * 3));
         check(|n| [n, n + 1, n + 2, n + 3]);
         check(|n| Rec24([n, !n, n * 7]));
+    }
+
+    #[test]
+    fn release_empties_every_list() {
+        for combine in [None, Some(1), Some(4)] {
+            let mut parts = Parts::new(3, 4, combine);
+            for n in 0..100u64 {
+                parts.push((n % 3) as usize, [n; 2]);
+            }
+            parts.release();
+            assert!(parts.is_empty() && parts.spilled() == 0, "combine {combine:?}");
+            // The lists fill again from their first slot.
+            for n in 0..7u64 {
+                parts.push(2, [n; 2]);
+            }
+            parts.fence();
+            assert_eq!(parts.pieces(2).concat(), (0..7).map(|n| [n; 2]).collect::<Vec<_>>(), "combine {combine:?}");
+            assert_eq!(parts.len(), 7);
+        }
     }
 
     #[test]
