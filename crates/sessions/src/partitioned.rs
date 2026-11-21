@@ -222,7 +222,7 @@ pub fn bucket<'a>(
     clicks: impl Iterator<Item = &'a [ClickRec]> + Clone,
     agg: &mut Agg,
 ) {
-    let Agg { user_daily, bucket: scratch, rows, attr, day, counters } = agg;
+    let Agg { user_daily, bucket: scratch, rows, attr, day, counters, .. } = agg;
     let n: usize = events.clone().map(<[_]>::len).sum();
     let ts_bits = ctx.ts_bits;
     scratch.reset(n, ctx.bucket_bits);

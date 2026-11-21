@@ -28,7 +28,7 @@ mimalloc = { version = "0.1", optional = true }
 [features]
 default = [
     "id-u64", "rec-32", "hash-mul", "table-linear", "par-counter",
-    "reader-mmap", "tok-mask", "ts-table",
+    "reader-mmap", "tok-mask", "tok-shape", "ts-table",
     "links-serial", "lookup-prefetch",
     "dedup-partitioned",
     "sess-partitioned", "sess-purchase-side", "sort-grouped", "sort-std", "attr-sweep", "agg-dense",
@@ -49,6 +49,7 @@ reader-mmap = ["ingest/reader-mmap"]
 reader-populate = ["ingest/reader-populate"]
 tok-mask = ["ingest/tok-mask"]
 tok-scalar = ["ingest/tok-scalar"]
+tok-shape = ["ingest/tok-shape"]
 ts-table = ["ingest/ts-table"]
 # links
 links-serial = ["links/links-serial"]

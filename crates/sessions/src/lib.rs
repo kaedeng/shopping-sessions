@@ -11,6 +11,8 @@
 
 #[cfg(feature = "agg-dense")]
 mod agg_dense;
+#[cfg(feature = "pipe-positional")]
+mod attr_interval;
 #[cfg(feature = "attr-sweep")]
 mod attr_sweep;
 #[cfg(feature = "sess-partitioned")]
@@ -81,6 +83,9 @@ pub struct Agg {
     bucket: partitioned::Scratch,
     rows: purchase_side::Rows,
     attr: attr_sweep::Attr,
+    /// The positional pipeline's attribution (`attr-interval`).
+    #[cfg(feature = "pipe-positional")]
+    stretch: attr_interval::Attr,
     day: agg_dense::Day,
     counters: agg_dense::Counters,
 }
@@ -92,6 +97,8 @@ impl Agg {
             bucket: Default::default(),
             rows: Default::default(),
             attr: attr_sweep::Attr::new(ctx),
+            #[cfg(feature = "pipe-positional")]
+            stretch: attr_interval::Attr::new(ctx),
             day: Default::default(),
             counters: agg_dense::Counters::new(ctx),
         }

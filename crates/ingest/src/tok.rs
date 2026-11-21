@@ -202,7 +202,7 @@ mod mask {
     /// The `,`, `\n` and `"` bits of the 64 bytes at `p`.
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
-    unsafe fn masks(p: *const u8) -> [u64; 3] {
+    pub(super) unsafe fn masks(p: *const u8) -> [u64; 3] {
         use core::arch::aarch64::*;
         // SAFETY: the caller guarantees 64 readable bytes.
         unsafe {
@@ -222,7 +222,7 @@ mod mask {
     /// The `,`, `\n` and `"` bits of the 64 bytes at `p`.
     #[cfg(target_arch = "x86_64")]
     #[inline(always)]
-    unsafe fn masks(p: *const u8) -> [u64; 3] {
+    pub(super) unsafe fn masks(p: *const u8) -> [u64; 3] {
         use core::arch::x86_64::*;
         // SAFETY: the caller guarantees 64 readable bytes; AVX2 is compiled in (cfg above).
         unsafe {
@@ -234,6 +234,177 @@ mod mask {
                 lo | hi << 32
             };
             [bits(b','), bits(b'\n'), bits(b'"')]
+        }
+    }
+}
+
+#[cfg(all(feature = "tok-shape", any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64")))]
+pub(crate) use shape::Shape;
+#[cfg(all(feature = "tok-shape", not(any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64"))))]
+pub(crate) use Scalar as Shape;
+
+/// Slot `tok-shape`: the event and click lines read by their shape instead of by position
+/// lists. An event line's first three fields (`event_id`, `user_id`, `ts`) end within 64 bytes
+/// of its first byte whenever they are well-formed and generated, and the other four within 64
+/// bytes of the third comma, so a line is two 64-bit windows of the comma, newline and quote
+/// masks: the separators come out with a few bit operations, and the quote rules are mask
+/// algebra (every quote at a field's edge, an even count before every separator), with no
+/// byte loaded to look for a quote. A click line is one window. A line that does not fit this
+/// shape (a wrong field count, a misplaced quote, a field over 60 bytes, a chunk's last line)
+/// is handed, alone, to `Scalar`, so the fields are those of `Scalar` for any input.
+///
+/// One core, 20M events: 320 to 340 ms for the event files against about 515 ms for `Mask`
+/// (`x86.md`). Several lines in turn, to overlap one line's wait for its newline, measured no
+/// gain: a line is work, not waiting.
+#[cfg(all(feature = "tok-shape", any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64")))]
+mod shape {
+    use memchr::memchr;
+
+    use super::mask::masks;
+    use super::{Field, Scalar, Scratch, Tok};
+
+    pub(crate) struct Shape;
+
+    impl Tok for Shape {
+        unsafe fn lines<const N: usize>(p: *const u8, len: usize, s: &mut Scratch, mut row: impl FnMut(&[Field; N])) {
+            // SAFETY: the caller's contract is each loop's; a `[Field; N]` is a `[Field; 7]`
+            // or a `[Field; 4]` in the arm that says so.
+            unsafe {
+                match N {
+                    7 => events(p, len, s, |fields| row(&*(fields as *const [Field; 7]).cast::<[Field; N]>())),
+                    4 => clicks(p, len, s, |fields| row(&*(fields as *const [Field; 4]).cast::<[Field; N]>())),
+                    _ => super::Mask::lines::<N>(p, len, s, row),
+                }
+            }
+        }
+    }
+
+    /// The lowest set bit of `bits` as a mask, and `bits` without it.
+    #[inline(always)]
+    fn take(bits: u64) -> (u64, u64) {
+        let lowest = bits & bits.wrapping_neg();
+        (lowest, bits ^ lowest)
+    }
+
+    /// Whether an odd number of quotes precedes any of the separators `stops`, or the end of
+    /// the stretch `quotes` covers: a field with one quote, or three.
+    #[inline(always)]
+    fn odd<const K: usize>(quotes: u64, stops: [u64; K]) -> bool {
+        let mut counts = quotes.count_ones();
+        for stop in stops {
+            counts |= (quotes & stop.wrapping_sub(1)).count_ones();
+        }
+        counts & 1 != 0
+    }
+
+    /// One line through `Scalar`: the line at `at`, to its newline. Returns the next line's start.
+    ///
+    /// # Safety
+    /// As `Tok::lines`, with `at < len`.
+    #[cold]
+    #[inline(never)]
+    unsafe fn general<const N: usize>(p: *const u8, len: usize, at: usize, s: &mut Scratch, row: &mut impl FnMut(&[Field; N])) -> usize {
+        // SAFETY: `at..len` is inside the segment, which ends with a newline.
+        let rest = unsafe { std::slice::from_raw_parts(p.add(at), len - at) };
+        let line = memchr(b'\n', rest).map_or(rest.len(), |newline| newline + 1);
+        unsafe { Scalar::lines::<N>(p.add(at), line, s, row) };
+        at + line
+    }
+
+    /// # Safety
+    /// As `Tok::lines`.
+    #[inline(always)]
+    unsafe fn events(p: *const u8, len: usize, s: &mut Scratch, mut row: impl FnMut(&[Field; 7])) {
+        let mut at = 0;
+        while at < len {
+            // Both windows are read whole: 64 bytes at the line, 64 more from at most 64 on.
+            if at + 128 <= len + crate::PAD {
+                // SAFETY: 128 readable bytes from `at`, and the second window starts at most
+                // 64 after it.
+                let [commas, newlines, quotes] = unsafe { masks(p.add(at)) };
+                let (c1, rest) = take(commas);
+                let (c2, rest) = take(rest);
+                let (c3, _) = take(rest);
+                let before = c3.wrapping_sub(1);
+                let qa = quotes & before;
+                let fits_a = (c3 != 0)
+                    & (newlines & before == 0)
+                    & (qa & !(1 | (c1 | c2) << 1 | (c1 | c2 | c3) >> 1) == 0)
+                    & !odd(qa, [c1, c2]);
+                let (p1, p2, p3) = (c1.trailing_zeros() as usize, c2.trailing_zeros() as usize, c3.trailing_zeros() as usize & 63);
+                let second = at + p3 + 1;
+                let [commas, newlines, quotes] = unsafe { masks(p.add(second)) };
+                let (c4, rest) = take(commas | newlines);
+                let (c5, rest) = take(rest);
+                let (c6, rest) = take(rest);
+                let (end, _) = take(rest);
+                let qb = quotes & end.wrapping_sub(1);
+                let fits_b = (newlines & end != 0)
+                    & (newlines & (c4 | c5 | c6) == 0)
+                    & (qb & !(1 | (c4 | c5 | c6) << 1 | (c4 | c5 | c6 | end) >> 1) == 0)
+                    & !odd(qb, [c4, c5, c6]);
+                if fits_a & fits_b {
+                    let (p4, p5, p6, p7) =
+                        (c4.trailing_zeros() as usize, c5.trailing_zeros() as usize, c6.trailing_zeros() as usize, end.trailing_zeros() as usize);
+                    // A quote at a field's first byte: the field is wrapped (its last byte is
+                    // the other quote, by the checks above).
+                    let wrapped_a = |start: usize| (qa >> start) as usize & 1;
+                    let wrapped_b = |start: usize| (qb >> start) as usize & 1;
+                    let (w0, w1, w2) = (wrapped_a(0), wrapped_a(p1 + 1), wrapped_a(p2 + 1));
+                    let (w3, w4, w5, w6) = (wrapped_b(0), wrapped_b(p4 + 1), wrapped_b(p5 + 1), wrapped_b(p6 + 1));
+                    let (a, b) = (p.wrapping_add(at), p.wrapping_add(second));
+                    let fields = [
+                        Field { p: a.wrapping_add(w0), len: p1 - 2 * w0 },
+                        Field { p: a.wrapping_add(p1 + 1 + w1), len: p2 - p1 - 1 - 2 * w1 },
+                        Field { p: a.wrapping_add(p2 + 1 + w2), len: p3 - p2 - 1 - 2 * w2 },
+                        Field { p: b.wrapping_add(w3), len: p4 - 2 * w3 },
+                        Field { p: b.wrapping_add(p4 + 1 + w4), len: p5 - p4 - 1 - 2 * w4 },
+                        Field { p: b.wrapping_add(p5 + 1 + w5), len: p6 - p5 - 1 - 2 * w5 },
+                        Field { p: b.wrapping_add(p6 + 1 + w6), len: p7 - p6 - 1 - 2 * w6 },
+                    ];
+                    row(&fields);
+                    at = second + p7 + 1;
+                    continue;
+                }
+            }
+            at = unsafe { general(p, len, at, s, &mut row) };
+        }
+    }
+
+    /// # Safety
+    /// As `Tok::lines`.
+    #[inline(always)]
+    unsafe fn clicks(p: *const u8, len: usize, s: &mut Scratch, mut row: impl FnMut(&[Field; 4])) {
+        let mut at = 0;
+        while at < len {
+            // SAFETY: `at < len`, and `PAD` (64) bytes after the segment are readable.
+            let [commas, newlines, quotes] = unsafe { masks(p.add(at)) };
+            let (c1, rest) = take(commas | newlines);
+            let (c2, rest) = take(rest);
+            let (c3, rest) = take(rest);
+            let (end, _) = take(rest);
+            let q = quotes & end.wrapping_sub(1);
+            let fits = (newlines & end != 0)
+                & (newlines & (c1 | c2 | c3) == 0)
+                & (q & !(1 | (c1 | c2 | c3) << 1 | (c1 | c2 | c3 | end) >> 1) == 0)
+                & !odd(q, [c1, c2, c3]);
+            if fits {
+                let (p1, p2, p3, p4) =
+                    (c1.trailing_zeros() as usize, c2.trailing_zeros() as usize, c3.trailing_zeros() as usize, end.trailing_zeros() as usize);
+                let wrapped = |start: usize| (q >> start) as usize & 1;
+                let (w0, w1, w2, w3) = (wrapped(0), wrapped(p1 + 1), wrapped(p2 + 1), wrapped(p3 + 1));
+                let a = p.wrapping_add(at);
+                let fields = [
+                    Field { p: a.wrapping_add(w0), len: p1 - 2 * w0 },
+                    Field { p: a.wrapping_add(p1 + 1 + w1), len: p2 - p1 - 1 - 2 * w1 },
+                    Field { p: a.wrapping_add(p2 + 1 + w2), len: p3 - p2 - 1 - 2 * w2 },
+                    Field { p: a.wrapping_add(p3 + 1 + w3), len: p4 - p3 - 1 - 2 * w3 },
+                ];
+                row(&fields);
+                at += p4 + 1;
+            } else {
+                at = unsafe { general(p, len, at, s, &mut row) };
+            }
         }
     }
 }

@@ -28,7 +28,7 @@ use ingest::pos::{PosOut, PosPlan};
 use sessions::{Agg, Click};
 use types::hash::person_hash;
 use types::par;
-use types::pos::{POS_ODD_USER, POS_VALID};
+use types::pos::{POS_ODD_USER, POS_VALID, PosEvent};
 use types::record::{ClickRec, PersonEvent, VALID};
 use types::scramble::{self, ALIAS_BITS, ALIAS_MASK};
 use types::{Ctx, Id};
@@ -39,14 +39,23 @@ const MASK_ALIASES: u32 = 64;
 const RUNS_PER_TASK: usize = 2048;
 /// Classic-lane buckets, as bits.
 const SLOW_BITS: u32 = 6;
-/// `users` slot of a kept copy whose user is not a number (resolved right after placing).
-const ODD: u32 = u32::MAX;
-
 /// `flags` of a person.
 const SEEN: u8 = 1;
-/// More than one run, a run out of time order, an alias over the masks, or a row outside the
-/// numbering: the classic lane.
+/// More than one run, a run out of time order, an alias over the masks, or events outside
+/// the numbering and no run to add them to: the classic lane.
 const UNFIT: u8 = 2;
+/// Has events outside the numbering (`Extra`).
+const EXTRA: u8 = 4;
+
+/// A surviving event whose `event_id` is outside the numbering and whose user is a number:
+/// it joins its person's table events before the sessions are cut.
+#[derive(Clone, Copy)]
+struct Extra {
+    person: u32,
+    u: u32,
+    ts: u32,
+    pay: u32,
+}
 
 /// A raw pointer tasks share to write disjoint stretches of one array.
 struct Shared<T>(*mut T);
@@ -232,7 +241,8 @@ impl Grouped {
 /// A worker's buffers for the placing stage.
 #[derive(Default)]
 struct Placing {
-    ingest: Vec<u32>,
+    /// The partition's slots while its rows are placed: the kept copy of each event number.
+    kept: Vec<PosEvent>,
     /// Kept-copy candidates whose user is not a number: (slot, ingest, worker, index).
     odd: Vec<(u32, u32, u32, u32)>,
     slow_events: Vec<PersonEvent>,
@@ -260,10 +270,10 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
     lap("parse");
 
     // The rows outside the numbering, deduplicated among themselves (every copy of an
-    // `event_id` is among them or none is). Each survivor is a classic-lane event, and so
-    // becomes everything else of its person.
+    // `event_id` is among them or none is). A survivor whose user is a number joins that
+    // person's events (`Extra`); any other is a classic-lane event.
     let mut slow_events: Vec<PersonEvent> = Vec::new();
-    let mut unfit_persons: Vec<u32> = Vec::new();
+    let mut extras: Vec<Extra> = Vec::new();
     let odd_rows: usize = parsed.iter().map(|out| out.odd_events.len()).sum();
     if odd_rows > 0 {
         let mut scratch = dedup::Scratch::default();
@@ -272,14 +282,10 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
                 let number = scramble::canonical_packed(kept.user, b'u')
                     .map(|scrambled| scramble::number(scrambled, plan.user_key))
                     .filter(|&number| number >> ALIAS_BITS < u64::from(plan.persons));
-                let person = match number {
-                    Some(number) => {
-                        unfit_persons.push((number >> ALIAS_BITS) as u32);
-                        links.person(number as u32)
-                    }
-                    None => links.general.person(kept.user),
-                };
-                slow_events.push(PersonEvent { person, ts: kept.ts, pay: kept.pay });
+                match number {
+                    Some(number) => extras.push(Extra { person: (number >> ALIAS_BITS) as u32, u: number as u32, ts: kept.ts, pay: kept.pay }),
+                    None => slow_events.push(PersonEvent { person: links.general.person(kept.user), ts: kept.ts, pay: kept.pay }),
+                }
             }
         }
     }
@@ -349,8 +355,12 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
         // A second run of a person: its events are not one stretch.
         flags[person] |= if flags[person] & SEEN != 0 || run.unfit { UNFIT | SEEN } else { SEEN };
     }
-    for &person in &unfit_persons {
-        flags[person as usize] |= UNFIT;
+    extras.sort_unstable_by_key(|extra| extra.person);
+    for extra in &extras {
+        let (person, alias) = (extra.person as usize, extra.u & ALIAS_MASK);
+        event_aliases[person] |= 1 << (alias & (MASK_ALIASES - 1));
+        // No run to join: the person's events are these alone, and the classic lane takes them.
+        flags[person] |= if flags[person] & SEEN == 0 || alias >= MASK_ALIASES { UNFIT | EXTRA } else { EXTRA };
     }
     // A person is one fast-lane person when nothing above disqualifies it and every ID its
     // rows use is in its one link component, or it has no links and uses a single ID.
@@ -363,6 +373,11 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
                 _ => false,
             }
     };
+    for extra in &extras {
+        if !fit(extra.person as usize) {
+            slow_events.push(PersonEvent { person: links.person(extra.u), ts: extra.ts, pay: extra.pay });
+        }
+    }
     lap("runs");
 
     // Stage 3. Runs in table order, a fixed count per task; then the click ranges, for the
@@ -398,7 +413,28 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
                         },
                         None => &mut [],
                     };
-                    sessions::positional::person(ctx, name, &times[stretch], run.first, &pays, &mut next_pay, clicks, &mut work.agg);
+                    if flags[person] & EXTRA == 0 {
+                        sessions::positional::person(ctx, name, &times[stretch], run.first, &pays, &mut next_pay, clicks, &mut work.agg);
+                    } else {
+                        // The table's events and the extras together, in time order.
+                        let mut all: Vec<(u32, u32)> = Vec::with_capacity(stretch.len() + 8);
+                        for number in stretch {
+                            if times[number] != 0 {
+                                let pay = match pays.get(next_pay) {
+                                    Some(&(at, pay)) if at as usize == number => {
+                                        next_pay += 1;
+                                        pay
+                                    }
+                                    _ => 0,
+                                };
+                                all.push((times[number], pay));
+                            }
+                        }
+                        let from = extras.partition_point(|extra| (extra.person as usize) < person);
+                        all.extend(extras[from..].iter().take_while(|extra| extra.person as usize == person).map(|extra| (extra.ts, extra.pay)));
+                        all.sort_unstable_by_key(|&(ts, _)| ts);
+                        sessions::positional::person_pairs(ctx, name, &all, clicks, &mut work.agg);
+                    }
                 } else {
                     for number in stretch {
                         if times[number] != 0 {
@@ -526,35 +562,35 @@ unsafe fn place(
     let (slots, base) = (1usize << plan.shift, part << plan.shift);
     // SAFETY: the caller's contract; the arrays hold `parts << shift` slots.
     let (times, users) = unsafe { (std::slice::from_raw_parts_mut(times.0.add(base), slots), std::slice::from_raw_parts_mut(users.0.add(base), slots)) };
-    let Placing { ingest, odd, slow_events } = work;
-    ingest.clear();
-    ingest.resize(slots, u32::MAX);
+    let Placing { kept, odd, slow_events } = work;
+    // One 16-byte slot per event number while placing: a row reads and writes one cache line
+    // of a table that fits L2. Three arrays (ingest, time, user) were three lines a row, and
+    // those accesses were two thirds of this stage.
+    kept.clear();
+    kept.resize(slots, PosEvent::EMPTY);
     odd.clear();
     for (worker, out) in parsed.iter().enumerate() {
         for piece in out.events.pieces(part) {
             for row in piece {
-                let slot = row.slot as usize & (slots - 1);
-                // SAFETY: `slot < slots`, the length of all three.
-                unsafe {
-                    if row.ingest < *ingest.get_unchecked(slot) {
-                        *ingest.get_unchecked_mut(slot) = row.ingest;
-                        *times.get_unchecked_mut(slot) = if row.flags & POS_VALID != 0 { row.ts } else { 0 };
-                        *users.get_unchecked_mut(slot) = row.u;
-                        if row.flags & POS_ODD_USER != 0 {
-                            odd_user(slot, row.ingest, worker, row.u, users, odd);
-                        }
+                // SAFETY: the mask keeps the slot below `slots`, the table's length.
+                let slot = unsafe { kept.get_unchecked_mut(row.slot() as usize & (slots - 1)) };
+                if row.ingest() < slot.ingest() {
+                    *slot = *row;
+                    if row.flags() & POS_ODD_USER != 0 {
+                        odd_user(row, worker, odd);
                     }
                 }
             }
         }
     }
+    let valid = |row: &PosEvent| row.flags() & POS_VALID != 0;
     let mut result = Placed::default();
     for out in parsed {
         for piece in out.pays.pieces(part) {
             for pay in piece {
                 let slot = pay.slot as usize & (slots - 1);
                 // The kept copy has this `ingest`, so it is this row or its twin.
-                if ingest[slot] == pay.ingest && times[slot] != 0 {
+                if kept[slot].ingest() == pay.ingest && valid(&kept[slot]) {
                     result.pays.push(((base + slot) as u32, pay.pay));
                 }
             }
@@ -565,53 +601,57 @@ unsafe fn place(
     // A kept copy whose user is not a number leaves the table for the classic lane.
     if !odd.is_empty() {
         for &(slot, row_ingest, worker, index) in odd.iter() {
-            let slot = slot as usize;
-            if users[slot] == ODD && ingest[slot] == row_ingest && times[slot] != 0 {
-                let number = (base + slot) as u32;
+            let row = kept[slot as usize];
+            if row.flags() & POS_ODD_USER != 0 && row.ingest() == row_ingest && valid(&row) {
+                let number = base as u32 + slot;
                 let pay = result.pays.binary_search_by_key(&number, |&(at, _)| at).map_or(0, |at| result.pays[at].1);
                 let person = links.general.person(parsed[worker as usize].odd_users[index as usize]);
-                slow_events.push(PersonEvent { person, ts: times[slot], pay });
-                times[slot] = 0;
+                slow_events.push(PersonEvent { person, ts: row.ts(), pay });
+                kept[slot as usize] = PosEvent::new(0, 0, row_ingest, slot as u16, 0);
             }
         }
-        result.pays.retain(|&(number, _)| times[number as usize - base] != 0);
+        result.pays.retain(|&(number, _)| valid(&kept[number as usize - base]));
+    }
+    // The table's two columns: the `ts` of a valid kept copy, 0 for anything else, and the user.
+    for (slot, row) in kept.iter().enumerate() {
+        times[slot] = if valid(row) { row.ts() } else { 0 };
+        users[slot] = row.u();
     }
 
-    let mut run: Option<Run> = None;
-    for slot in 0..slots {
-        let ts = times[slot];
-        if ts == 0 {
-            continue;
+    // The runs: one pass with the run's state in registers; a person's first event opens one.
+    let mut slot = 0;
+    loop {
+        while slot < slots && times[slot] == 0 {
+            slot += 1;
         }
-        let (person, alias, number) = (users[slot] >> ALIAS_BITS, users[slot] & ALIAS_MASK, (base + slot) as u32);
-        match &mut run {
-            Some(run) if run.person == person => {
-                run.unfit |= (ts < run.last_ts) | (alias >= MASK_ALIASES);
-                (run.end, run.last_ts, run.aliases) = (number + 1, ts, run.aliases | 1 << (alias & (MASK_ALIASES - 1)));
-            }
-            _ => {
-                result.runs.extend(run.take());
-                run = Some(Run {
-                    person,
-                    first: number,
-                    end: number + 1,
-                    first_ts: ts,
-                    last_ts: ts,
-                    aliases: 1 << (alias & (MASK_ALIASES - 1)),
-                    unfit: alias >= MASK_ALIASES,
-                });
-            }
+        if slot == slots {
+            break;
         }
+        let (person, first, first_ts) = (users[slot] >> ALIAS_BITS, slot, times[slot]);
+        let (mut end, mut last_ts, mut aliases, mut unfit) = (slot, first_ts, 0u64, false);
+        while slot < slots {
+            // SAFETY: `slot < slots`, the length of both.
+            let (ts, u) = unsafe { (*times.get_unchecked(slot), *users.get_unchecked(slot)) };
+            if ts != 0 {
+                if u >> ALIAS_BITS != person {
+                    break;
+                }
+                let alias = u & ALIAS_MASK;
+                unfit |= (ts < last_ts) | (alias >= MASK_ALIASES);
+                aliases |= 1 << (alias & (MASK_ALIASES - 1));
+                (last_ts, end) = (ts, slot + 1);
+            }
+            slot += 1;
+        }
+        result.runs.push(Run { person, first: (base + first) as u32, end: (base + end) as u32, first_ts, last_ts, aliases, unfit });
     }
-    result.runs.extend(run);
     Some(result)
 }
 
 #[cold]
 #[inline(never)]
-fn odd_user(slot: usize, ingest: u32, worker: usize, index: u32, users: &mut [u32], odd: &mut Vec<(u32, u32, u32, u32)>) {
-    users[slot] = ODD;
-    odd.push((slot as u32, ingest, worker as u32, index));
+fn odd_user(row: &PosEvent, worker: usize, odd: &mut Vec<(u32, u32, u32, u32)>) {
+    odd.push((u32::from(row.slot()), row.ingest(), worker as u32, row.u()));
 }
 
 /// Groups click range `range` by person with a counting scatter, and notes each person's click
@@ -634,7 +674,7 @@ unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_al
     for out in parsed {
         for piece in out.clicks.pieces(range) {
             for click in piece {
-                let (local, alias) = ((click.u >> ALIAS_BITS) as usize - first, click.u & ALIAS_MASK);
+                let (local, alias) = ((click.u() >> ALIAS_BITS) as usize - first, click.u() & ALIAS_MASK);
                 ends[local + 1] += 1;
                 click_aliases[local] |= 1 << (alias & (MASK_ALIASES - 1));
                 if alias >= MASK_ALIASES {
@@ -652,9 +692,9 @@ unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_al
     for out in parsed {
         for piece in out.clicks.pieces(range) {
             for click in piece {
-                let at = &mut ends[(click.u >> ALIAS_BITS) as usize - first];
-                clicks[*at as usize] = Click { ts: click.ts, campaign: click.campaign, id: click.click };
-                aliases[*at as usize] = (click.u & ALIAS_MASK) as u16;
+                let at = &mut ends[(click.u() >> ALIAS_BITS) as usize - first];
+                clicks[*at as usize] = Click { ts: click.ts(), campaign: click.campaign(), id: click.click };
+                aliases[*at as usize] = (click.u() & ALIAS_MASK) as u16;
                 *at += 1;
             }
         }

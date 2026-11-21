@@ -68,6 +68,7 @@ pub fn scrambled(number: u64, key: u64) -> u64 {
 }
 
 /// ASCII to base 36 digit; 0xFF for anything but `0-9a-z`.
+#[cfg_attr(all(target_arch = "x86_64", target_feature = "ssse3"), allow(dead_code))]
 static DIGIT: [u8; 256] = {
     let mut table = [0xFF; 256];
     let mut c = 0;
@@ -99,14 +100,48 @@ pub unsafe fn canonical_at(p: *const u8, len: usize, letter: u8) -> Option<u64> 
     // Right-align the digits in the word and fill the front with '0'.
     let shift = 8 * (8 - digits) as u32;
     let word = word << shift | (0x3030_3030_3030_3030 & ((1u64 << shift) - 1));
+    let (value, digits_ok) = base36(word);
+    let leading_zero = (digits > 1) & (unsafe { *p.add(1) } == b'0');
+    (digits_ok & !leading_zero & (value <= MASK)).then_some(value)
+}
+
+/// The value of 8 base 36 digits, the first in the low byte, and whether all 8 are digits.
+/// Three multiply-adds side by side: the digit-by-digit loop below is a chain of 8 table loads
+/// and multiplies, about 70 cycles a row before the event number is known, and with
+/// speculative store bypass disabled (`x86.md`) the next row's loads wait for the store whose
+/// address comes out of it.
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline(always)]
+fn base36(word: u64) -> (u64, bool) {
+    use core::arch::x86_64::*;
+    // SAFETY: SSSE3 is compiled in (cfg above).
+    #[allow(unused_unsafe)]
+    unsafe {
+        let chars = _mm_cvtsi64_si128(word as i64);
+        let (digit, letter) = (_mm_sub_epi8(chars, _mm_set1_epi8(b'0' as i8)), _mm_sub_epi8(chars, _mm_set1_epi8(b'a' as i8)));
+        // Unsigned `x <= n` as `min(x, n) == x`.
+        let is_digit = _mm_cmpeq_epi8(_mm_min_epu8(digit, _mm_set1_epi8(9)), digit);
+        let is_letter = _mm_cmpeq_epi8(_mm_min_epu8(letter, _mm_set1_epi8(25)), letter);
+        let value = _mm_or_si128(_mm_and_si128(is_digit, digit), _mm_and_si128(is_letter, _mm_add_epi8(letter, _mm_set1_epi8(10))));
+        let ok = _mm_movemask_epi8(_mm_or_si128(is_digit, is_letter)) & 0xFF == 0xFF;
+        // Pairs of digits (first * 36 + second), then pairs of pairs (first * 36^2 + second).
+        let pairs = _mm_maddubs_epi16(value, _mm_set1_epi16(0x0124));
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x0001_0510));
+        let both = _mm_cvtsi128_si64(quads) as u64;
+        ((both & 0xFFFF_FFFF) * 1_679_616 + (both >> 32), ok)
+    }
+}
+
+#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
+#[inline(always)]
+fn base36(word: u64) -> (u64, bool) {
     let (mut value, mut bad) = (0u64, 0u8);
     for c in word.to_le_bytes() {
         let digit = DIGIT[c as usize];
         bad |= digit;
         value = value * 36 + u64::from(digit & 63);
     }
-    let leading_zero = (digits > 1) & (unsafe { *p.add(1) } == b'0');
-    ((bad < 64) & !leading_zero & (value <= MASK)).then_some(value)
+    (value, bad < 64)
 }
 
 /// `canonical_at` for an ID already packed (`types::id`).
@@ -169,7 +204,10 @@ mod tests {
         assert_eq!(value(b"uz"), Some(35));
         assert_eq!(value(b"u10"), Some(36));
         assert_eq!(value(b"u4k2nn2cj"), Some(((((((4 * 36 + 20) * 36 + 2) * 36 + 23) * 36 + 23) * 36 + 2) * 36 + 12) * 36 + 19));
-        for bad in [&b""[..], b"u", b"U1", b"u01", b"u00", b"uA", b"u1 ", b" u1", b"e1", b"u123456789", b"uzzzzzzzz", b"u1\r"] {
+        for bad in [
+            &b""[..], b"u", b"U1", b"u01", b"u00", b"uA", b"u1 ", b" u1", b"e1", b"u123456789", b"uzzzzzzzz", b"u1\r", b"u1:", b"u1`",
+            b"u1{", b"u1/", b"u1@", b"u1Z", b"u1\x80", b"u\xffz", b"uab_cd",
+        ] {
             assert_eq!(value(bad), None, "{:?}", std::str::from_utf8(bad));
         }
         // 36^8 - 1 is over 2^40, so `uzzzzzzzz` is not canonical, and the boundary is exact.

@@ -106,6 +106,13 @@ impl Counters {
         cell.revenue += revenue;
     }
 
+    /// The assists table, `[day * campaigns + campaign]`, for `attr-interval` to add to.
+    #[cfg(feature = "pipe-positional")]
+    #[inline(always)]
+    pub(crate) fn assisted(&mut self) -> &mut [u32] {
+        &mut self.assisted
+    }
+
     /// Counts one assist of `campaign` on `day` per call.
     #[inline(always)]
     pub fn assists(&mut self, day: usize) -> impl FnMut(u32) + '_ {

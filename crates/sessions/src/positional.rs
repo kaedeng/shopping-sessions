@@ -1,7 +1,7 @@
 //! Slot `pipe-positional`: one person whose events already sit in time order (the positional
-//! pipeline, `src/positional.rs`): no table, no keys, no sort. The sessions, the purchases, the
-//! credit and the counters are the same calls, in the same order, as `partitioned::bucket`
-//! makes for a person, so both pipelines give the same rows.
+//! pipeline, `src/positional.rs`): no table, no keys, no sort. The sessions, the purchases and
+//! the credit are the same calls, in the same order, as `partitioned::bucket` makes for a
+//! person; the assists are counted per stretch (`attr-interval`), to the same totals.
 
 use types::record::{PAY_CATEGORY_SHIFT, PAY_PRICE_MASK};
 use types::{Ctx, Id};
@@ -29,7 +29,7 @@ pub fn person(
     clicks: &mut [Click],
     agg: &mut Agg,
 ) {
-    let Agg { user_daily, bucket: scratch, attr, day, counters, .. } = agg;
+    let Agg { user_daily, bucket: scratch, stretch: attr, day, counters, .. } = agg;
     let clicks = sort_person_clicks(scratch, clicks);
     let organic = ctx.organic();
     let (n, mut at) = (times.len(), 0);
@@ -62,9 +62,39 @@ pub fn person(
             revenue += u64::from(price);
             *next_pay += 1;
         }
-        let credit = attr.session(clicks, start, organic, counters.assists(d));
+        let credit = attr.session(clicks, start, d, organic, counters.assisted());
         counters.credit(credit, d, revenue);
     }
-    attr.end_person();
+    attr.end_person(counters.assisted());
+    day.flush(name, ctx.day0, user_daily);
+}
+
+/// The same for a person whose events were gathered into `(ts, pay)` pairs, ascending by `ts`:
+/// a person with events outside the table.
+pub fn person_pairs(ctx: &Ctx, name: Id, events: &[(u32, u32)], clicks: &mut [Click], agg: &mut Agg) {
+    let Agg { user_daily, bucket: scratch, stretch: attr, day, counters, .. } = agg;
+    let clicks = sort_person_clicks(scratch, clicks);
+    let organic = ctx.organic();
+    let (n, mut at) = (events.len(), 0);
+    while at < n {
+        let (first, start) = (at, events[at].0);
+        at += 1;
+        while at < n && u64::from(events[at].0 - events[at - 1].0) <= GAP {
+            at += 1;
+        }
+        let d = (ctx.day_of(start) - ctx.day0) as usize;
+        day.session(d, at - first, name, ctx.day0, user_daily);
+        let mut revenue = 0u64;
+        for &(_, pay) in &events[first..at] {
+            if pay != 0 {
+                let price = pay & PAY_PRICE_MASK;
+                day.purchase(price, (pay >> PAY_CATEGORY_SHIFT) as u8);
+                revenue += u64::from(price);
+            }
+        }
+        let credit = attr.session(clicks, start, d, organic, counters.assisted());
+        counters.credit(credit, d, revenue);
+    }
+    attr.end_person(counters.assisted());
     day.flush(name, ctx.day0, user_daily);
 }

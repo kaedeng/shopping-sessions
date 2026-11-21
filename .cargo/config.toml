@@ -1,7 +1,11 @@
-# AVX2 and BMI2 are compiled in for amd64 (every AVX-512 Xeon has them); `tok-mask` and the ID
-# packer pick their fast paths from these at compile time. cascadelake is the untested step up.
+# Linux amd64 is built for Cascade Lake: the organizers' README says the scorers have AVX-512 and
+# suggests pinning `-C target-cpu=cascadelake` (not `native`, which would tune for the build
+# host). That turns on AVX-512 F/CD/BW/DQ/VL/VNNI on top of x86-64-v3's AVX2, BMI2 and FMA;
+# `tok-mask` and the ID packer pick their fast paths from these at compile time. A Linux amd64
+# machine without AVX-512 cannot run this build (SIGILL); build it with
+# RUSTFLAGS="-C target-cpu=x86-64-v3" there. Intel Macs stay on x86-64-v3, since most lack AVX-512.
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+rustflags = ["-C", "target-cpu=cascadelake"]
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "target-cpu=x86-64-v3"]
 [target.aarch64-apple-darwin]

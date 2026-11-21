@@ -226,13 +226,20 @@ impl Ingest {
         let mut ingest = Ingest::with(files, ctx, parse_fn, links_fn)?;
         #[cfg(feature = "pipe-positional")]
         {
-            let options: &[pos::PosFn] = &[
+            // The positional parse's own tokenizer (`SS_POS_TOK`): `shape` by default, while the
+            // classic pipeline keeps `SS_TOK`'s, so comparing the two pipelines also compares
+            // two tokenizers.
+            let _ = picked;
+            let options: &[(&str, pos::PosFn)] = &[
+                #[cfg(feature = "tok-shape")]
+                ("shape", pos::parse_with::<tok::Shape>),
                 #[cfg(feature = "tok-mask")]
-                pos::parse_with::<tok::Mask>,
+                ("mask", pos::parse_with::<tok::Mask>),
                 #[cfg(feature = "tok-scalar")]
-                pos::parse_with::<Scalar>,
+                ("scalar", pos::parse_with::<Scalar>),
             ];
-            ingest.pos_fn = options[picked];
+            let names: Vec<&str> = options.iter().map(|option| option.0).collect();
+            ingest.pos_fn = options[env::pick("SS_POS_TOK", &names)].1;
         }
         #[cfg(all(feature = "reader-populate", target_os = "linux"))]
         {

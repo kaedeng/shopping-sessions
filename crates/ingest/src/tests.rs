@@ -237,6 +237,8 @@ fn both<const N: usize>(text: &[u8]) -> Vec<Vec<Vec<u8>>> {
     for batch in [1, 37, 64, 1 << 14] {
         assert_eq!(tokenize::<tok::Mask, N>(text, batch), scalar, "batch {batch}: {:?}", String::from_utf8_lossy(text));
     }
+    #[cfg(feature = "tok-shape")]
+    assert_eq!(tokenize::<tok::Shape, N>(text, 1 << 14), scalar, "shape: {:?}", String::from_utf8_lossy(text));
     scalar
 }
 

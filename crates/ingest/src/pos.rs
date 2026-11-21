@@ -87,6 +87,50 @@ impl PosOut {
 
 pub(crate) type PosFn = fn(&Ingest, &Ctx, &PosPlan, usize, &mut PosOut);
 
+/// Rows parsed before they are scattered.
+const PENDING: usize = 64;
+
+/// The last few parsed records and their lists, scattered `PENDING` at a time. A record goes
+/// here with a store whose address is known at once. Stored straight into its list, its
+/// address came at the end of the row's whole decode (the ID's number picks the list), and
+/// with speculative store bypass disabled no later load may run before every earlier store's
+/// address is known: the next row could not start until this one was finished (`x86.md`).
+struct Pending<T> {
+    lists: [u32; PENDING],
+    recs: [T; PENDING],
+    len: usize,
+}
+
+impl<T: Copy + Default> Pending<T> {
+    fn new() -> Pending<T> {
+        Pending { lists: [0; PENDING], recs: [T::default(); PENDING], len: 0 }
+    }
+
+    /// # Safety
+    /// `list < out.lists()`.
+    #[inline(always)]
+    unsafe fn push<M: Mode>(&mut self, list: usize, rec: T, out: &mut Parts<T>) {
+        // SAFETY: `len < PENDING` between calls.
+        unsafe {
+            *self.lists.get_unchecked_mut(self.len) = list as u32;
+            *self.recs.get_unchecked_mut(self.len) = rec;
+        }
+        self.len += 1;
+        if self.len == PENDING {
+            self.flush::<M>(out);
+        }
+    }
+
+    #[inline(always)]
+    fn flush<M: Mode>(&mut self, out: &mut Parts<T>) {
+        for at in 0..self.len {
+            // SAFETY: every list here was in range when pushed.
+            unsafe { out.push_as::<M>(self.lists[at] as usize, self.recs[at]) };
+        }
+        self.len = 0;
+    }
+}
+
 impl Ingest {
     /// The keys, found from the first rows of the largest event chunk, and the arrays' shape;
     /// `None` when the rows do not carry the generator's numbering (then the classic pipeline
@@ -226,9 +270,11 @@ pub(crate) fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, plan: &PosPlan, tas
 unsafe fn events<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &PosPlan, out: &mut PosOut) {
     let PosOut { events, pays, odd_events, odd_users, scratch, .. } = out;
     let limit = plan.events() as u64;
+    let mut pending = Pending::new();
     unsafe {
-        T::lines::<7>(p, len, scratch, |fields| event_row::<M>(ctx, dates, plan, limit, fields, events, pays, odd_events, odd_users))
+        T::lines::<7>(p, len, scratch, |fields| event_row::<M>(ctx, dates, plan, limit, fields, &mut pending, events, pays, odd_events, odd_users))
     };
+    pending.flush::<M>(events);
     // Streamed lines become visible to the placing threads.
     events.fence();
     pays.fence();
@@ -239,7 +285,9 @@ unsafe fn events<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &D
 #[inline(always)]
 unsafe fn clicks<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &PosPlan, out: &mut PosOut) {
     let PosOut { clicks, odd_clicks, scratch, .. } = out;
-    unsafe { T::lines::<4>(p, len, scratch, |fields| click_row::<M>(ctx, dates, plan, fields, clicks, odd_clicks)) };
+    let mut pending = Pending::new();
+    unsafe { T::lines::<4>(p, len, scratch, |fields| click_row::<M>(ctx, dates, plan, fields, &mut pending, clicks, odd_clicks)) };
+    pending.flush::<M>(clicks);
     clicks.fence();
 }
 
@@ -255,6 +303,7 @@ unsafe fn event_row<M: Mode>(
     plan: &PosPlan,
     limit: u64,
     fields: &[Field; 7],
+    pending: &mut Pending<PosEvent>,
     events: &mut Parts<PosEvent>,
     pays: &mut Parts<PosPay>,
     odd_events: &mut Vec<EventRec>,
@@ -295,9 +344,9 @@ unsafe fn event_row<M: Mode>(
         Some(number) if number < limit => {
             let (u, odd) = unsafe { user_number(user, plan, odd_users) };
             let (part, slot) = ((number >> plan.shift) as usize, (number & ((1 << plan.shift) - 1)) as u16);
-            let rec = PosEvent { u, ts: ts as u32, ingest: ingest_rel, slot, flags: POS_VALID * u16::from(valid) | odd };
+            let rec = PosEvent::new(u, ts as u32, ingest_rel, slot, POS_VALID * u16::from(valid) | odd);
             // SAFETY: `number < parts << shift`.
-            unsafe { events.push_as::<M>(part, rec) };
+            unsafe { pending.push::<M>(part, rec, events) };
             if valid & (pay != 0) {
                 pays.push(part, PosPay { slot: u32::from(slot), ingest: ingest_rel, pay });
             }
@@ -346,6 +395,7 @@ unsafe fn click_row<M: Mode>(
     dates: &Dates,
     plan: &PosPlan,
     fields: &[Field; 4],
+    pending: &mut Pending<PosClick>,
     clicks: &mut Parts<PosClick>,
     odd_clicks: &mut Vec<ClickRec>,
 ) {
@@ -360,7 +410,7 @@ unsafe fn click_row<M: Mode>(
             Some(number) if number >> ALIAS_BITS < u64::from(plan.persons) => {
                 let list = (number >> ALIAS_BITS >> plan.click_shift) as usize;
                 // SAFETY: the person is below `persons`, so the list is below `click_parts`.
-                unsafe { clicks.push_as::<M>(list, PosClick { click, u: number as u32, ts: ts as u32, campaign, spare: 0 }) };
+                unsafe { pending.push::<M>(list, PosClick::new(click, number as u32, ts as u32, campaign), clicks) };
             }
             _ => odd_clicks.push(ClickRec { user: unsafe { pack_at(user.p, user.len) }, click, ts: ts as u32, campaign }),
         }

@@ -11,12 +11,14 @@ memmap2 = { version = "0.9", optional = true }
 serde_json = "1"
 
 [features]
-default = ["reader-mmap", "tok-mask", "ts-table", "pipe-positional"]
+default = ["reader-mmap", "tok-mask", "tok-shape", "ts-table", "pipe-positional"]
 reader-mmap = ["dep:memmap2"]
 # Linux only: `SS_READER=populate` faults each chunk in with one MADV_POPULATE_READ.
 reader-populate = ["reader-mmap"]
 tok-mask = []
 tok-scalar = []
+# Event and click lines read by their shape; the positional parse's tokenizer (`SS_POS_TOK`).
+tok-shape = ["tok-mask"]
 ts-table = []
 # `pos`: the parse for the positional pipeline.
 pipe-positional = ["types/pipe-positional"]
