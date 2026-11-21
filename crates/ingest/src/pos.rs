@@ -653,12 +653,15 @@ pub(crate) mod wide {
             Held { lists: [0; HELD], low: [0; HELD], high: [0; HELD], len: 0 }
         }
 
-        #[inline(always)]
+        /// A function of its own: inside the decode its loop had no registers left, and
+        /// reloaded the lists' base, room and staging from the stack for every record.
+        #[inline(never)]
         fn flush<M: Mode>(&mut self, events: &mut Parts<PosEvent>) {
-            for at in 0..self.len {
-                // SAFETY: every list here was in range when put.
-                unsafe { events.push_as::<M>(self.lists[at] as usize, PosEvent::from_words(self.low[at], self.high[at])) };
-            }
+            let (lists, low, high) = (&self.lists, &self.low, &self.high);
+            // SAFETY: `len <= HELD`, and every list here was in range when put.
+            unsafe {
+                events.extend_as::<M>(self.len, |at| (*lists.get_unchecked(at) as usize, PosEvent::from_words(*low.get_unchecked(at), *high.get_unchecked(at))))
+            };
             self.len = 0;
         }
     }
@@ -764,13 +767,30 @@ pub(crate) mod wide {
         product_len: __m512i,
     }
 
-    /// The records of the lanes that are plainly ordinary rows, appended to `held`; returns
-    /// the other live lanes, which are the row code's.
+    /// What `records` leaves to its caller.
+    struct Records {
+        /// The live lanes that are not records yet: the row code's, unless the caller makes
+        /// the purchases among them (`buys`) records itself.
+        rest: __mmask8,
+        /// Lanes of `rest` that are ordinary rows but for their type, which is 8 bytes
+        /// starting `purchas`: a record once the type is checked whole and the price and the
+        /// product are read.
+        buys: __mmask8,
+        /// For a lane of `buys`: `event_row`'s `valid` but for the price.
+        valid: __mmask8,
+        /// For a lane of `buys`: its list and its record's words, the second without flags.
+        list: __m512i,
+        low: __m512i,
+        plain: __m512i,
+    }
+
+    /// The records of the lanes that are plainly ordinary rows of type `view` or `cart`,
+    /// appended to `held`.
     ///
     /// # Safety
     /// `held.len + 8 <= HELD`.
     #[inline(always)]
-    unsafe fn records(lanes: &Lanes, held: &mut Held, ctx: &Ctx, dates: &Dates, plan: &PosPlan, limit: u64) -> __mmask8 {
+    unsafe fn records(lanes: &Lanes, held: &mut Held, ctx: &Ctx, dates: &Dates, plan: &PosPlan, limit: u64) -> Records {
         // SAFETY: register arithmetic, and stores of 8 words at `held.len <= HELD - 8`.
         unsafe {
             let (number, id_ok) = numbers(lanes.id_first, lanes.id_digits, lanes.id_len, b'e', plan.event_key);
@@ -781,15 +801,19 @@ pub(crate) mod wide {
             let view_or_cart = (_mm512_cmpeq_epi64_mask(kind, all(u64::from(u32::from_le_bytes(*b"view"))))
                 | _mm512_cmpeq_epi64_mask(kind, all(u64::from(u32::from_le_bytes(*b"cart")))))
                 & _mm512_cmpeq_epi64_mask(lanes.kind_len, all(4));
-            let fast = lanes.fit
+            let ordinary = lanes.fit
                 & id_ok
                 & _mm512_cmplt_epu64_mask(number, all(limit))
                 & user_ok
                 & _mm512_cmplt_epu64_mask(_mm512_srli_epi64::<{ ALIAS_BITS }>(user), all(u64::from(plan.persons)))
                 & ts_ok
                 & ingest_ok
-                & view_or_cart
                 & _mm512_cmpneq_epi64_mask(lanes.product_len, all(0));
+            let fast = ordinary & view_or_cart;
+            // The type's first 7 bytes: all a word holds of a wrapped type's 8.
+            let buys = ordinary
+                & _mm512_cmpeq_epi64_mask(lanes.kind_len, all(8))
+                & _mm512_cmpeq_epi64_mask(_mm512_and_si512(lanes.kind, all(0x00FF_FFFF_FFFF_FFFF)), all(u64::from_le_bytes(*b"purchas\0")));
 
             // `event_row`'s `valid` for such a row: the window, and not late.
             let valid = _mm512_cmpge_epi64_mask(ts, all(u64::from(ctx.event_lo)))
@@ -803,10 +827,8 @@ pub(crate) mod wide {
             // `PosEvent::new`: u | ts << 32, then ingest | slot << 32 | flags << 48.
             let low = _mm512_or_si512(_mm512_and_si512(user, all(0xFFFF_FFFF)), _mm512_slli_epi64::<32>(ts));
             let slot = _mm512_and_si512(number, all((1u64 << plan.shift) - 1));
-            let high = _mm512_or_si512(
-                _mm512_or_si512(ingest_rel, _mm512_slli_epi64::<32>(slot)),
-                _mm512_maskz_mov_epi64(valid, all(u64::from(POS_VALID) << 48)),
-            );
+            let plain = _mm512_or_si512(ingest_rel, _mm512_slli_epi64::<32>(slot));
+            let high = _mm512_or_si512(plain, _mm512_maskz_mov_epi64(valid, all(u64::from(POS_VALID) << 48)));
             let list = _mm512_srl_epi64(number, _mm_cvtsi32_si128(plan.shift as i32));
             // Compressed in a register and stored whole (the lanes past the fast ones are
             // overwritten by the next store): the compressing store is microcoded on Zen 4.
@@ -815,7 +837,7 @@ pub(crate) mod wide {
             _mm512_storeu_si512(held.low.as_mut_ptr().add(at).cast(), _mm512_maskz_compress_epi64(fast, low));
             _mm512_storeu_si512(held.high.as_mut_ptr().add(at).cast(), _mm512_maskz_compress_epi64(fast, high));
             held.len = at + fast.count_ones() as usize;
-            lanes.live & !fast
+            Records { rest: lanes.live & !fast, buys, valid, list, low, plain }
         }
     }
 
@@ -906,7 +928,7 @@ pub(crate) mod wide {
                     product_len: len(5),
                 };
                 // Every row that is not a record already, through the row code.
-                let mut rest = records(&lanes, &mut batch.held, ctx, dates, plan, limit);
+                let mut rest = records(&lanes, &mut batch.held, ctx, dates, plan, limit).rest;
                 while rest != 0 {
                     let row = first + rest.trailing_zeros() as usize;
                     rest &= rest - 1;
@@ -1200,7 +1222,32 @@ pub(crate) mod wide {
                 // or zeros, and `live` keeps it out of the records and the row code.
                 unsafe {
                     let lanes = lanes_of(&raw.words, first, live(rows, first), dates);
-                    let mut rest = records(&lanes, &mut raw.held, ctx, dates, plan, limit);
+                    let made = records(&lanes, &mut raw.held, ctx, dates, plan, limit);
+                    let mut rest = made.rest;
+                    // The purchases: the kernels' record, with the price and the product read
+                    // here. About 3% of the rows, and the row code was 600 instructions each.
+                    if made.buys != 0 {
+                        let (mut list, mut low, mut plain) = ([0u64; 8], [0u64; 8], [0u64; 8]);
+                        _mm512_storeu_si512(list.as_mut_ptr().cast(), made.list);
+                        _mm512_storeu_si512(low.as_mut_ptr().cast(), made.low);
+                        _mm512_storeu_si512(plain.as_mut_ptr().cast(), made.plain);
+                        let mut buys = made.buys;
+                        while buys != 0 {
+                            let lane = buys.trailing_zeros() as usize;
+                            buys &= buys - 1;
+                            if let Some((pay, price_ok)) = purchase(base, &raw.words, first + lane, ctx) {
+                                // `event_row`: the row is valid when its price is, too, and a
+                                // valid purchase leaves its `pay` beside its record.
+                                let valid = (made.valid >> lane & 1 == 1) & price_ok;
+                                let high = plain[lane] | u64::from(POS_VALID * u16::from(valid)) << 48;
+                                raw.held.put::<M>(list[lane] as usize, PosEvent::from_words(low[lane], high), events);
+                                if valid & (pay != 0) {
+                                    pays.push(list[lane] as usize, PosPay { slot: (plain[lane] >> 32) as u32, ingest: plain[lane] as u32, pay });
+                                }
+                                rest &= !(1 << lane);
+                            }
+                        }
+                    }
                     while rest != 0 {
                         let row = first + rest.trailing_zeros() as usize;
                         rest &= rest - 1;
@@ -1208,6 +1255,40 @@ pub(crate) mod wide {
                     }
                 }
                 first += 8;
+            }
+        }
+
+        /// For row `row`, a well-formed line that `records` found ordinary but for its type:
+        /// its `pay` and whether its price is valid, as `event_row` computes them, when the
+        /// type is `purchase`; `None` for any other type (the row code's).
+        ///
+        /// # Safety
+        /// `row < ROWS` is a row `raw_row` stored from a line of the segment at `base`, and
+        /// `pairs` passed its second window.
+        #[inline(always)]
+        unsafe fn purchase(base: *const u8, words: &[[u64; ROWS]; R_WORDS], row: usize, ctx: &Ctx) -> Option<(u32, bool)> {
+            // SAFETY: the fields are inside the line, and `PAD` bytes after the segment are
+            // readable.
+            unsafe {
+                let (seps_a, seps_b, quotes) = (words[R_SEPS_A][row], words[R_SEPS_B][row], words[R_QUOTES_B][row]);
+                // The second window starts after the third comma, the first window's last.
+                let second = base.add(words[R_AT][row] as usize + 64 - seps_a.leading_zeros() as usize);
+                let p4 = seps_b.trailing_zeros() as usize;
+                let rest = seps_b & seps_b.wrapping_sub(1);
+                let p5 = rest.trailing_zeros() as usize;
+                let rest = rest & rest.wrapping_sub(1);
+                let p6 = rest.trailing_zeros() as usize;
+                let rest = rest & rest.wrapping_sub(1);
+                let p7 = rest.trailing_zeros() as usize;
+                // A field is wrapped when a quote is its first byte (`pairs`).
+                let wrapped = |start: usize| (quotes >> start) as usize & 1;
+                let (q4, q5, q6) = (wrapped(p4 + 1), wrapped(p5 + 1), wrapped(p6 + 1));
+                if (p5 - p4 - 1 - 2 * q4 != 8) | (rd(second.add(p4 + 1 + q4)) != u64::from_le_bytes(*b"purchase")) {
+                    return None;
+                }
+                let (ok, cents) = price_cents(second.add(p6 + 1 + q6), p7 - p6 - 1 - 2 * q6);
+                let category = ctx.products.get(pack_at(second.add(p5 + 1 + q5), p6 - p5 - 1 - 2 * q5)).unwrap_or(ctx.unknown);
+                Some((cents | u32::from(category) << PAY_CATEGORY_SHIFT, ok))
             }
         }
 
@@ -1284,12 +1365,16 @@ pub(crate) mod wide {
         }
 
         impl RawClicks {
-            #[inline(always)]
+            #[inline(never)]
             fn flush<M: Mode>(&mut self, clicks: &mut Parts<PosClick>) {
-                for at in 0..self.held {
-                    // SAFETY: the decode put only lists of persons below `PosPlan::persons` here.
-                    unsafe { clicks.push_as::<M>(self.lists[at] as usize, PosClick::from_words(self.click[at], self.low[at], self.campaign[at])) };
-                }
+                let (lists, click, low, campaign) = (&self.lists, &self.click, &self.low, &self.campaign);
+                // SAFETY: `held <= HELD`, and the decode put only lists of persons below
+                // `PosPlan::persons` here.
+                unsafe {
+                    clicks.extend_as::<M>(self.held, |at| {
+                        (*lists.get_unchecked(at) as usize, PosClick::from_words(*click.get_unchecked(at), *low.get_unchecked(at), *campaign.get_unchecked(at)))
+                    })
+                };
                 self.held = 0;
             }
         }

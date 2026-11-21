@@ -192,6 +192,54 @@ impl<T: Copy> Parts<T> {
         }
     }
 
+    /// Appends `count` records the way `M` says: record `at` is `record(at)`, its list first.
+    /// `push_as` in a loop of its own: the lists' fields stay in registers, and the one call,
+    /// for a list that is full, is outside the loop that runs for every record. (Called per
+    /// record from a decode loop, `push_as` reloaded the lengths' base, the room and the
+    /// staging buffers from the stack each time: 24 instructions a record against 15.)
+    ///
+    /// # Safety
+    /// Every list `record` returns is below `self.lists()`, and `M::COMBINE` equals
+    /// `combining()`.
+    #[inline(always)]
+    pub unsafe fn extend_as<M: Mode>(&mut self, count: usize, mut record: impl FnMut(usize) -> (usize, T)) {
+        debug_assert!(M::COMBINE == self.combining());
+        let (room, batch) = (self.room, self.batch);
+        let (mask, shift) = (batch.wrapping_sub(1), if M::COMBINE { batch.trailing_zeros() } else { 0 });
+        let mut at = 0;
+        loop {
+            let (lens, region, stage) = (self.lens.as_mut_ptr(), self.region.ptr.as_ptr(), self.stage.ptr.as_ptr());
+            // SAFETY: as `push_as`, list by list.
+            let (list, rec) = unsafe {
+                loop {
+                    if at == count {
+                        return;
+                    }
+                    let (list, rec) = record(at);
+                    debug_assert!(list < self.lens.len());
+                    let len = *lens.add(list) as usize;
+                    if len >= room {
+                        break (list, rec);
+                    }
+                    at += 1;
+                    *lens.add(list) = len as u32 + 1;
+                    if !M::COMBINE {
+                        region.add(list * room + len).write(rec);
+                        continue;
+                    }
+                    let fill = len & mask;
+                    let buffer = stage.add(list << shift);
+                    buffer.add(fill).write(rec);
+                    if fill == mask {
+                        stream(buffer.cast(), region.add(list * room + len - mask).cast(), batch * size_of::<T>());
+                    }
+                }
+            };
+            self.spill(list, rec);
+            at += 1;
+        }
+    }
+
     /// Appends `rec` to list `list`, plain or staged as this `Parts` was built; panics if there
     /// is no such list. Not for hot loops: it decides the mode per call.
     pub fn push(&mut self, list: usize, rec: T) {
@@ -333,6 +381,34 @@ mod tests {
         check(|n| (n, n * 3));
         check(|n| [n, n + 1, n + 2, n + 3]);
         check(|n| Rec24([n, !n, n * 7]));
+    }
+
+    #[test]
+    fn extend_is_push() {
+        for combine in [None, Some(1), Some(4)] {
+            for room in [1, 3, 64] {
+                let (mut pushed, mut extended) = (Parts::new(7, room, combine), Parts::new(7, room, combine));
+                let record = |n: u64| (((n * 2_654_435_761) >> 7) as usize % 7, [n, !n]);
+                for n in 0..1000u64 {
+                    let (list, rec) = record(n);
+                    pushed.push(list, rec);
+                }
+                for first in (0..1000u64).step_by(100) {
+                    // SAFETY: the lists are below 7, and the mode is the one built with.
+                    unsafe {
+                        if extended.combining() {
+                            extended.extend_as::<super::Combine>(100, |at| record(first + at as u64));
+                        } else {
+                            extended.extend_as::<super::Plain>(100, |at| record(first + at as u64));
+                        }
+                    }
+                }
+                extended.fence();
+                for list in 0..7 {
+                    assert_eq!(extended.pieces(list).concat(), pushed.pieces(list).concat(), "combine {combine:?}, room {room}, list {list}");
+                }
+            }
+        }
     }
 
     #[test]

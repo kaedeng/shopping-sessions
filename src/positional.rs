@@ -89,10 +89,11 @@ const ONE: u8 = 1;
 const MIXED: u8 = 2;
 
 /// A link between two aliases of one person.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 struct Inner {
     person: u32,
-    aliases: [u8; 2],
+    /// The two aliases, a bit each.
+    aliases: u64,
     ids: [Id; 2],
 }
 
@@ -106,10 +107,12 @@ impl Links {
                 .map(|number| number as u32)
         };
         let mut state = vec![NONE; persons];
+        let (mut mask, mut name) = (vec![0u64; persons], vec![0 as Id; persons]);
         let mut inner: Vec<Inner> = Vec::with_capacity(pairs.len());
         let mut general: Vec<[Id; 2]> = Vec::new();
-        // One past each person's last inner link, once summed and scattered.
-        let mut ends = vec![0u32; persons + 1];
+        // A person's mask grows from its first link by every link that touches it. A link that
+        // touches none of it yet is set apart: a later one may join the two.
+        let mut apart: Vec<u32> = Vec::new();
         for &pair in pairs {
             if pair.contains(&0) {
                 continue;
@@ -119,9 +122,20 @@ impl Links {
                 (Some(x), Some(y))
                     if x >> ALIAS_BITS == y >> ALIAS_BITS && (x & ALIAS_MASK) < MASK_ALIASES && (y & ALIAS_MASK) < MASK_ALIASES =>
                 {
-                    let person = x >> ALIAS_BITS;
-                    inner.push(Inner { person, aliases: [(x & ALIAS_MASK) as u8, (y & ALIAS_MASK) as u8], ids: pair });
-                    ends[person as usize + 1] += 1;
+                    let person = (x >> ALIAS_BITS) as usize;
+                    let aliases = 1u64 << (x & ALIAS_MASK) | 1u64 << (y & ALIAS_MASK);
+                    if mask[person] == 0 || mask[person] & aliases != 0 {
+                        mask[person] |= aliases;
+                    } else {
+                        apart.push(inner.len() as u32);
+                    }
+                    // The component's name, if it is one: the smallest of the IDs linked.
+                    for id in pair {
+                        if name[person] == 0 || types::id::less(id, name[person]) {
+                            name[person] = id;
+                        }
+                    }
+                    inner.push(Inner { person: person as u32, aliases, ids: pair });
                 }
                 _ => {
                     for side in [x, y].into_iter().flatten() {
@@ -131,54 +145,32 @@ impl Links {
                 }
             }
         }
-        for person in 1..=persons {
-            ends[person] += ends[person - 1];
+        // Until none joins: what then stays apart is a second component of its person.
+        loop {
+            let before = apart.len();
+            apart.retain(|&at| {
+                let link = &inner[at as usize];
+                let joined = mask[link.person as usize] & link.aliases != 0;
+                if joined {
+                    mask[link.person as usize] |= link.aliases;
+                }
+                !joined
+            });
+            if apart.len() == before {
+                break;
+            }
         }
-        let mut grouped = vec![Inner::default(); inner.len()];
+        for &at in &apart {
+            state[inner[at as usize].person as usize] = MIXED;
+        }
+        // A person whose links are one component and tie it to nothing else is `ONE`; the
+        // links of every other linked person go to the general table.
         for link in &inner {
-            let at = &mut ends[link.person as usize];
-            grouped[*at as usize] = *link;
-            *at += 1;
-        }
-        drop(inner);
-
-        let (mut mask, mut name) = (vec![0u64; persons], vec![0 as Id; persons]);
-        let mut first = 0;
-        while first < grouped.len() {
-            let person = grouped[first].person as usize;
-            let end = ends[person] as usize;
-            let links = &grouped[first..end];
-            first = end;
+            let person = link.person as usize;
             if state[person] == MIXED {
-                general.extend(links.iter().map(|link| link.ids));
-                continue;
-            }
-            // A union-find over at most 64 aliases; the component count falls with each join.
-            let mut parent: [u8; MASK_ALIASES as usize] = std::array::from_fn(|alias| alias as u8);
-            let root = |parent: &[u8; MASK_ALIASES as usize], mut alias: u8| {
-                while parent[alias as usize] != alias {
-                    alias = parent[alias as usize];
-                }
-                alias
-            };
-            let (mut aliases, mut smallest) = (0u64, links[0].ids[0]);
-            for link in links {
-                let (a, b) = (root(&parent, link.aliases[0]), root(&parent, link.aliases[1]));
-                parent[a as usize] = b;
-                for (alias, id) in link.aliases.into_iter().zip(link.ids) {
-                    aliases |= 1 << alias;
-                    if types::id::less(id, smallest) {
-                        smallest = id;
-                    }
-                }
-            }
-            let top = root(&parent, aliases.trailing_zeros() as u8);
-            let one = (0..MASK_ALIASES as u8).filter(|alias| aliases >> alias & 1 == 1).all(|alias| root(&parent, alias) == top);
-            if one {
-                (state[person], mask[person], name[person]) = (ONE, aliases, smallest);
+                general.push(link.ids);
             } else {
-                state[person] = MIXED;
-                general.extend(links.iter().map(|link| link.ids));
+                state[person] = ONE;
             }
         }
         Links { state, mask, name, general: links::build(&general), user_key: plan.user_key }
@@ -416,8 +408,15 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
                     if flags[person] & EXTRA == 0 {
                         sessions::positional::person(ctx, name, &times[stretch], run.first, &pays, &mut next_pay, clicks, &mut work.agg);
                     } else {
-                        // The table's events and the extras together, in time order.
-                        let mut all: Vec<(u32, u32)> = Vec::with_capacity(stretch.len() + 8);
+                        // The table's events, which are in time order, with the extras
+                        // merged in: a few rows, sorted alone. (Sorting them all together was
+                        // 1.4% of a run's instructions at 20M: the whales have extras.)
+                        let from = extras.partition_point(|extra| (extra.person as usize) < person);
+                        let mut own: Vec<(u32, u32)> =
+                            extras[from..].iter().take_while(|extra| extra.person as usize == person).map(|extra| (extra.ts, extra.pay)).collect();
+                        own.sort_unstable_by_key(|&(ts, _)| ts);
+                        let mut next_own = 0;
+                        let mut all: Vec<(u32, u32)> = Vec::with_capacity(stretch.len() + own.len());
                         for number in stretch {
                             if times[number] != 0 {
                                 let pay = match pays.get(next_pay) {
@@ -427,12 +426,14 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
                                     }
                                     _ => 0,
                                 };
+                                while own.get(next_own).is_some_and(|&(ts, _)| ts <= times[number]) {
+                                    all.push(own[next_own]);
+                                    next_own += 1;
+                                }
                                 all.push((times[number], pay));
                             }
                         }
-                        let from = extras.partition_point(|extra| (extra.person as usize) < person);
-                        all.extend(extras[from..].iter().take_while(|extra| extra.person as usize == person).map(|extra| (extra.ts, extra.pay)));
-                        all.sort_unstable_by_key(|&(ts, _)| ts);
+                        all.extend_from_slice(&own[next_own..]);
                         sessions::positional::person_pairs(ctx, name, &all, clicks, &mut work.agg);
                     }
                 } else {
