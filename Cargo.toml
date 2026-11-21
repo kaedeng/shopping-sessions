@@ -2,5 +2,9 @@
 name = "shopping-sessions"
 version = "0.1.0"
 edition = "2024"
+publish = false
 
 [dependencies]
+polars = { version = "0.55.2", features = ["lazy", "parquet", "dtype-date"] }
+polars-core = "0.55.2"  # same crate polars uses; only for its thread pool (RAYON)
+serde_json = "1"
