@@ -36,6 +36,7 @@ Checked by:
 
 - the 36 fixtures and `dev/` against `dev-answer/` under `SS_PIPE=auto`, `classic` and `positional`, each also with `SS_POS_DECODE=wide`, `SS_POS_DECODE=row`, `SS_POS_TOK=mask` and `NCPU=3`. Forced on, the fixtures run entirely through the exception paths, since their IDs are not numbers;
 - `scripts/pos_check.sh seeds`: 11 seeds from 1,000 to 5M events against the classic output, exact, under four settings; and the 20M and 60M sets;
+- the same script with chunks of 32, 33 and 40 KB, so that thousands of lines cross a chunk's cut, under both readers; and with 1 KB chunks under `SS_PIPE=positional` (a sample that small finds no keys, so `auto` would run the classic pipeline);
 - `scripts/pos_check.sh spoiled`: datasets spoiled by `scripts/mutate.py` (event IDs and users swapped between rows, earlier copies with another user or a bad row, times out of order, IDs respelled, people merged and split by links, clicks moved), up to 5,000 mutations of each kind in 300,000 events. With most persons thrown out of the fast lane the outputs still match.
 
 `mutate.py` keeps two promises of the rules, because without them the answer is anyone's choice in both pipelines: copies of an event with equal `ingest_ts` are identical, and so are copies of a click.
@@ -82,7 +83,7 @@ With 8 workers the kernel takes 19% of the cycles: 7% zeroing the fresh pages of
 - **Both windows checked in one block.** The compiler paired the two windows' bit operations in vector registers, 40 instructions of moves a line: each window now leaves by its own branch (`tok::fused::event_shape`).
 - **All of a row's fields cut before the kernels run.** Twenty live vectors and the kernels' own did not fit the registers: 60 of the decode's 640 instructions a group were moves to and from the stack. Each kernel now asks for its field's words when it runs (`Fields`).
 - **Handing a parsed chunk's pages back while the others parse** (`free-early` on the input mapping): each `madvise` flushes the TLB of every other worker's CPU. The parse took 179 ms with it and 159 without (8 workers, 20M), but without it the process spent 60 ms unmapping at exit. Reading the chunk with `pread` has neither cost: about 3% less CPU time than the mapping.
-- **Keeping the input files open for those reads.** A few hundred open files grow the descriptor table while the workers run, and each growth waits out an RCU grace period: 40 ms each, 130 ms in the inputs stage. A file is opened for its read only.
+- **Keeping every input file open for those reads.** A few hundred open files grow the descriptor table while the workers run, and each growth waits out an RCU grace period: 40 ms each, 130 ms in the inputs stage. A worker keeps one file open, the one it read last: chunks come file by file, so at 60M that is 630 opens for 5,432 reads.
 - **Other partition sizes** (`SS_POS_SHIFT` 12 to 16) and **other chunk sizes** (128 KB to 1 MB): no difference beyond the noise with one process.
 - **The whole row code for a purchase**: 600 instructions each for 3% of the rows, 4% of the run. The decode's record is right for a purchase but for the price and the product.
 - **A counting sort of the links and a union-find per person**: replaced by the alias masks, 0.2 G instructions less, the same classification.

@@ -350,7 +350,7 @@ impl Ingest {
     /// `None` for a segment that is not a mapped file's, a read that fails, or a last line
     /// that passes `READ_SLACK`: the caller takes the mapping (`seg`, then `release`).
     #[cfg(feature = "pipe-positional")]
-    fn read(&self, seg: &Seg, buf: &mut Vec<u8>) -> Option<(*const u8, usize)> {
+    fn read(&self, seg: &Seg, buf: &mut Vec<u8>, open: &mut Option<(usize, File)>) -> Option<(*const u8, usize)> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
@@ -358,10 +358,15 @@ impl Ingest {
             if !self.pread {
                 return None;
             }
-            // Opened for this read only. Kept open, a few hundred files grow the descriptor
-            // table while the workers run, and each growth waits out an RCU grace period
-            // (40 ms each at 20M on the x86 box); thousands would pass the usual limit.
-            let file = File::open(path).ok()?;
+            // A worker keeps one file open, the one it read last: chunks come file by file,
+            // so most reads find theirs. Every file kept open would grow the descriptor
+            // table while the workers run, and each growth waits out an RCU grace period (40
+            // ms each for a few hundred files at 20M on the x86 box); thousands would pass
+            // the usual limit.
+            if open.as_ref().is_none_or(|&(buf, _)| buf != seg.buf) {
+                *open = Some((seg.buf, File::open(path).ok()?));
+            }
+            let (_, file) = open.as_ref()?;
             // From the byte before the segment's first to a little past its cut.
             let (from, to) = (seg.start - 1, (seg.end + READ_SLACK).min(seg.limit));
             let bytes = to - from;
@@ -380,7 +385,7 @@ impl Ingest {
         }
         #[cfg(not(unix))]
         {
-            let _ = (seg, buf);
+            let _ = (seg, buf, open);
             None
         }
     }
