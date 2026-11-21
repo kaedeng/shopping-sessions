@@ -1,0 +1,12 @@
+[package]
+name = "dedup"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+types = { path = "../types" }
+
+[features]
+default = ["dedup-partitioned"]
+dedup-partitioned = []

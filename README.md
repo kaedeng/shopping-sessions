@@ -1,12 +1,12 @@
-# Shopping Sessions: Polars (Rust) starter
+# Shopping Sessions: custom Rust engine
 
-A Rust Polars skeleton, ported from the Python Polars starter, that reads the inputs and writes both output tables with the right schema. Both tables are empty, so the checker marks it incorrect until you implement `rules.md`. If this and `rules.md` disagree, `rules.md` wins.
+Reads the inputs under `$DATA_DIR` and writes `user_daily/` and `campaign_daily/` as Parquet under `$OUTPUT_DIR`, following `rules.md`. If this and `rules.md` disagree, `rules.md` wins.
 
-- `src/main.rs` holds the pipeline. The TODO lists the steps in order.
-- `Cargo.toml` pins `polars` 0.55 (features `lazy`, `parquet`, `dtype-date`). Add features as you need them (`strings`, `regex`, `is_in`, `rank`, ...).
-- `Dockerfile` is a two-stage build: `rust:1.98-slim-trixie` compiles, `debian:trixie-slim` runs. Dependencies get their own layer, so editing `src/` doesn't recompile Polars.
-- `run.sh` is the entry point. It points every temp and spill directory at `/scratch` and sets `POLARS_MAX_THREADS` from `NCPU`.
-- `scripts/` and `Makefile` are the Python starter's, unchanged except for paths. `make native` and `make fixtures` read the 36 fixtures from `fixtures/`.
+- `decisions.md` holds the design pick per slot, `alternatives.md` every option and measurement, `implementation.md` how the picks are built: the crates, the feature and env var of every slot, the record layouts, the limits.
+- `src/main.rs` is the pipeline: three parallel stages (parse, dedup and person scatter, sessions and output). Each stage's code is a crate under `crates/`.
+- `Dockerfile` is a two-stage build: `rust:1.98-slim-trixie` compiles, `debian:trixie-slim` runs. `.cargo/config.toml` compiles amd64 for `x86-64-v3` (AVX2, BMI2).
+- `run.sh` is the entry point. The binary needs no temp directory and takes its thread count from `NCPU`.
+- `generator/` writes datasets; `prototypes/` are the throwaway benchmarks behind `alternatives.md`.
 
 ## Run and test
 
@@ -17,14 +17,16 @@ make native                          # cargo build --release, then all 36 fixtur
 make fixtures                        # the same through the image, with scorer flags
 make build run-dev PLATFORM=linux/arm64   # native image on Apple silicon; check amd64 before submitting
 make check-dev                       # diff out/ against dev-answer/
+SS_TIMING=1 DATA_DIR=dev OUTPUT_DIR=out target/release/shopping-sessions   # per-stage wall time
 ```
 
-Building amd64 on Apple silicon emulates rustc and compiling Polars takes a long time. Build time is never timed, only the run.
+`make dev` needs `generate` on the PATH: `cargo build --release` in `generator/`.
 
-## Pitfalls
+## Benchmarking an alternative
 
-The Python starter's pitfalls apply (its CSV reader is not `rules.md`'s dialect; `\d` is not `[0-9]`; 24 GB, no swap). Rust-specific:
+Every alternative is a Cargo feature that only adds code, and each slot with more than one compiled in has an env var that picks at start (the table is in `implementation.md`):
 
-- **Spill directory.** Polars 0.55's streaming engine spills to `/var/tmp` by default, ignoring `POLARS_TEMP_DIR`; the root is read-only, so `run.sh` sets `POLARS_OOC_SPILL_DIR`.
-- **Threads.** `POLARS_MAX_THREADS` is read once, when the pool first starts. Set it in `run.sh`, not mid-program.
-- **CPU target.** The scorers have AVX-512, but `target-cpu=native` in the image would tune for the build host. Pin `-C target-cpu=cascadelake` for amd64 only if you want it.
+```sh
+cargo build --release --features tok-scalar
+SS_TOK=scalar SS_TIMING=1 DATA_DIR=full OUTPUT_DIR=out target/release/shopping-sessions
+```

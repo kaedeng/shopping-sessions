@@ -1,10 +1,72 @@
-[package]
-name = "shopping-sessions"
+[workspace]
+members = ["crates/*"]
+exclude = ["prototypes", "generator"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2024"
 publish = false
 
+[package]
+name = "shopping-sessions"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
 [dependencies]
-polars = { version = "0.55.2", features = ["lazy", "parquet", "dtype-date"] }
-polars-core = "0.55.2"  # same crate polars uses; only for its thread pool (RAYON)
-serde_json = "1"
+types = { path = "crates/types", default-features = false }
+ingest = { path = "crates/ingest", default-features = false }
+links = { path = "crates/links", default-features = false }
+dedup = { path = "crates/dedup", default-features = false }
+sessions = { path = "crates/sessions", default-features = false }
+output = { path = "crates/output", default-features = false }
+mimalloc = { version = "0.1", optional = true }
+
+# One feature per alternative in alternatives.md. Features only add code: the picks are the
+# defaults, and when a slot has several compiled in, its env var chooses (implementation.md).
+[features]
+default = [
+    "id-u64", "rec-32", "hash-mul", "table-linear", "par-counter",
+    "reader-mmap", "tok-mask", "ts-table",
+    "links-serial", "lookup-prefetch",
+    "dedup-partitioned",
+    "sess-partitioned", "sess-purchase-side", "sort-std", "attr-sweep", "agg-dense",
+    "out-arrow",
+    "fast-exit",
+]
+# types
+id-u64 = ["types/id-u64"]
+rec-32 = ["types/rec-32"]
+hash-mul = ["types/hash-mul"]
+table-linear = ["types/table-linear"]
+par-counter = ["types/par-counter"]
+# ingest
+reader-mmap = ["ingest/reader-mmap"]
+reader-populate = ["ingest/reader-populate"]
+tok-mask = ["ingest/tok-mask"]
+tok-scalar = ["ingest/tok-scalar"]
+ts-table = ["ingest/ts-table"]
+# links
+links-serial = ["links/links-serial"]
+lookup-prefetch = ["links/lookup-prefetch"]
+# dedup
+dedup-partitioned = ["dedup/dedup-partitioned"]
+# sessions
+sess-partitioned = ["sessions/sess-partitioned"]
+sess-purchase-side = ["sessions/sess-purchase-side"]
+sort-std = ["sessions/sort-std"]
+attr-sweep = ["sessions/attr-sweep"]
+agg-dense = ["sessions/agg-dense"]
+# output
+out-arrow = ["output/out-arrow"]
+# process
+fast-exit = []
+# A process has one global allocator, so this one swaps at build time; no env var.
+alloc-mimalloc = ["dep:mimalloc"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

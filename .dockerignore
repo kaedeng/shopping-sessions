@@ -1,8 +1,11 @@
+target/
 fixtures/
 dev/
+full/
 out/
 *.md
 .git
-target/
 generator/
+prototypes/
 dev-answer/
+*.pdf

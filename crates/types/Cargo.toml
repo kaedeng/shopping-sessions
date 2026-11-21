@@ -1,0 +1,13 @@
+[package]
+name = "types"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[features]
+default = ["id-u64", "rec-32", "hash-mul", "table-linear", "par-counter"]
+id-u64 = []
+rec-32 = []
+hash-mul = []
+table-linear = []
+par-counter = []

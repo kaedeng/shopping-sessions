@@ -1,0 +1,20 @@
+[package]
+name = "ingest"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+types = { path = "../types" }
+memchr = "2"
+memmap2 = { version = "0.9", optional = true }
+serde_json = "1"
+
+[features]
+default = ["reader-mmap", "tok-mask", "ts-table"]
+reader-mmap = ["dep:memmap2"]
+# Linux only: `SS_READER=populate` faults each chunk in with one MADV_POPULATE_READ.
+reader-populate = ["reader-mmap"]
+tok-mask = []
+tok-scalar = []
+ts-table = []

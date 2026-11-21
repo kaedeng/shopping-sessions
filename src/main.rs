@@ -1,93 +1,139 @@
-//! Shopping Sessions: Polars (Rust) starter (skeleton).
+//! Shopping Sessions. Three data-parallel stages with two barriers (decision "Parallelism"):
+//! parse (with the union-find beside it), dedup and person scatter, then sessions and output.
 //!
-//! This runs end to end inside the scorer's container and writes both output tables
-//! with the exact schema, but the tables are EMPTY, so the checker will mark it
-//! incorrect. It gives you the plumbing; the rules are yours to implement.
-//!
-//! Reads  $DATA_DIR    (default /data)
-//! Writes $OUTPUT_DIR  (default /output): user_daily/ and campaign_daily/ as Parquet
-//! Temp   $SCRATCH_DIR (default /scratch)
+//! Reads  $DATA_DIR   (default /data)
+//! Writes $OUTPUT_DIR (default /output): user_daily/ and campaign_daily/ as Parquet
+//! `SS_TIMING=1` prints each stage's wall time to stderr; implementation.md lists every knob.
 
-use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::Instant;
 
-use polars::prelude::*;
+use ingest::{Ingest, ParseOut};
+use sessions::Agg;
+use types::par;
+use types::record::{ClickRec, PersonEvent};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+// Slot `alloc-mimalloc`: a build-time swap, since a process has one global allocator.
+#[cfg(feature = "alloc-mimalloc")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-fn env_or(key: &str, default: &str) -> PathBuf {
-    std::env::var_os(key).map_or_else(|| default.into(), PathBuf::from)
+/// Clicks per person-lookup task.
+const CLICK_TASK: usize = 1 << 16;
+
+/// One worker's person buckets, filled after dedup.
+struct Scattered {
+    events: Vec<Vec<PersonEvent>>,
+    clicks: Vec<Vec<ClickRec>>,
+    scratch: dedup::Scratch,
 }
 
-/// Every `*.csv` directly in `dir`, sorted. A missing folder is an error, not zero files.
-fn csv_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files: Vec<PathBuf> = fs::read_dir(dir)?
-        .map(|entry| entry.map(|e| e.path()))
-        .collect::<std::io::Result<_>>()?;
-    files.retain(|p| p.extension().is_some_and(|ext| ext == "csv"));
-    files.sort();
-    Ok(files)
+fn dir(var: &str, default: &str) -> PathBuf {
+    std::env::var_os(var).map_or_else(|| default.into(), PathBuf::from)
 }
 
-fn main() -> Result<()> {
-    let data = env_or("DATA_DIR", "/data");
-    let out = env_or("OUTPUT_DIR", "/output");
-    let _scratch = env_or("SCRATCH_DIR", "/scratch");
-
-    let manifest: serde_json::Value =
-        serde_json::from_reader(File::open(data.join("manifest.json"))?)?;
-    println!("window: {} to {}", manifest["window_start"], manifest["window_end"]);
-    println!("polars threads: {}", polars_core::runtime::RAYON.current_num_threads());
-
-    let event_files = csv_files(&data.join("events"))?;
-    let click_files = csv_files(&data.join("clicks"))?;
-    let link_files = csv_files(&data.join("links"))?;
-    println!(
-        "{} event files, {} click files, {} link files",
-        event_files.len(),
-        click_files.len(),
-        link_files.len()
-    );
-
-    // TODO: implement the rules.
-    //   Links:  parse -> union-find -> name each person by the byte-wise smallest ID
-    //   Events: parse -> dedup on event_id (smallest ingest_ts, before validation)
-    //           -> validate -> drop late -> sessionize per person (gap > 30 min)
-    //           -> day of session start -> categories
-    //   Clicks: parse -> dedup -> validate -> credit each session to the latest
-    //           click at or before its start, within 7 days (ties: smallest click_id)
-    //           -> assists
-    //
-    // Careful with Polars' CSV reader: it handles malformed lines and quoting its own
-    // way, which is not necessarily the spec's way (`\r`, stray quotes, field counts).
-    // Check it against the fixtures. LazyFrame + streaming helps with memory at full
-    // size; the container has about 24 GB and no swap.
-
-    let user_daily = Schema::from_iter([
-        Field::new("user_id".into(), DataType::String),
-        Field::new("day".into(), DataType::Date),
-        Field::new("sessions".into(), DataType::Int64),
-        Field::new("events".into(), DataType::Int64),
-        Field::new("revenue_cents".into(), DataType::Int64),
-        Field::new("top_category".into(), DataType::String),
-    ]);
-    let campaign_daily = Schema::from_iter([
-        Field::new("campaign_id".into(), DataType::String),
-        Field::new("channel".into(), DataType::String),
-        Field::new("day".into(), DataType::Date),
-        Field::new("sessions".into(), DataType::Int64),
-        Field::new("purchasing_sessions".into(), DataType::Int64),
-        Field::new("revenue_cents".into(), DataType::Int64),
-        Field::new("assisted_sessions".into(), DataType::Int64),
-    ]);
-
-    // Write both tables with the exact schema the checker expects.
-    for (name, schema) in [("user_daily", &user_daily), ("campaign_daily", &campaign_daily)] {
-        let folder = out.join(name);
-        fs::create_dir_all(&folder)?;
-        let mut df = DataFrame::empty_with_schema(schema);
-        ParquetWriter::new(File::create(folder.join("part-0.parquet"))?).finish(&mut df)?;
+fn main() {
+    if let Err(error) = run() {
+        eprintln!("shopping-sessions: {error}");
+        std::process::exit(1);
     }
-    println!("wrote empty user_daily and campaign_daily (skeleton)");
+}
+
+fn run() -> Result<(), String> {
+    let started = Instant::now();
+    let timing = std::env::var_os("SS_TIMING").is_some();
+    let mut last = started;
+    let mut lap = |stage: &str| {
+        if timing {
+            let now = Instant::now();
+            eprintln!("{stage:<9}{:>8.1} ms", (now - last).as_secs_f64() * 1e3);
+            last = now;
+        }
+    };
+
+    let (data, out) = (dir("DATA_DIR", "/data"), dir("OUTPUT_DIR", "/output"));
+    let ctx = ingest::load_ctx(&data)?;
+    let ingest = Ingest::open(&data, &ctx)?;
+    lap("inputs");
+
+    // Stage 1. Task 0 is the union-find, the only serial job; its worker then joins the parse.
+    let mut parsed: Vec<ParseOut> = (0..ctx.workers).map(|_| ingest.new_out(&ctx)).collect();
+    let link_table = OnceLock::new();
+    par::run(&mut parsed, ingest.tasks() + 1, |_, out, task| match task {
+        0 => drop(link_table.set(links::build(&ingest.links()))),
+        _ => ingest.parse(&ctx, task - 1, out),
+    });
+    let link_table = link_table.get().expect("task 0 ran");
+    lap("parse");
+
+    // Stage 2. Each dedup partition, then its survivors' persons; clicks only need the person.
+    let (parts, buckets) = (1usize << ctx.part_bits, 1usize << ctx.bucket_bits);
+    let click_tasks: Vec<(usize, usize)> = parsed
+        .iter()
+        .enumerate()
+        .flat_map(|(worker, out)| (0..out.clicks.len()).step_by(CLICK_TASK).map(move |start| (worker, start)))
+        .collect();
+    let events: usize = parsed.iter().flat_map(|out| &out.parts).map(Vec::len).sum();
+    let clicks: usize = parsed.iter().map(|out| out.clicks.len()).sum();
+    let room = |rows: usize| rows / ctx.workers / buckets * 9 / 8 + 64;
+    let mut scattered: Vec<Scattered> = (0..ctx.workers)
+        .map(|_| Scattered {
+            events: (0..buckets).map(|_| Vec::with_capacity(room(events))).collect(),
+            clicks: (0..buckets).map(|_| Vec::with_capacity(room(clicks))).collect(),
+            scratch: Default::default(),
+        })
+        .collect();
+    par::run(&mut scattered, parts + click_tasks.len(), |_, mine, task| {
+        if task < parts {
+            let pieces = parsed.iter().map(|out| &out.parts[task][..]);
+            let kept = dedup::partition(pieces, ctx.part_bits, &mut mine.scratch);
+            links::scatter_events(link_table, kept, ctx.bucket_bits, &mut mine.events);
+        } else {
+            let (worker, start) = click_tasks[task - parts];
+            let clicks = &parsed[worker].clicks;
+            let end = clicks.len().min(start + CLICK_TASK);
+            links::scatter_clicks(link_table, &clicks[start..end], ctx.bucket_bits, &mut mine.clicks);
+        }
+    });
+    lap("dedup");
+
+    // Stage 3. Person buckets, largest first so a whale's bucket is not the last to start.
+    let mut order: Vec<usize> = (0..buckets).collect();
+    order.sort_by_cached_key(|&bucket| {
+        std::cmp::Reverse(scattered.iter().map(|mine| mine.events[bucket].len()).sum::<usize>())
+    });
+    let mut aggs: Vec<Agg> = (0..ctx.workers).map(|_| Agg::new(&ctx)).collect();
+    par::run(&mut aggs, buckets, |_, agg, task| {
+        let bucket = order[task];
+        let events = scattered.iter().map(|mine| &mine.events[bucket][..]);
+        let clicks = scattered.iter().map(|mine| &mine.clicks[bucket][..]);
+        sessions::bucket(&ctx, events, clicks, agg);
+    });
+    lap("sessions");
+
+    let (user_folder, campaign_folder) = (out.join("user_daily"), out.join("campaign_daily"));
+    for folder in [&user_folder, &campaign_folder] {
+        std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
+    }
+    let failure = OnceLock::new();
+    par::each(&mut aggs, |worker, agg| {
+        let rows = std::mem::take(&mut agg.user_daily);
+        if let Err(error) = output::user_daily(&user_folder, worker, &ctx, rows) {
+            drop(failure.set(error));
+        }
+    });
+    if let Some(error) = failure.into_inner() {
+        return Err(error);
+    }
+    output::campaign_daily(&campaign_folder, &ctx, sessions::campaign_daily(&ctx, &aggs))?;
+    lap("output");
+    if timing {
+        eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
+    }
+    // Slot `fast-exit`: the files are written, so skip the destructors and let the kernel reclaim.
+    if cfg!(feature = "fast-exit") {
+        std::process::exit(0);
+    }
     Ok(())
 }
