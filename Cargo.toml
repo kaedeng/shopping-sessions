@@ -32,7 +32,7 @@ default = [
     "links-serial", "lookup-prefetch",
     "dedup-partitioned",
     "sess-partitioned", "sess-purchase-side", "sort-grouped", "sort-std", "attr-sweep", "agg-dense",
-    "out-arrow",
+    "out-arrow", "out-direct",
     "fast-exit", "alloc-parallel", "free-early", "scatter-wc",
     "pipe-positional",
 ]
@@ -66,6 +66,9 @@ attr-sweep = ["sessions/attr-sweep"]
 agg-dense = ["sessions/agg-dense"]
 # output
 out-arrow = ["output/out-arrow"]
+# `user_daily` written by hand, `SS_OUT=direct|arrow` (the pick first); needs `out-arrow` for
+# `campaign_daily` and as the alternative.
+out-direct = ["output/out-direct"]
 # process
 # The pipeline for data that carries the generator's numbering, with the classic one as the
 # fallback (`SS_PIPE=auto|classic|positional`).

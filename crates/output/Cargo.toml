@@ -12,5 +12,7 @@ arrow-buffer = { version = "60.1.0", optional = true }
 arrow-schema = { version = "60.1.0", optional = true }
 
 [features]
-default = ["out-arrow"]
+default = ["out-arrow", "out-direct"]
+# `user_daily` written by hand (`SS_OUT=direct`, the pick); `campaign_daily` stays with arrow-rs.
+out-direct = []
 out-arrow = ["dep:parquet", "dep:arrow-array", "dep:arrow-buffer", "dep:arrow-schema"]
