@@ -34,6 +34,7 @@ use crate::{Ingest, ingest_slow, price_cents};
     target_feature = "avx512f",
     target_feature = "avx512bw",
     target_feature = "avx512dq",
+    target_feature = "avx512cd",
     target_feature = "bmi2"
 ))]
 const DECODES: &[&str] = &["fused", "wide", "row"];
@@ -42,7 +43,7 @@ const DECODES: &[&str] = &["fused", "wide", "row"];
     target_feature = "avx512f",
     target_feature = "avx512bw",
     target_feature = "avx512dq",
-    not(all(feature = "tok-shape", target_feature = "bmi2"))
+    not(all(feature = "tok-shape", target_feature = "bmi2", target_feature = "avx512cd"))
 ))]
 const DECODES: &[&str] = &["wide", "row"];
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq")))]
@@ -130,6 +131,7 @@ pub(crate) struct Campaigns {
         target_feature = "avx512f",
         target_feature = "avx512bw",
         target_feature = "avx512dq",
+        target_feature = "avx512cd",
         target_feature = "bmi2"
     )),
     allow(dead_code)
@@ -276,7 +278,8 @@ impl Ingest {
             click_shift,
             click_parts: persons.div_ceil(1 << click_shift),
             wide: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "wide",
-            fused: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "fused",
+            // The fused decode finds a date among the table's months, one step each.
+            fused: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "fused" && self.few_months(),
         })
     }
 
@@ -302,6 +305,14 @@ impl Ingest {
             })
         };
         rows
+    }
+
+    /// Whether the date table spans few enough calendar months for the fused decode.
+    fn few_months(&self) -> bool {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq"))]
+        return self.dates.few_months();
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq")))]
+        false
     }
 
     /// A worker's buffers for the positional parse.
@@ -409,10 +420,11 @@ unsafe fn events<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &D
         target_feature = "avx512f",
         target_feature = "avx512bw",
         target_feature = "avx512dq",
+        target_feature = "avx512cd",
         target_feature = "bmi2"
     ))]
     if plan.fused {
-        return unsafe { wide::fused::<M>(p, len, ctx, dates, plan, out) };
+        return unsafe { wide::fused::events::<M>(p, len, ctx, dates, plan, out) };
     }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq"))]
     if plan.wide {
@@ -440,10 +452,11 @@ unsafe fn clicks<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &D
         target_feature = "avx512f",
         target_feature = "avx512bw",
         target_feature = "avx512dq",
+        target_feature = "avx512cd",
         target_feature = "bmi2"
     ))]
     if plan.fused {
-        return unsafe { wide::fused_clicks::<M>(p, len, ctx, dates, campaigns, plan, out) };
+        return unsafe { wide::fused::clicks::<M>(p, len, ctx, dates, campaigns, plan, out) };
     }
     let _ = campaigns;
     let PosOut { clicks, odd_clicks, scratch, .. } = out;
@@ -617,6 +630,39 @@ pub(crate) mod wide {
     /// Records held before they are scattered; a group adds at most 8.
     const HELD: usize = 128;
 
+    /// The records decoded and not yet scattered: list, then the record's two words.
+    pub(super) struct Held {
+        lists: [u64; HELD],
+        low: [u64; HELD],
+        high: [u64; HELD],
+        len: usize,
+    }
+
+    impl Sink for Held {
+        #[inline(always)]
+        unsafe fn put<M: Mode>(&mut self, list: usize, rec: PosEvent, _: &mut Parts<PosEvent>) {
+            debug_assert!(self.len < HELD);
+            let (low, high) = rec.words();
+            (self.lists[self.len], self.low[self.len], self.high[self.len]) = (list as u64, low, high);
+            self.len += 1;
+        }
+    }
+
+    impl Held {
+        fn new() -> Held {
+            Held { lists: [0; HELD], low: [0; HELD], high: [0; HELD], len: 0 }
+        }
+
+        #[inline(always)]
+        fn flush<M: Mode>(&mut self, events: &mut Parts<PosEvent>) {
+            for at in 0..self.len {
+                // SAFETY: every list here was in range when put.
+                unsafe { events.push_as::<M>(self.lists[at] as usize, PosEvent::from_words(self.low[at], self.high[at])) };
+            }
+            self.len = 0;
+        }
+    }
+
     /// The words of a row the kernels read, one array per word (see `Batch::take`).
     const ID_FIRST: usize = 0;
     const ID_DIGITS: usize = 1;
@@ -633,32 +679,18 @@ pub(crate) mod wide {
     const KIND: usize = 12;
     const WORDS: usize = 13;
 
-    pub(super) struct Batch {
+    struct Batch {
         /// `at[field][row]`, `len[field][row]`: the row's fields as the tokenizer gave them.
         at: [[u64; ROWS]; 7],
         len: [[u64; ROWS]; 7],
         words: [[u64; ROWS]; WORDS],
         rows: usize,
-        /// The records decoded and not yet scattered: list, then the record's two words.
-        lists: [u64; HELD],
-        low: [u64; HELD],
-        high: [u64; HELD],
-        held: usize,
-    }
-
-    impl Sink for Batch {
-        #[inline(always)]
-        unsafe fn put<M: Mode>(&mut self, list: usize, rec: PosEvent, _: &mut Parts<PosEvent>) {
-            debug_assert!(self.held < HELD);
-            let (low, high) = rec.words();
-            (self.lists[self.held], self.low[self.held], self.high[self.held]) = (list as u64, low, high);
-            self.held += 1;
-        }
+        held: Held,
     }
 
     impl Batch {
         fn new() -> Batch {
-            Batch { at: [[0; ROWS]; 7], len: [[0; ROWS]; 7], words: [[0; ROWS]; WORDS], rows: 0, lists: [0; HELD], low: [0; HELD], high: [0; HELD], held: 0 }
+            Batch { at: [[0; ROWS]; 7], len: [[0; ROWS]; 7], words: [[0; ROWS]; WORDS], rows: 0, held: Held::new() }
         }
 
         /// Adds a row: its fields, and the words of them the kernels read.
@@ -675,44 +707,22 @@ pub(crate) mod wide {
                     *self.len.get_unchecked_mut(field).get_unchecked_mut(row) = value.len as u64;
                 }
                 let [id, user, ts, ingest, kind, ..] = *fields;
-                self.read(dates, row, id.p, user.p, ts.p, ingest.p, kind.p);
+                let mut set = |word: usize, value: u64| *self.words.get_unchecked_mut(word).get_unchecked_mut(row) = value;
+                set(ID_FIRST, rd(id.p));
+                set(ID_DIGITS, rd(id.p.add(1)));
+                set(USER_FIRST, rd(user.p));
+                set(USER_DIGITS, rd(user.p.add(1)));
+                set(TS_0, rd(ts.p));
+                set(TS_8, rd(ts.p.add(8)));
+                set(TS_12, rd(ts.p.add(12)));
+                set(TS_19, rd(ts.p.add(19)));
+                set(TS_DATE, dates.date_s(ts.p) as u64);
+                set(INGEST_8, rd(ingest.p.add(8)));
+                set(INGEST_12, rd(ingest.p.add(12)));
+                set(INGEST_DATE, dates.date_s(ingest.p) as u64);
+                set(KIND, rd(kind.p));
             }
             self.rows = row + 1;
-        }
-
-        /// Row `row`'s words, read at the first bytes of its first five fields.
-        ///
-        /// # Safety
-        /// `row < ROWS`, and 27 bytes are readable at each pointer.
-        #[inline(always)]
-        #[allow(clippy::too_many_arguments)]
-        unsafe fn read(&mut self, dates: &Dates, row: usize, id: *const u8, user: *const u8, ts: *const u8, ingest: *const u8, kind: *const u8) {
-            // SAFETY: the caller's.
-            unsafe {
-                let mut set = |word: usize, value: u64| *self.words.get_unchecked_mut(word).get_unchecked_mut(row) = value;
-                set(ID_FIRST, rd(id));
-                set(ID_DIGITS, rd(id.add(1)));
-                set(USER_FIRST, rd(user));
-                set(USER_DIGITS, rd(user.add(1)));
-                set(TS_0, rd(ts));
-                set(TS_8, rd(ts.add(8)));
-                set(TS_12, rd(ts.add(12)));
-                set(TS_19, rd(ts.add(19)));
-                set(TS_DATE, dates.date_s(ts) as u64);
-                set(INGEST_8, rd(ingest.add(8)));
-                set(INGEST_12, rd(ingest.add(12)));
-                set(INGEST_DATE, dates.date_s(ingest) as u64);
-                set(KIND, rd(kind));
-            }
-        }
-
-        #[inline(always)]
-        fn flush<M: Mode>(&mut self, events: &mut Parts<PosEvent>) {
-            for at in 0..self.held {
-                // SAFETY: every list here was in range when put.
-                unsafe { events.push_as::<M>(self.lists[at] as usize, PosEvent::from_words(self.low[at], self.high[at])) };
-            }
-            self.held = 0;
         }
     }
 
@@ -723,6 +733,96 @@ pub(crate) mod wide {
         unsafe {
             _mm512_set1_epi64(value as i64)
         }
+    }
+
+    /// Eight rows as the kernels read them: each lane a row's words (little-endian, at the
+    /// first byte of the field, wrapping quotes stripped) and its fields' lengths.
+    struct Lanes {
+        /// The lanes that hold a row.
+        live: __mmask8,
+        /// The live lanes whose words are a well-formed line's: only these can be records
+        /// straight from the registers.
+        fit: __mmask8,
+        id_first: __m512i,
+        id_digits: __m512i,
+        id_len: __m512i,
+        user_first: __m512i,
+        user_digits: __m512i,
+        user_len: __m512i,
+        ts_0: __m512i,
+        ts_8: __m512i,
+        ts_12: __m512i,
+        ts_19: __m512i,
+        ts_len: __m512i,
+        ts_date: __m512i,
+        ingest_8: __m512i,
+        ingest_12: __m512i,
+        ingest_len: __m512i,
+        ingest_date: __m512i,
+        kind: __m512i,
+        kind_len: __m512i,
+        product_len: __m512i,
+    }
+
+    /// The records of the lanes that are plainly ordinary rows, appended to `held`; returns
+    /// the other live lanes, which are the row code's.
+    ///
+    /// # Safety
+    /// `held.len + 8 <= HELD`.
+    #[inline(always)]
+    unsafe fn records(lanes: &Lanes, held: &mut Held, ctx: &Ctx, dates: &Dates, plan: &PosPlan, limit: u64) -> __mmask8 {
+        // SAFETY: register arithmetic, and stores of 8 words at `held.len <= HELD - 8`.
+        unsafe {
+            let (number, id_ok) = numbers(lanes.id_first, lanes.id_digits, lanes.id_len, b'e', plan.event_key);
+            let (user, user_ok) = numbers(lanes.user_first, lanes.user_digits, lanes.user_len, b'u', plan.user_key);
+            let (ts_ok, ts) = dates.ts_wide(lanes.ts_0, lanes.ts_8, lanes.ts_12, lanes.ts_19, lanes.ts_len, lanes.ts_date);
+            let (ingest_ok, ingest_ms, ingest_s) = dates.f1_wide(lanes.ingest_8, lanes.ingest_12, lanes.ingest_len, lanes.ingest_date);
+            let kind = _mm512_and_si512(lanes.kind, all(0xFFFF_FFFF));
+            let view_or_cart = (_mm512_cmpeq_epi64_mask(kind, all(u64::from(u32::from_le_bytes(*b"view"))))
+                | _mm512_cmpeq_epi64_mask(kind, all(u64::from(u32::from_le_bytes(*b"cart")))))
+                & _mm512_cmpeq_epi64_mask(lanes.kind_len, all(4));
+            let fast = lanes.fit
+                & id_ok
+                & _mm512_cmplt_epu64_mask(number, all(limit))
+                & user_ok
+                & _mm512_cmplt_epu64_mask(_mm512_srli_epi64::<{ ALIAS_BITS }>(user), all(u64::from(plan.persons)))
+                & ts_ok
+                & ingest_ok
+                & view_or_cart
+                & _mm512_cmpneq_epi64_mask(lanes.product_len, all(0));
+
+            // `event_row`'s `valid` for such a row: the window, and not late.
+            let valid = _mm512_cmpge_epi64_mask(ts, all(u64::from(ctx.event_lo)))
+                & _mm512_cmplt_epi64_mask(ts, all(u64::from(ctx.ts_end)))
+                & _mm512_cmple_epi64_mask(_mm512_sub_epi64(ingest_ms, ts), all(DAY as u64));
+            // `Ctx::ingest_rel`.
+            let ingest_rel = _mm512_min_epi64(
+                _mm512_max_epi64(_mm512_sub_epi64(ingest_s, all(ctx.ingest_base() as u64)), all(0)),
+                all(u64::from(u32::MAX)),
+            );
+            // `PosEvent::new`: u | ts << 32, then ingest | slot << 32 | flags << 48.
+            let low = _mm512_or_si512(_mm512_and_si512(user, all(0xFFFF_FFFF)), _mm512_slli_epi64::<32>(ts));
+            let slot = _mm512_and_si512(number, all((1u64 << plan.shift) - 1));
+            let high = _mm512_or_si512(
+                _mm512_or_si512(ingest_rel, _mm512_slli_epi64::<32>(slot)),
+                _mm512_maskz_mov_epi64(valid, all(u64::from(POS_VALID) << 48)),
+            );
+            let list = _mm512_srl_epi64(number, _mm_cvtsi32_si128(plan.shift as i32));
+            // Compressed in a register and stored whole (the lanes past the fast ones are
+            // overwritten by the next store): the compressing store is microcoded on Zen 4.
+            let at = held.len;
+            _mm512_storeu_si512(held.lists.as_mut_ptr().add(at).cast(), _mm512_maskz_compress_epi64(fast, list));
+            _mm512_storeu_si512(held.low.as_mut_ptr().add(at).cast(), _mm512_maskz_compress_epi64(fast, low));
+            _mm512_storeu_si512(held.high.as_mut_ptr().add(at).cast(), _mm512_maskz_compress_epi64(fast, high));
+            held.len = at + fast.count_ones() as usize;
+            lanes.live & !fast
+        }
+    }
+
+    /// The lanes of a group that hold a row.
+    #[inline(always)]
+    fn live(rows: usize, first: usize) -> __mmask8 {
+        if rows - first >= 8 { 0xFF } else { (1u8 << (rows - first)) - 1 }
     }
 
     /// One event chunk through the batches.
@@ -742,340 +842,15 @@ pub(crate) mod wide {
                 }
                 batch.take(dates, fields);
                 if batch.rows == ROWS {
-                    decode::<M, false>(&mut batch, p, len, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+                    decode::<M>(&mut batch, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
                 }
             });
-            decode::<M, false>(&mut batch, p, len, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+            decode::<M>(&mut batch, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
         }
-        batch.flush::<M>(events);
+        batch.held.flush::<M>(events);
         // Streamed lines become visible to the placing threads.
         events.fence();
         pays.fence();
-    }
-
-    /// Slot `pos-fused`: one event chunk, each line read by its shape (`tok::fused`) straight
-    /// into the batch. No tokenizer runs between and no `Field` is built: a line's separators
-    /// give the first bytes of its fields, and the words the kernels read are copied from
-    /// there. A row keeps its line's offset (`at[0]`) instead of its fields; a line that is
-    /// not of the usual shape is a row too, with an `event_id` of no length, so the decode
-    /// leaves it to the row code like any other row it does not recognise (`slow_line`).
-    ///
-    /// # Safety
-    /// `p, len` is a segment.
-    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
-    #[inline(never)]
-    pub(super) unsafe fn fused<M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &PosPlan, out: &mut PosOut) {
-        use crate::tok::fused::{EVENT_WINDOW, event_shape};
-        let PosOut { events, pays, odd_events, odd_users, .. } = out;
-        let limit = plan.events() as u64;
-        let mut batch = Batch::new();
-        let mut at = 0;
-        // SAFETY: `at < len` is a line's first byte; `batch.rows < ROWS` between decodes; a
-        // shape's fields are inside the segment, with `PAD` readable bytes after it.
-        unsafe {
-            while at < len {
-                let (line, row) = (p.add(at), batch.rows);
-                *batch.at.get_unchecked_mut(0).get_unchecked_mut(row) = at as u64;
-                if at + EVENT_WINDOW <= len + crate::PAD
-                    && let Some(shape) = event_shape(line)
-                {
-                    for field in 0..6 {
-                        *batch.len.get_unchecked_mut(field).get_unchecked_mut(row) = shape.len[field] as u64;
-                    }
-                    let first = |field: usize| line.add(shape.start[field]);
-                    batch.read(dates, row, first(0), first(1), first(2), first(3), first(4));
-                    at += shape.next;
-                } else {
-                    *batch.len.get_unchecked_mut(0).get_unchecked_mut(row) = 0;
-                    at = line_end(p, len, at);
-                }
-                batch.rows = row + 1;
-                if batch.rows == ROWS {
-                    decode::<M, true>(&mut batch, p, len, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
-                }
-            }
-            decode::<M, true>(&mut batch, p, len, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
-        }
-        batch.flush::<M>(events);
-        // Streamed lines become visible to the placing threads.
-        events.fence();
-        pays.fence();
-    }
-
-    /// The first byte after the line at `at`.
-    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
-    #[cold]
-    #[inline(never)]
-    unsafe fn line_end(p: *const u8, len: usize, at: usize) -> usize {
-        // SAFETY: `at..len` is inside the segment.
-        let rest = unsafe { std::slice::from_raw_parts(p.add(at), len - at) };
-        at + memchr::memchr(b'\n', rest).map_or(rest.len(), |newline| newline + 1)
-    }
-
-    /// A row of the fused parse through the row code: the line at `at` tokenized again (by its
-    /// shape where it has one, a purchase mostly; by `Scalar` otherwise), then `event_row`.
-    ///
-    /// # Safety
-    /// `p, len` is a segment and `at < len` a line's first byte in it.
-    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
-    #[cold]
-    #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn slow_line<M: Mode>(
-        p: *const u8,
-        len: usize,
-        at: usize,
-        batch: &mut Batch,
-        ctx: &Ctx,
-        dates: &Dates,
-        plan: &PosPlan,
-        limit: u64,
-        events: &mut Parts<PosEvent>,
-        pays: &mut Parts<PosPay>,
-        odd_events: &mut Vec<EventRec>,
-        odd_users: &mut Vec<Id>,
-    ) {
-        // SAFETY: one line of the segment; the shape is asked for only where its window is
-        // readable, and its fields are inside the line.
-        unsafe {
-            let line = p.add(at);
-            if at + crate::tok::fused::EVENT_WINDOW <= len + crate::PAD
-                && let Some(shape) = crate::tok::fused::event_shape(line)
-            {
-                return event_row::<M, Batch>(ctx, dates, plan, limit, &shape.fields(line), batch, events, pays, odd_events, odd_users);
-            }
-            let bytes = line_end(p, len, at) - at;
-            Scalar::lines::<7>(line, bytes, &mut Scratch::new(), |fields| {
-                event_row::<M, Batch>(ctx, dates, plan, limit, fields, batch, events, pays, odd_events, odd_users)
-            });
-        }
-    }
-
-    /// The words of a click row the kernels read (`fused_clicks`).
-    const C_USER_FIRST: usize = 0;
-    const C_USER_DIGITS: usize = 1;
-    const C_USER_LEN: usize = 2;
-    const C_TS_0: usize = 3;
-    const C_TS_8: usize = 4;
-    const C_TS_12: usize = 5;
-    const C_TS_19: usize = 6;
-    const C_TS_LEN: usize = 7;
-    const C_TS_DATE: usize = 8;
-    /// The `click_id` packed (`types::id`): 0 for none.
-    const C_CLICK: usize = 9;
-    /// The campaign's index, or `Campaigns::NONE`.
-    const C_CAMPAIGN: usize = 10;
-    const C_WORDS: usize = 11;
-
-    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
-    struct ClickBatch {
-        /// Each row's line, from the segment's first byte.
-        at: [u64; ROWS],
-        words: [[u64; ROWS]; C_WORDS],
-        rows: usize,
-        /// The clicks decoded and not yet scattered: list, then the record's three words.
-        lists: [u64; HELD],
-        click: [u64; HELD],
-        low: [u64; HELD],
-        campaign: [u64; HELD],
-        held: usize,
-    }
-
-    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
-    impl ClickBatch {
-        fn new() -> ClickBatch {
-            ClickBatch { at: [0; ROWS], words: [[0; ROWS]; C_WORDS], rows: 0, lists: [0; HELD], click: [0; HELD], low: [0; HELD], campaign: [0; HELD], held: 0 }
-        }
-
-        #[inline(always)]
-        fn flush<M: Mode>(&mut self, clicks: &mut Parts<PosClick>) {
-            for at in 0..self.held {
-                // SAFETY: the decode put only lists of persons below `PosPlan::persons` here.
-                unsafe { clicks.push_as::<M>(self.lists[at] as usize, PosClick::from_words(self.click[at], self.low[at], self.campaign[at])) };
-            }
-            self.held = 0;
-        }
-    }
-
-    /// Slot `pos-fused`: one click chunk, each line read by its shape (`tok::fused`) into a
-    /// batch and decoded eight rows a step. Per row: the words of its `user_id` and `ts`, the
-    /// `ts`'s date, the `click_id` packed and the campaign looked up by its bytes
-    /// (`Campaigns`). A row the kernels recognise as an ordinary click (a `user_id` that is a
-    /// number inside the arrays, a `ts` in one of the usual forms, a campaign of the table)
-    /// becomes the record `click_row` makes, or nothing when its `ts` is outside the window or
-    /// it has no `click_id`, as there; every other row goes to `click_row` itself.
-    ///
-    /// # Safety
-    /// `p, len` is a segment.
-    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
-    #[inline(never)]
-    pub(super) unsafe fn fused_clicks<M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, campaigns: &Campaigns, plan: &PosPlan, out: &mut PosOut) {
-        use crate::tok::fused::click_shape;
-        let PosOut { clicks, odd_clicks, .. } = out;
-        let mut batch = ClickBatch::new();
-        // The clicks of the rows left to the row code.
-        let mut pending = Pending::new();
-        let mut at = 0;
-        // SAFETY: `at < len` is a line's first byte, with 64 readable bytes (`PAD`);
-        // `batch.rows < ROWS` between decodes; a shape's fields are inside the segment.
-        unsafe {
-            while at < len {
-                let (line, row) = (p.add(at), batch.rows);
-                *batch.at.get_unchecked_mut(row) = at as u64;
-                let mut set = |word: usize, value: u64| *batch.words.get_unchecked_mut(word).get_unchecked_mut(row) = value;
-                if let Some(shape) = click_shape(line) {
-                    let (click, user, campaign, ts) = (line.add(shape.start[0]), line.add(shape.start[1]), line.add(shape.start[2]), line.add(shape.start[3]));
-                    set(C_USER_FIRST, rd(user));
-                    set(C_USER_DIGITS, rd(user.add(1)));
-                    set(C_USER_LEN, shape.len[1] as u64);
-                    set(C_TS_0, rd(ts));
-                    set(C_TS_8, rd(ts.add(8)));
-                    set(C_TS_12, rd(ts.add(12)));
-                    set(C_TS_19, rd(ts.add(19)));
-                    set(C_TS_LEN, shape.len[3] as u64);
-                    set(C_TS_DATE, dates.date_s(ts) as u64);
-                    set(C_CLICK, pack_at(click, shape.len[0]));
-                    set(C_CAMPAIGN, campaigns.get(campaign, shape.len[2]));
-                    at += shape.next;
-                } else {
-                    // Left to the row code: a click of some ID with no user, time or campaign
-                    // the kernels would take (the row's other words are an older row's).
-                    set(C_USER_LEN, 0);
-                    set(C_TS_LEN, 0);
-                    set(C_CLICK, 1);
-                    set(C_CAMPAIGN, Campaigns::NONE);
-                    at = line_end(p, len, at);
-                }
-                batch.rows = row + 1;
-                if batch.rows == ROWS {
-                    decode_clicks::<M>(&mut batch, p, len, ctx, dates, plan, &mut pending, clicks, odd_clicks);
-                }
-            }
-            decode_clicks::<M>(&mut batch, p, len, ctx, dates, plan, &mut pending, clicks, odd_clicks);
-        }
-        batch.flush::<M>(clicks);
-        pending.flush::<M>(clicks);
-        clicks.fence();
-    }
-
-    /// Decodes the gathered click rows and leaves the batch empty of rows.
-    ///
-    /// # Safety
-    /// `base, bytes` is the segment the rows' lines are in.
-    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
-    #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn decode_clicks<M: Mode>(
-        batch: &mut ClickBatch,
-        base: *const u8,
-        bytes: usize,
-        ctx: &Ctx,
-        dates: &Dates,
-        plan: &PosPlan,
-        pending: &mut Pending<PosClick>,
-        clicks: &mut Parts<PosClick>,
-        odd_clicks: &mut Vec<ClickRec>,
-    ) {
-        let rows = std::mem::take(&mut batch.rows);
-        let mut first = 0;
-        while first < rows {
-            if batch.held + 8 > HELD {
-                batch.flush::<M>(clicks);
-            }
-            let live: __mmask8 = if rows - first >= 8 { 0xFF } else { (1u8 << (rows - first)) - 1 };
-            // SAFETY: `first + 8 <= ROWS`. A lane past `rows` holds an older row's words or
-            // zeros, and `live` keeps it out of everything below.
-            unsafe {
-                let word = |word: usize| _mm512_loadu_si512(batch.words[word].as_ptr().add(first).cast());
-                let (user, user_ok) = numbers(word(C_USER_FIRST), word(C_USER_DIGITS), word(C_USER_LEN), b'u', plan.user_key);
-                let (ts_ok, ts) = dates.ts_wide(word(C_TS_0), word(C_TS_8), word(C_TS_12), word(C_TS_19), word(C_TS_LEN), word(C_TS_DATE));
-                let (click, campaign) = (word(C_CLICK), word(C_CAMPAIGN));
-                let has_click = _mm512_test_epi64_mask(click, click);
-                // `click_row`'s window, on a `ts` that is the one `Dates::ts` gives.
-                let inside = _mm512_cmpge_epi64_mask(ts, _mm512_setzero_si512()) & _mm512_cmplt_epi64_mask(ts, all(u64::from(ctx.ts_end)));
-                let person = _mm512_srli_epi64::<{ ALIAS_BITS }>(user);
-                let fast = live
-                    & has_click
-                    & user_ok
-                    & _mm512_cmplt_epu64_mask(person, all(u64::from(plan.persons)))
-                    & ts_ok
-                    & inside
-                    & _mm512_cmpneq_epi64_mask(campaign, all(Campaigns::NONE));
-                // No click whatever the rest says: no `click_id`, or a well-formed `ts`
-                // outside the window.
-                let dropped = !has_click | (ts_ok & !inside);
-
-                // `PosClick::new`: u | ts << 32.
-                let low = _mm512_or_si512(_mm512_and_si512(user, all(0xFFFF_FFFF)), _mm512_slli_epi64::<32>(ts));
-                let list = _mm512_srl_epi64(person, _mm_cvtsi32_si128(plan.click_shift as i32));
-                let held = batch.held;
-                _mm512_storeu_si512(batch.lists.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, list));
-                _mm512_storeu_si512(batch.click.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, click));
-                _mm512_storeu_si512(batch.low.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, low));
-                _mm512_storeu_si512(batch.campaign.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, campaign));
-                batch.held = held + fast.count_ones() as usize;
-
-                // Every other row, through the row code.
-                let mut rest = live & !fast & !dropped;
-                while rest != 0 {
-                    let row = first + rest.trailing_zeros() as usize;
-                    rest &= rest - 1;
-                    slow_click::<M>(base, bytes, batch.at[row] as usize, ctx, dates, plan, pending, clicks, odd_clicks);
-                }
-            }
-            first += 8;
-        }
-    }
-
-    /// A click row of the fused parse through the row code: the line at `at` tokenized again,
-    /// then `click_row`.
-    ///
-    /// # Safety
-    /// `p, len` is a segment and `at < len` a line's first byte in it.
-    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
-    #[cold]
-    #[inline(never)]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn slow_click<M: Mode>(
-        p: *const u8,
-        len: usize,
-        at: usize,
-        ctx: &Ctx,
-        dates: &Dates,
-        plan: &PosPlan,
-        pending: &mut Pending<PosClick>,
-        clicks: &mut Parts<PosClick>,
-        odd_clicks: &mut Vec<ClickRec>,
-    ) {
-        // SAFETY: one line of the segment, 64 bytes readable at its first; a shape's fields
-        // are inside the line.
-        unsafe {
-            let line = p.add(at);
-            if let Some(shape) = crate::tok::fused::click_shape(line) {
-                return click_row::<M>(ctx, dates, plan, &shape.fields(line), pending, clicks, odd_clicks);
-            }
-            let bytes = line_end(p, len, at) - at;
-            Scalar::lines::<4>(line, bytes, &mut Scratch::new(), |fields| click_row::<M>(ctx, dates, plan, fields, pending, clicks, odd_clicks));
-        }
-    }
-
-    #[cfg(not(all(feature = "tok-shape", target_feature = "bmi2")))]
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn slow_line<M: Mode>(
-        _: *const u8,
-        _: usize,
-        _: usize,
-        _: &mut Batch,
-        _: &Ctx,
-        _: &Dates,
-        _: &PosPlan,
-        _: u64,
-        _: &mut Parts<PosEvent>,
-        _: &mut Parts<PosPay>,
-        _: &mut Vec<EventRec>,
-        _: &mut Vec<Id>,
-    ) {
-        unreachable!("the fused parse is not in this build")
     }
 
     /// Decodes the gathered rows and leaves the batch empty of rows.
@@ -1084,10 +859,8 @@ pub(crate) mod wide {
     /// Every gathered row's fields are from a segment still mapped.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn decode<M: Mode, const LINES: bool>(
+    unsafe fn decode<M: Mode>(
         batch: &mut Batch,
-        base: *const u8,
-        bytes: usize,
         ctx: &Ctx,
         dates: &Dates,
         plan: &PosPlan,
@@ -1100,74 +873,944 @@ pub(crate) mod wide {
         let rows = std::mem::take(&mut batch.rows);
         let mut first = 0;
         while first < rows {
-            if batch.held + 8 > HELD {
-                batch.flush::<M>(events);
+            if batch.held.len + 8 > HELD {
+                batch.held.flush::<M>(events);
             }
-            let live: __mmask8 = if rows - first >= 8 { 0xFF } else { (1u8 << (rows - first)) - 1 };
+            let live = live(rows, first);
             // SAFETY: `first + 8 <= ROWS`. A lane past `rows` holds an older row's words or
             // zeros, and `live` keeps it out of everything below.
             unsafe {
                 let word = |word: usize| _mm512_loadu_si512(batch.words[word].as_ptr().add(first).cast());
                 let len = |field: usize| _mm512_loadu_si512(batch.len[field].as_ptr().add(first).cast());
-
-                let (number, id_ok) = numbers(word(ID_FIRST), word(ID_DIGITS), len(0), b'e', plan.event_key);
-                let (user, user_ok) = numbers(word(USER_FIRST), word(USER_DIGITS), len(1), b'u', plan.user_key);
-                let (ts_ok, ts) = dates.ts_wide(word(TS_0), word(TS_8), word(TS_12), word(TS_19), len(2), word(TS_DATE));
-                let (ingest_ok, ingest_ms, ingest_s) = dates.f1_wide(word(INGEST_8), word(INGEST_12), len(3), word(INGEST_DATE));
-                let kind = _mm512_and_si512(word(KIND), all(0xFFFF_FFFF));
-                let view_or_cart = (_mm512_cmpeq_epi64_mask(kind, all(u64::from(u32::from_le_bytes(*b"view"))))
-                    | _mm512_cmpeq_epi64_mask(kind, all(u64::from(u32::from_le_bytes(*b"cart")))))
-                    & _mm512_cmpeq_epi64_mask(len(4), all(4));
-                let fast = live
-                    & id_ok
-                    & _mm512_cmplt_epu64_mask(number, all(limit))
-                    & user_ok
-                    & _mm512_cmplt_epu64_mask(_mm512_srli_epi64::<{ ALIAS_BITS }>(user), all(u64::from(plan.persons)))
-                    & ts_ok
-                    & ingest_ok
-                    & view_or_cart
-                    & _mm512_cmpneq_epi64_mask(len(5), all(0));
-
-                // `event_row`'s `valid` for such a row: the window, and not late.
-                let valid = _mm512_cmpge_epi64_mask(ts, all(u64::from(ctx.event_lo)))
-                    & _mm512_cmplt_epi64_mask(ts, all(u64::from(ctx.ts_end)))
-                    & _mm512_cmple_epi64_mask(_mm512_sub_epi64(ingest_ms, ts), all(DAY as u64));
-                // `Ctx::ingest_rel`.
-                let ingest_rel = _mm512_min_epi64(
-                    _mm512_max_epi64(_mm512_sub_epi64(ingest_s, all(ctx.ingest_base() as u64)), all(0)),
-                    all(u64::from(u32::MAX)),
-                );
-                // `PosEvent::new`: u | ts << 32, then ingest | slot << 32 | flags << 48.
-                let low = _mm512_or_si512(_mm512_and_si512(user, all(0xFFFF_FFFF)), _mm512_slli_epi64::<32>(ts));
-                let slot = _mm512_and_si512(number, all((1u64 << plan.shift) - 1));
-                let high = _mm512_or_si512(
-                    _mm512_or_si512(ingest_rel, _mm512_slli_epi64::<32>(slot)),
-                    _mm512_maskz_mov_epi64(valid, all(u64::from(POS_VALID) << 48)),
-                );
-                let list = _mm512_srl_epi64(number, _mm_cvtsi32_si128(plan.shift as i32));
-                // Compressed in a register and stored whole (the lanes past the fast ones are
-                // overwritten by the next store): the compressing store is microcoded on Zen 4.
-                let held = batch.held;
-                _mm512_storeu_si512(batch.lists.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, list));
-                _mm512_storeu_si512(batch.low.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, low));
-                _mm512_storeu_si512(batch.high.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, high));
-                batch.held = held + fast.count_ones() as usize;
-
-                // Every other row, through the row code.
-                let mut rest = live & !fast;
+                let lanes = Lanes {
+                    live,
+                    fit: live,
+                    id_first: word(ID_FIRST),
+                    id_digits: word(ID_DIGITS),
+                    id_len: len(0),
+                    user_first: word(USER_FIRST),
+                    user_digits: word(USER_DIGITS),
+                    user_len: len(1),
+                    ts_0: word(TS_0),
+                    ts_8: word(TS_8),
+                    ts_12: word(TS_12),
+                    ts_19: word(TS_19),
+                    ts_len: len(2),
+                    ts_date: word(TS_DATE),
+                    ingest_8: word(INGEST_8),
+                    ingest_12: word(INGEST_12),
+                    ingest_len: len(3),
+                    ingest_date: word(INGEST_DATE),
+                    kind: word(KIND),
+                    kind_len: len(4),
+                    product_len: len(5),
+                };
+                // Every row that is not a record already, through the row code.
+                let mut rest = records(&lanes, &mut batch.held, ctx, dates, plan, limit);
                 while rest != 0 {
                     let row = first + rest.trailing_zeros() as usize;
                     rest &= rest - 1;
-                    if LINES {
-                        // The fused parse kept the line's offset, not its fields.
-                        slow_line::<M>(base, bytes, batch.at[0][row] as usize, batch, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
-                        continue;
-                    }
                     let fields: [Field; 7] = std::array::from_fn(|field| Field { p: batch.at[field][row] as *const u8, len: batch.len[field][row] as usize });
-                    event_row::<M, Batch>(ctx, dates, plan, limit, &fields, batch, events, pays, odd_events, odd_users);
+                    event_row::<M, Held>(ctx, dates, plan, limit, &fields, &mut batch.held, events, pays, odd_events, odd_users);
                 }
             }
             first += 8;
+        }
+    }
+
+    /// Slot `pos-fused`: event and click lines read by their shape straight into the 8-row
+    /// decode, no tokenizer and no `Field` between.
+    ///
+    /// Per line, the scalar code finds the separators (two 64-byte windows for an event line,
+    /// as `tok::fused::event_shape`: the first three commas, then three commas and the
+    /// newline), checks nothing else, and copies what the decode will need: the separator and
+    /// quote bits of each window and the raw bytes at the first five fields, as words. Per 8
+    /// rows the decode then does the rest in registers: the quote rules (`pairs`), where each
+    /// field starts and how long it is, the fields' words with a wrapping quote shifted off
+    /// (`cut`), the dates (`Dates::date_wide`), and from there the kernels of `pos-wide`
+    /// (`records`). `tests::raw_rows_are_the_scalar_fields` checks that what the kernels are
+    /// given is what `Scalar` and `Batch::take` give them, lane for lane.
+    ///
+    /// A row keeps its line's offset. A line that is not of the usual shape, or whose quotes
+    /// are not wrapping pairs, or that `records` does not recognise (a purchase, anything
+    /// dirty), is tokenized again from that offset and goes through the row code.
+    #[cfg(all(feature = "tok-shape", target_feature = "bmi2", target_feature = "avx512cd"))]
+    pub(super) mod fused {
+        use super::*;
+        use crate::tok::fused::{EVENT_WINDOW, click_shape, event_shape, masks};
+
+        /// The words of an event row, one array per word.
+        const R_AT: usize = 0;
+        /// The first window: its three commas, and the quotes before the third.
+        const R_SEPS_A: usize = 1;
+        const R_QUOTES_A: usize = 2;
+        /// The second window, from the byte after the third comma: three commas and the
+        /// newline, and the quotes before the newline.
+        const R_SEPS_B: usize = 3;
+        const R_QUOTES_B: usize = 4;
+        /// The raw bytes from each field's first (a wrapping quote included): 16 of the
+        /// `event_id`, 16 of the `user_id`, 32 of the `ts`, 24 of the `ingest_ts`, 8 of the type.
+        const R_ID: usize = 5;
+        const R_USER: usize = 7;
+        const R_TS: usize = 9;
+        const R_INGEST: usize = 13;
+        const R_KIND: usize = 16;
+        const R_WORDS: usize = 17;
+
+        struct Raw {
+            words: [[u64; ROWS]; R_WORDS],
+            rows: usize,
+            held: Held,
+        }
+
+        /// The event line at `line` into row `row`: its length with the newline, or 0 when
+        /// it has not the usual shape (three commas within 64 bytes and before any newline,
+        /// then three commas and the newline within the next 64) and nothing was stored.
+        ///
+        /// # Safety
+        /// `row < ROWS`, and `EVENT_WINDOW` bytes are readable at `line`.
+        #[inline(always)]
+        unsafe fn raw_row(words: &mut [[u64; ROWS]; R_WORDS], row: usize, line: *const u8) -> usize {
+            // SAFETY: every read is within 64 bytes of a comma of the first window, which is
+            // within 64 of `line`... the second window's 64 bytes start at most 64 on.
+            unsafe {
+                let (commas, newlines, quotes) = masks(line);
+                let after_first = commas & commas.wrapping_sub(1);
+                let after_second = after_first & after_first.wrapping_sub(1);
+                let third = after_second & after_second.wrapping_neg();
+                let before = third.wrapping_sub(1);
+                if (third == 0) | (newlines & before != 0) {
+                    return 0;
+                }
+                let (p1, p2, p3) = (commas.trailing_zeros() as usize, after_first.trailing_zeros() as usize, third.trailing_zeros() as usize);
+                let second = line.add(p3 + 1);
+                let (commas_b, newlines_b, quotes_b) = masks(second);
+                let stops = commas_b | newlines_b;
+                let rest = stops & stops.wrapping_sub(1);
+                let rest = rest & rest.wrapping_sub(1);
+                let rest = rest & rest.wrapping_sub(1);
+                let end = rest & rest.wrapping_neg();
+                let before_b = end.wrapping_sub(1);
+                if (newlines_b & end == 0) | (newlines_b & before_b != 0) {
+                    return 0;
+                }
+                let mut set = |word: usize, value: u64| *words.get_unchecked_mut(word).get_unchecked_mut(row) = value;
+                set(R_SEPS_A, commas & (before | third));
+                set(R_QUOTES_A, quotes & before);
+                set(R_SEPS_B, stops & (before_b | end));
+                set(R_QUOTES_B, quotes_b & before_b);
+                let (user, ts, kind) = (line.add(p1 + 1), line.add(p2 + 1), second.add(stops.trailing_zeros() as usize + 1));
+                set(R_ID, rd(line));
+                set(R_ID + 1, rd(line.add(8)));
+                set(R_USER, rd(user));
+                set(R_USER + 1, rd(user.add(8)));
+                set(R_TS, rd(ts));
+                set(R_TS + 1, rd(ts.add(8)));
+                set(R_TS + 2, rd(ts.add(16)));
+                set(R_TS + 3, rd(ts.add(24)));
+                set(R_INGEST, rd(second));
+                set(R_INGEST + 1, rd(second.add(8)));
+                set(R_INGEST + 2, rd(second.add(16)));
+                set(R_KIND, rd(kind));
+                p3 + end.trailing_zeros() as usize + 2
+            }
+        }
+
+        /// One event chunk.
+        ///
+        /// # Safety
+        /// `p, len` is a segment.
+        #[inline(never)]
+        pub(in super::super) unsafe fn events<M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &PosPlan, out: &mut PosOut) {
+            let PosOut { events, pays, odd_events, odd_users, .. } = out;
+            let limit = plan.events() as u64;
+            let mut raw = Raw { words: [[0; ROWS]; R_WORDS], rows: 0, held: Held::new() };
+            let (mut at, mut rows) = (0, 0);
+            // SAFETY: `at < len` is a line's first byte; `rows < ROWS` between decodes; a line
+            // of the usual shape is read within its window, and `PAD` bytes after the segment
+            // are readable.
+            unsafe {
+                while at < len {
+                    *raw.words.get_unchecked_mut(R_AT).get_unchecked_mut(rows) = at as u64;
+                    let next = if at + EVENT_WINDOW <= len + crate::PAD { raw_row(&mut raw.words, rows, p.add(at)) } else { 0 };
+                    if next != 0 {
+                        at += next;
+                    } else {
+                        // Not a line `pairs` could pass: a quote that is no field's.
+                        *raw.words.get_unchecked_mut(R_SEPS_A).get_unchecked_mut(rows) = 0;
+                        *raw.words.get_unchecked_mut(R_QUOTES_A).get_unchecked_mut(rows) = !0;
+                        at = line_end(p, len, at);
+                    }
+                    rows += 1;
+                    if rows == ROWS {
+                        raw.rows = rows;
+                        decode::<M>(&mut raw, p, len, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+                        rows = 0;
+                    }
+                }
+                raw.rows = rows;
+                decode::<M>(&mut raw, p, len, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+            }
+            raw.held.flush::<M>(events);
+            // Streamed lines become visible to the placing threads.
+            events.fence();
+            pays.fence();
+        }
+
+        /// Each lane's lowest set bit: its position (64 for none), and the lane without it.
+        #[inline(always)]
+        fn lowest(bits: __m512i) -> (__m512i, __m512i) {
+            // SAFETY: register arithmetic; AVX-512CD is compiled in (cfg above).
+            #[allow(unused_unsafe)]
+            unsafe {
+                let less = _mm512_add_epi64(bits, all(u64::MAX));
+                // The bits below the lowest set one: as many as its position.
+                (_mm512_sub_epi64(all(64), _mm512_lzcnt_epi64(_mm512_andnot_si512(bits, less))), _mm512_and_si512(bits, less))
+            }
+        }
+
+        /// The lanes where the quotes `quotes` are only wrapping pairs, for fields that
+        /// start at bit 0 and end at the separators `seps` (`quotes` holds no bit from the
+        /// last separator on).
+        ///
+        /// A field's first byte is bit 0 or the bit after a separator, its last the bit
+        /// before its separator. A quote anywhere else is stray, and one on a byte that is
+        /// both is a field of one quote. That leaves quotes on first and last bytes; what
+        /// remains to show is that a field has the one exactly when it has the other. Take
+        /// `(last << 1) - first`: a wrapped field contributes its separator's bit less its
+        /// first byte's, the bits of the field itself, and wrapped fields do not overlap, so
+        /// no separator's bit is set. A first quote without its last borrows through its
+        /// field's separator, and a last quote without its first leaves its separator's bit:
+        /// either way a separator's bit is set.
+        #[inline(always)]
+        fn pairs(quotes: __m512i, seps: __m512i) -> __mmask8 {
+            // SAFETY: register arithmetic.
+            #[allow(unused_unsafe)]
+            unsafe {
+                let starts = _mm512_or_si512(_mm512_slli_epi64::<1>(seps), all(1));
+                let ends = _mm512_srli_epi64::<1>(seps);
+                let (first, last) = (_mm512_and_si512(quotes, starts), _mm512_and_si512(quotes, ends));
+                let stray = _mm512_andnot_si512(_mm512_or_si512(starts, ends), quotes);
+                let alone = _mm512_and_si512(first, ends);
+                let spans = _mm512_sub_epi64(_mm512_slli_epi64::<1>(last), first);
+                let bad = _mm512_or_si512(_mm512_or_si512(stray, alone), _mm512_and_si512(spans, seps));
+                _mm512_testn_epi64_mask(bad, bad)
+            }
+        }
+
+        /// Eight bytes from bit `bits` of the 16 whose words are `low` and `high`.
+        #[inline(always)]
+        fn cut(low: __m512i, high: __m512i, bits: __m512i) -> __m512i {
+            // SAFETY: register arithmetic. A shift count of 64 or more gives 0, which is what
+            // `bits == 0` needs of `high`.
+            #[allow(unused_unsafe)]
+            unsafe {
+                _mm512_or_si512(_mm512_srlv_epi64(low, bits), _mm512_sllv_epi64(high, _mm512_sub_epi64(all(64), bits)))
+            }
+        }
+
+        /// Rows `first..first + 8` of `words` as the kernels read them.
+        ///
+        /// # Safety
+        /// `first + 8 <= ROWS`.
+        #[inline(always)]
+        unsafe fn lanes_of(words: &[[u64; ROWS]; R_WORDS], first: usize, live: __mmask8, dates: &Dates) -> Lanes {
+            // SAFETY: loads of 8 words at `first <= ROWS - 8`, then register arithmetic.
+            unsafe {
+                let word = |word: usize| _mm512_loadu_si512(words.get_unchecked(word).as_ptr().add(first).cast());
+                let (seps_a, quotes_a, seps_b, quotes_b) = (word(R_SEPS_A), word(R_QUOTES_A), word(R_SEPS_B), word(R_QUOTES_B));
+                let fit = live & pairs(quotes_a, seps_a) & pairs(quotes_b, seps_b);
+                // The separators' positions; a field starts one after the one before it.
+                let (p1, rest) = lowest(seps_a);
+                let (p2, rest) = lowest(rest);
+                let (p3, _) = lowest(rest);
+                let (p4, rest) = lowest(seps_b);
+                let (p5, rest) = lowest(rest);
+                let (p6, _) = lowest(rest);
+                let one = all(1);
+                let (s1, s2, s4, s5) = (_mm512_add_epi64(p1, one), _mm512_add_epi64(p2, one), _mm512_add_epi64(p4, one), _mm512_add_epi64(p5, one));
+                // Whether each field is wrapped: a quote at its first byte.
+                let bit = |quotes: __m512i, at: __m512i| _mm512_and_si512(_mm512_srlv_epi64(quotes, at), one);
+                let (q0, q1, q2) = (_mm512_and_si512(quotes_a, one), bit(quotes_a, s1), bit(quotes_a, s2));
+                let (q3, q4, q5) = (_mm512_and_si512(quotes_b, one), bit(quotes_b, s4), bit(quotes_b, s5));
+                // A field's length: to its separator, less its two quotes.
+                let len = |end: __m512i, start: __m512i, q: __m512i| _mm512_sub_epi64(_mm512_sub_epi64(end, start), _mm512_slli_epi64::<1>(q));
+                let zero = _mm512_setzero_si512();
+                // The quote's 8 bits, to shift off a field's words.
+                let (b0, b1, b2, b3, b4) =
+                    (_mm512_slli_epi64::<3>(q0), _mm512_slli_epi64::<3>(q1), _mm512_slli_epi64::<3>(q2), _mm512_slli_epi64::<3>(q3), _mm512_slli_epi64::<3>(q4));
+                let more = |bits: __m512i, by: u64| _mm512_add_epi64(bits, all(by));
+                let (id0, id1, user0, user1) = (word(R_ID), word(R_ID + 1), word(R_USER), word(R_USER + 1));
+                let (ts0, ts1, ts2, ts3) = (word(R_TS), word(R_TS + 1), word(R_TS + 2), word(R_TS + 3));
+                let (in0, in1, in2) = (word(R_INGEST), word(R_INGEST + 1), word(R_INGEST + 2));
+                let (ts_0, ts_8) = (cut(ts0, ts1, b2), cut(ts1, ts2, b2));
+                let (ingest_0, ingest_8) = (cut(in0, in1, b3), cut(in1, in2, b3));
+                Lanes {
+                    live,
+                    fit,
+                    id_first: cut(id0, id1, b0),
+                    id_digits: cut(id0, id1, more(b0, 8)),
+                    id_len: len(p1, zero, q0),
+                    user_first: cut(user0, user1, b1),
+                    user_digits: cut(user0, user1, more(b1, 8)),
+                    user_len: len(p2, s1, q1),
+                    ts_0,
+                    ts_8,
+                    ts_12: cut(ts1, ts2, more(b2, 32)),
+                    ts_19: cut(ts2, ts3, more(b2, 24)),
+                    ts_len: len(p3, s2, q2),
+                    ts_date: dates.date_wide(ts_0, ts_8),
+                    ingest_8,
+                    ingest_12: cut(in1, in2, more(b3, 32)),
+                    ingest_len: len(p4, zero, q3),
+                    ingest_date: dates.date_wide(ingest_0, ingest_8),
+                    kind: _mm512_srlv_epi64(word(R_KIND), b4),
+                    kind_len: len(p5, s4, q4),
+                    product_len: len(p6, s5, q5),
+                }
+            }
+        }
+
+        /// Decodes the gathered rows and leaves `raw` empty of rows.
+        ///
+        /// # Safety
+        /// `base, bytes` is the segment the rows' lines are in.
+        #[inline(never)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn decode<M: Mode>(
+            raw: &mut Raw,
+            base: *const u8,
+            bytes: usize,
+            ctx: &Ctx,
+            dates: &Dates,
+            plan: &PosPlan,
+            limit: u64,
+            events: &mut Parts<PosEvent>,
+            pays: &mut Parts<PosPay>,
+            odd_events: &mut Vec<EventRec>,
+            odd_users: &mut Vec<Id>,
+        ) {
+            let rows = std::mem::take(&mut raw.rows);
+            let mut first = 0;
+            while first < rows {
+                if raw.held.len + 8 > HELD {
+                    raw.held.flush::<M>(events);
+                }
+                // SAFETY: `first + 8 <= ROWS`. A lane past `rows` holds an older row's words
+                // or zeros, and `live` keeps it out of the records and the row code.
+                unsafe {
+                    let lanes = lanes_of(&raw.words, first, live(rows, first), dates);
+                    let mut rest = records(&lanes, &mut raw.held, ctx, dates, plan, limit);
+                    while rest != 0 {
+                        let row = first + rest.trailing_zeros() as usize;
+                        rest &= rest - 1;
+                        slow_line::<M>(base, bytes, raw.words[R_AT][row] as usize, &mut raw.held, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+                    }
+                }
+                first += 8;
+            }
+        }
+
+        /// The first byte after the line at `at`.
+        #[cold]
+        #[inline(never)]
+        unsafe fn line_end(p: *const u8, len: usize, at: usize) -> usize {
+            // SAFETY: `at..len` is inside the segment.
+            let rest = unsafe { std::slice::from_raw_parts(p.add(at), len - at) };
+            at + memchr::memchr(b'\n', rest).map_or(rest.len(), |newline| newline + 1)
+        }
+
+        /// A row through the row code: the line at `at` tokenized again (by its shape where
+        /// it has one, a purchase mostly; by `Scalar` otherwise), then `event_row`.
+        ///
+        /// # Safety
+        /// `p, len` is a segment and `at < len` a line's first byte in it.
+        #[cold]
+        #[inline(never)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn slow_line<M: Mode>(
+            p: *const u8,
+            len: usize,
+            at: usize,
+            held: &mut Held,
+            ctx: &Ctx,
+            dates: &Dates,
+            plan: &PosPlan,
+            limit: u64,
+            events: &mut Parts<PosEvent>,
+            pays: &mut Parts<PosPay>,
+            odd_events: &mut Vec<EventRec>,
+            odd_users: &mut Vec<Id>,
+        ) {
+            // SAFETY: one line of the segment; the shape is asked for only where its window
+            // is readable, and its fields are inside the line.
+            unsafe {
+                let line = p.add(at);
+                if at + EVENT_WINDOW <= len + crate::PAD
+                    && let Some(shape) = event_shape(line)
+                {
+                    return event_row::<M, Held>(ctx, dates, plan, limit, &shape.fields(line), held, events, pays, odd_events, odd_users);
+                }
+                let bytes = line_end(p, len, at) - at;
+                Scalar::lines::<7>(line, bytes, &mut Scratch::new(), |fields| {
+                    event_row::<M, Held>(ctx, dates, plan, limit, fields, held, events, pays, odd_events, odd_users)
+                });
+            }
+        }
+
+        /// The words of a click row, one array per word.
+        const K_AT: usize = 0;
+        /// The line's three commas and its newline, and the quotes before the newline.
+        const K_SEPS: usize = 1;
+        const K_QUOTES: usize = 2;
+        /// The raw bytes from a field's first (a wrapping quote included): 16 of the
+        /// `click_id`, 16 of the `user_id`, 32 of the `ts`.
+        const K_CLICK: usize = 3;
+        const K_USER: usize = 5;
+        const K_TS: usize = 7;
+        /// The campaign's index, or `Campaigns::NONE`.
+        const K_CAMPAIGN: usize = 11;
+        const K_WORDS: usize = 12;
+
+        struct RawClicks {
+            words: [[u64; ROWS]; K_WORDS],
+            rows: usize,
+            /// The clicks decoded and not yet scattered: list, then the record's three words.
+            lists: [u64; HELD],
+            click: [u64; HELD],
+            low: [u64; HELD],
+            campaign: [u64; HELD],
+            held: usize,
+        }
+
+        impl RawClicks {
+            #[inline(always)]
+            fn flush<M: Mode>(&mut self, clicks: &mut Parts<PosClick>) {
+                for at in 0..self.held {
+                    // SAFETY: the decode put only lists of persons below `PosPlan::persons` here.
+                    unsafe { clicks.push_as::<M>(self.lists[at] as usize, PosClick::from_words(self.click[at], self.low[at], self.campaign[at])) };
+                }
+                self.held = 0;
+            }
+        }
+
+        /// The click line at `line` into row `row`: its length with the newline, or 0 when
+        /// it has not the usual shape (three commas, then the newline, within 64 bytes) and
+        /// nothing was stored. The campaign is looked up here, by its bytes (`Campaigns`),
+        /// with the quote rule of its field alone; `pairs` judges the line's quotes after.
+        ///
+        /// # Safety
+        /// `row < ROWS`, `line` is a line's first byte in a segment.
+        #[inline(always)]
+        unsafe fn raw_click(words: &mut [[u64; ROWS]; K_WORDS], row: usize, line: *const u8, campaigns: &Campaigns) -> usize {
+            // SAFETY: 64 bytes are readable at any byte of a segment (`PAD`), and every word
+            // read starts at or before the line's newline.
+            unsafe {
+                let (commas, newlines, quotes) = masks(line);
+                let stops = commas | newlines;
+                let after_first = stops & stops.wrapping_sub(1);
+                let after_second = after_first & after_first.wrapping_sub(1);
+                let after_third = after_second & after_second.wrapping_sub(1);
+                let end = after_third & after_third.wrapping_neg();
+                let before = end.wrapping_sub(1);
+                if (newlines & end == 0) | (newlines & before != 0) {
+                    return 0;
+                }
+                let (p1, p2, p3) = (stops.trailing_zeros() as usize, after_first.trailing_zeros() as usize, after_second.trailing_zeros() as usize);
+                let mut set = |word: usize, value: u64| *words.get_unchecked_mut(word).get_unchecked_mut(row) = value;
+                set(K_SEPS, stops & (before | end));
+                set(K_QUOTES, quotes & before);
+                let (user, ts) = (line.add(p1 + 1), line.add(p3 + 1));
+                set(K_CLICK, rd(line));
+                set(K_CLICK + 1, rd(line.add(8)));
+                set(K_USER, rd(user));
+                set(K_USER + 1, rd(user.add(8)));
+                set(K_TS, rd(ts));
+                set(K_TS + 1, rd(ts.add(8)));
+                set(K_TS + 2, rd(ts.add(16)));
+                set(K_TS + 3, rd(ts.add(24)));
+                // The campaign between the second and third commas, less a quote at its
+                // first byte and the one that then ends it. A line whose quotes are not
+                // pairs gives any length here, and any answer: `pairs` rejects the row.
+                let wrapped = (quotes >> (p2 + 1)) as usize & 1;
+                set(K_CAMPAIGN, campaigns.get(line.add(p2 + 1 + wrapped), (p3 - p2 - 1).wrapping_sub(2 * wrapped)));
+                end.trailing_zeros() as usize + 1
+            }
+        }
+
+        /// One click chunk, as `events`: per line the separators, the raw words of the
+        /// `click_id`, `user_id` and `ts`, and the campaign looked up by its bytes; per 8 rows
+        /// the quote rules, the fields, the `click_id` packed (`types::id::wide::pack`), and
+        /// the kernels. A row they recognise as an ordinary click (a `click_id` that packs, a
+        /// `user_id` that is a number inside the arrays, a `ts` in one of the usual forms, a
+        /// campaign of the table) becomes the record `click_row` makes, or nothing when its
+        /// `ts` is outside the window or it has no `click_id`, as there; every other row
+        /// goes to `click_row` itself.
+        ///
+        /// # Safety
+        /// `p, len` is a segment.
+        #[inline(never)]
+        pub(in super::super) unsafe fn clicks<M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, campaigns: &Campaigns, plan: &PosPlan, out: &mut PosOut) {
+            let PosOut { clicks, odd_clicks, .. } = out;
+            let mut raw = RawClicks { words: [[0; ROWS]; K_WORDS], rows: 0, lists: [0; HELD], click: [0; HELD], low: [0; HELD], campaign: [0; HELD], held: 0 };
+            // The clicks of the rows left to the row code.
+            let mut pending = Pending::new();
+            let (mut at, mut rows) = (0, 0);
+            // SAFETY: `at < len` is a line's first byte; `rows < ROWS` between decodes.
+            unsafe {
+                while at < len {
+                    *raw.words.get_unchecked_mut(K_AT).get_unchecked_mut(rows) = at as u64;
+                    let next = raw_click(&mut raw.words, rows, p.add(at), campaigns);
+                    if next != 0 {
+                        at += next;
+                    } else {
+                        // Not a line `pairs` could pass: a quote that is no field's.
+                        *raw.words.get_unchecked_mut(K_SEPS).get_unchecked_mut(rows) = 0;
+                        *raw.words.get_unchecked_mut(K_QUOTES).get_unchecked_mut(rows) = !0;
+                        at = line_end(p, len, at);
+                    }
+                    rows += 1;
+                    if rows == ROWS {
+                        raw.rows = rows;
+                        decode_clicks::<M>(&mut raw, p, len, ctx, dates, plan, &mut pending, clicks, odd_clicks);
+                        rows = 0;
+                    }
+                }
+                raw.rows = rows;
+                decode_clicks::<M>(&mut raw, p, len, ctx, dates, plan, &mut pending, clicks, odd_clicks);
+            }
+            raw.flush::<M>(clicks);
+            pending.flush::<M>(clicks);
+            clicks.fence();
+        }
+
+        /// Eight click rows as the kernels read them (see `Lanes`).
+        struct ClickLanes {
+            fit: __mmask8,
+            click_first: __m512i,
+            /// The `click_id`'s ninth byte in the low byte.
+            click_ninth: __m512i,
+            click_len: __m512i,
+            user_first: __m512i,
+            user_digits: __m512i,
+            user_len: __m512i,
+            ts_0: __m512i,
+            ts_8: __m512i,
+            ts_12: __m512i,
+            ts_19: __m512i,
+            ts_len: __m512i,
+            ts_date: __m512i,
+        }
+
+        /// Rows `first..first + 8` of `words` as the kernels read them.
+        ///
+        /// # Safety
+        /// `first + 8 <= ROWS`.
+        #[inline(always)]
+        unsafe fn click_lanes(words: &[[u64; ROWS]; K_WORDS], first: usize, live: __mmask8, dates: &Dates) -> ClickLanes {
+            // SAFETY: loads of 8 words at `first <= ROWS - 8`, then register arithmetic.
+            unsafe {
+                let word = |word: usize| _mm512_loadu_si512(words.get_unchecked(word).as_ptr().add(first).cast());
+                let (seps, quotes) = (word(K_SEPS), word(K_QUOTES));
+                let (p1, rest) = lowest(seps);
+                let (p2, rest) = lowest(rest);
+                let (p3, rest) = lowest(rest);
+                let (p4, _) = lowest(rest);
+                let one = all(1);
+                let (s1, s3) = (_mm512_add_epi64(p1, one), _mm512_add_epi64(p3, one));
+                let (q0, q1, q3) =
+                    (_mm512_and_si512(quotes, one), _mm512_and_si512(_mm512_srlv_epi64(quotes, s1), one), _mm512_and_si512(_mm512_srlv_epi64(quotes, s3), one));
+                let len = |end: __m512i, start: __m512i, q: __m512i| _mm512_sub_epi64(_mm512_sub_epi64(end, start), _mm512_slli_epi64::<1>(q));
+                let (b0, b1, b3) = (_mm512_slli_epi64::<3>(q0), _mm512_slli_epi64::<3>(q1), _mm512_slli_epi64::<3>(q3));
+                let more = |bits: __m512i, by: u64| _mm512_add_epi64(bits, all(by));
+                let (click0, click1, user0, user1) = (word(K_CLICK), word(K_CLICK + 1), word(K_USER), word(K_USER + 1));
+                let (ts0, ts1, ts2, ts3) = (word(K_TS), word(K_TS + 1), word(K_TS + 2), word(K_TS + 3));
+                let (ts_0, ts_8) = (cut(ts0, ts1, b3), cut(ts1, ts2, b3));
+                ClickLanes {
+                    fit: live & pairs(quotes, seps),
+                    click_first: cut(click0, click1, b0),
+                    click_ninth: _mm512_srlv_epi64(click1, b0),
+                    click_len: len(p1, _mm512_setzero_si512(), q0),
+                    user_first: cut(user0, user1, b1),
+                    user_digits: cut(user0, user1, more(b1, 8)),
+                    user_len: len(p2, s1, q1),
+                    ts_0,
+                    ts_8,
+                    ts_12: cut(ts1, ts2, more(b3, 32)),
+                    ts_19: cut(ts2, ts3, more(b3, 24)),
+                    ts_len: len(p4, s3, q3),
+                    ts_date: dates.date_wide(ts_0, ts_8),
+                }
+            }
+        }
+
+        /// Decodes the gathered click rows and leaves `raw` empty of rows.
+        ///
+        /// # Safety
+        /// `base, bytes` is the segment the rows' lines are in.
+        #[inline(never)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn decode_clicks<M: Mode>(
+            raw: &mut RawClicks,
+            base: *const u8,
+            bytes: usize,
+            ctx: &Ctx,
+            dates: &Dates,
+            plan: &PosPlan,
+            pending: &mut Pending<PosClick>,
+            clicks: &mut Parts<PosClick>,
+            odd_clicks: &mut Vec<ClickRec>,
+        ) {
+            let rows = std::mem::take(&mut raw.rows);
+            let mut first = 0;
+            while first < rows {
+                if raw.held + 8 > HELD {
+                    raw.flush::<M>(clicks);
+                }
+                let live = live(rows, first);
+                // SAFETY: `first + 8 <= ROWS`. A lane past `rows` holds an older row's words
+                // or zeros, and `live` keeps it out of everything below.
+                unsafe {
+                    let lanes = click_lanes(&raw.words, first, live, dates);
+                    let (click, packs) = types::id::wide::pack(lanes.click_first, lanes.click_ninth, lanes.click_len);
+                    let (user, user_ok) = numbers(lanes.user_first, lanes.user_digits, lanes.user_len, b'u', plan.user_key);
+                    let (ts_ok, ts) = dates.ts_wide(lanes.ts_0, lanes.ts_8, lanes.ts_12, lanes.ts_19, lanes.ts_len, lanes.ts_date);
+                    let campaign = _mm512_loadu_si512(raw.words[K_CAMPAIGN].as_ptr().add(first).cast());
+                    let has_click = _mm512_test_epi64_mask(click, click);
+                    // `click_row`'s window, on a `ts` that is the one `Dates::ts` gives.
+                    let inside = _mm512_cmpge_epi64_mask(ts, _mm512_setzero_si512()) & _mm512_cmplt_epi64_mask(ts, all(u64::from(ctx.ts_end)));
+                    let person = _mm512_srli_epi64::<{ ALIAS_BITS }>(user);
+                    let fast = lanes.fit
+                        & packs
+                        & has_click
+                        & user_ok
+                        & _mm512_cmplt_epu64_mask(person, all(u64::from(plan.persons)))
+                        & ts_ok
+                        & inside
+                        & _mm512_cmpneq_epi64_mask(campaign, all(Campaigns::NONE));
+                    // No click whatever the rest says: a well-formed line with no
+                    // `click_id`, or with a well-formed `ts` outside the window.
+                    let dropped = lanes.fit & ((packs & !has_click) | (ts_ok & !inside));
+
+                    // `PosClick::new`: u | ts << 32.
+                    let low = _mm512_or_si512(_mm512_and_si512(user, all(0xFFFF_FFFF)), _mm512_slli_epi64::<32>(ts));
+                    let list = _mm512_srl_epi64(person, _mm_cvtsi32_si128(plan.click_shift as i32));
+                    let held = raw.held;
+                    _mm512_storeu_si512(raw.lists.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, list));
+                    _mm512_storeu_si512(raw.click.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, click));
+                    _mm512_storeu_si512(raw.low.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, low));
+                    _mm512_storeu_si512(raw.campaign.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, campaign));
+                    raw.held = held + fast.count_ones() as usize;
+
+                    // Every other row, through the row code.
+                    let mut rest = live & !fast & !dropped;
+                    while rest != 0 {
+                        let row = first + rest.trailing_zeros() as usize;
+                        rest &= rest - 1;
+                        slow_click::<M>(base, bytes, raw.words[K_AT][row] as usize, ctx, dates, plan, pending, clicks, odd_clicks);
+                    }
+                }
+                first += 8;
+            }
+        }
+
+        /// A click row through the row code: the line at `at` tokenized again, then
+        /// `click_row`.
+        ///
+        /// # Safety
+        /// `p, len` is a segment and `at < len` a line's first byte in it.
+        #[cold]
+        #[inline(never)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn slow_click<M: Mode>(
+            p: *const u8,
+            len: usize,
+            at: usize,
+            ctx: &Ctx,
+            dates: &Dates,
+            plan: &PosPlan,
+            pending: &mut Pending<PosClick>,
+            clicks: &mut Parts<PosClick>,
+            odd_clicks: &mut Vec<ClickRec>,
+        ) {
+            // SAFETY: one line of the segment, 64 bytes readable at its first; a shape's
+            // fields are inside the line.
+            unsafe {
+                let line = p.add(at);
+                if let Some(shape) = click_shape(line) {
+                    return click_row::<M>(ctx, dates, plan, &shape.fields(line), pending, clicks, odd_clicks);
+                }
+                let bytes = line_end(p, len, at) - at;
+                Scalar::lines::<4>(line, bytes, &mut Scratch::new(), |fields| click_row::<M>(ctx, dates, plan, fields, pending, clicks, odd_clicks));
+            }
+        }
+
+        #[cfg(test)]
+        mod tests {
+            use types::time::parse_f1;
+
+            use super::*;
+
+            struct Rng(u64);
+
+            impl Rng {
+                fn next(&mut self) -> u64 {
+                    self.0 ^= self.0 << 13;
+                    self.0 ^= self.0 >> 7;
+                    self.0 ^= self.0 << 17;
+                    self.0
+                }
+
+                fn below(&mut self, n: u64) -> u64 {
+                    self.next() % n
+                }
+
+                fn pick<'a>(&mut self, options: &[&'a str]) -> &'a str {
+                    options[self.below(options.len() as u64) as usize]
+                }
+            }
+
+            /// An event line much as the generator writes one, then perhaps spoiled.
+            fn line(rng: &mut Rng) -> Vec<u8> {
+                let digits = |rng: &mut Rng, letter: char| {
+                    let n = 1 + rng.below(9) as usize;
+                    let mut text = String::from(letter);
+                    text.extend((0..n).map(|_| char::from(b"0123456789abcdefghijklmnopqrstuvwxyz"[rng.below(36) as usize])));
+                    text
+                };
+                let day = 1 + rng.below(31);
+                let clock = format!("{:02}:{:02}:{:02}", rng.below(25), rng.below(61), rng.below(61));
+                let ts = match rng.below(8) {
+                    0..=3 => format!("2026-10-{day:02}T{clock}Z"),
+                    4 => format!("2026-1{}-{day:02}T{clock}{}{:02}:{:02}", rng.below(3), rng.pick(&["+", "-"]), rng.below(14), rng.below(60)),
+                    5 | 6 => format!("17{:011}", rng.below(100_000_000_000)),
+                    _ => rng.pick(&["", "0", "2026-10-03", "2026-10-03T10:00:00", "1791071890000.0", "2026-10-03t10:00:00Z"]).to_string(),
+                };
+                let ingest = match rng.below(10) {
+                    0 => rng.pick(&["", "2026-10-03 10:00:00Z", "1791071890000"]).to_string(),
+                    _ => format!("2026-1{}-{:02}T{clock}Z", rng.below(2), 1 + rng.below(30)),
+                };
+                let fields = [
+                    match rng.below(12) {
+                        0 => rng.pick(&["", "E12ab", "e", "x1234567", "e123456789ab"]).to_string(),
+                        _ => digits(rng, 'e'),
+                    },
+                    match rng.below(12) {
+                        0 => rng.pick(&["", "U12ab", "u", "anonymous-user-17"]).to_string(),
+                        _ => digits(rng, 'u'),
+                    },
+                    ts,
+                    ingest,
+                    rng.pick(&["view", "view", "view", "cart", "purchase", "refund", "", "VIEW", "views"]).to_string(),
+                    rng.pick(&["p1", "p123", "p4711", "", "p99999"]).to_string(),
+                    rng.pick(&["", "", "100", "2599", "0", "12a"]).to_string(),
+                ];
+                let mut line = Vec::new();
+                for (at, field) in fields.iter().enumerate() {
+                    if at > 0 {
+                        line.push(b',');
+                    }
+                    if rng.below(4) == 0 {
+                        line.push(b'"');
+                        line.extend_from_slice(field.as_bytes());
+                        line.push(b'"');
+                    } else {
+                        line.extend_from_slice(field.as_bytes());
+                    }
+                }
+                // Spoiled: a byte replaced, inserted or removed, mostly by one that matters.
+                for _ in 0..[0, 0, 0, 1, 1, 2, 5][rng.below(7) as usize] {
+                    let at = rng.below(line.len() as u64 + 1) as usize;
+                    let byte = b"\"\",,\n a0Z"[rng.below(9) as usize];
+                    match rng.below(3) {
+                        0 if at < line.len() => line[at] = byte,
+                        1 if at < line.len() => drop(line.remove(at)),
+                        _ => line.insert(at, byte),
+                    }
+                }
+                line
+            }
+
+            /// A click line much as the generator writes one, then perhaps spoiled.
+            fn click_line(rng: &mut Rng) -> Vec<u8> {
+                let digits = |rng: &mut Rng, letter: char| {
+                    let n = 1 + rng.below(9) as usize;
+                    let mut text = String::from(letter);
+                    text.extend((0..n).map(|_| char::from(b"0123456789abcdefghijklmnopqrstuvwxyz"[rng.below(36) as usize])));
+                    text
+                };
+                let clock = format!("{:02}:{:02}:{:02}", rng.below(25), rng.below(61), rng.below(61));
+                let fields = [
+                    match rng.below(12) {
+                        0 => rng.pick(&["", "K12ab", "k", "k123456789ab", "k\u{e9}1"]).to_string(),
+                        _ => digits(rng, 'k'),
+                    },
+                    match rng.below(12) {
+                        0 => rng.pick(&["", "U12ab", "u", "anonymous-user-17"]).to_string(),
+                        _ => digits(rng, 'u'),
+                    },
+                    rng.pick(&["c_1", "c_2", "c_17", "c_12345", "c_123456", "c_1234567", "", "c_9", "C_1", "c_3 "]).to_string(),
+                    match rng.below(8) {
+                        0..=3 => format!("2026-10-{:02}T{clock}Z", 1 + rng.below(31)),
+                        4 => format!("2026-1{}-{:02}T{clock}{}{:02}:{:02}", rng.below(3), 1 + rng.below(31), rng.pick(&["+", "-"]), rng.below(14), rng.below(60)),
+                        5 | 6 => format!("17{:011}", rng.below(100_000_000_000)),
+                        _ => rng.pick(&["", "0", "2026-10-03", "2026-10-03T10:00:00", "1791071890000.0"]).to_string(),
+                    },
+                ];
+                let mut line = Vec::new();
+                for (at, field) in fields.iter().enumerate() {
+                    if at > 0 {
+                        line.push(b',');
+                    }
+                    if rng.below(4) == 0 {
+                        line.push(b'"');
+                        line.extend_from_slice(field.as_bytes());
+                        line.push(b'"');
+                    } else {
+                        line.extend_from_slice(field.as_bytes());
+                    }
+                }
+                for _ in 0..[0, 0, 0, 1, 1, 2, 5][rng.below(7) as usize] {
+                    let at = rng.below(line.len() as u64 + 1) as usize;
+                    let byte = b"\"\",,\n a0Z"[rng.below(9) as usize];
+                    match rng.below(3) {
+                        0 if at < line.len() => line[at] = byte,
+                        1 if at < line.len() => drop(line.remove(at)),
+                        _ => line.insert(at, byte),
+                    }
+                }
+                line
+            }
+
+            #[test]
+            fn raw_clicks_are_the_scalar_fields() {
+                let campaigns: Vec<(Vec<u8>, Vec<u8>)> =
+                    ["c_1", "c_2", "c_17", "c_12345", "c_123456", "c_1234567", "c_2"].iter().map(|name| (name.as_bytes().to_vec(), b"email".to_vec())).collect();
+                let listed: Vec<(&[u8], &[u8])> = campaigns.iter().map(|(name, channel)| (&name[..], &channel[..])).collect();
+                let ctx = Ctx::new(parse_f1(b"2026-10-05T00:00:00Z").unwrap(), parse_f1(b"2026-11-02T00:00:00Z").unwrap(), &[], &listed).unwrap();
+                let (dates, table) = (Dates::new(&ctx), Campaigns::new(&ctx));
+                let mut rng = Rng(0xD6E8_FEB8_6659_FD93);
+                let (mut fits, mut rows, mut found) = (0, 0, 0);
+                for round in 0..60_000 {
+                    let mut buf = vec![b'\n'];
+                    buf.extend(click_line(&mut rng));
+                    buf.push(b'\n');
+                    for _ in 0..3 {
+                        buf.extend(click_line(&mut rng));
+                        buf.push(b'\n');
+                    }
+                    buf.resize(buf.len().max(200) + 64, b'"');
+                    // SAFETY: the buffer holds whole lines and at least 263 bytes after its
+                    // first, so every window and word below is inside it.
+                    unsafe {
+                        let p = buf.as_ptr().add(1);
+                        let end = buf[1..].iter().position(|&b| b == b'\n').unwrap() + 1;
+                        let mut want: Option<[Field; 4]> = None;
+                        Scalar::lines::<4>(p, end, &mut Scratch::new(), |fields| want = Some(*fields));
+
+                        let lane = round % 8;
+                        let mut words = [[0x2222_2222_2222_2222u64; ROWS]; K_WORDS];
+                        let next = raw_click(&mut words, lane, p, &table);
+                        if next == 0 {
+                            continue;
+                        }
+                        rows += 1;
+                        let text = String::from_utf8_lossy(&buf[1..end]);
+                        assert_eq!(next, end, "{text:?}");
+                        let lanes = click_lanes(&words, 0, 0xFF, &dates);
+                        let fit = lanes.fit >> lane & 1 == 1;
+                        assert_eq!(fit, want.is_some(), "{text:?}");
+                        let Some([click, user, campaign, ts]) = want else { continue };
+                        fits += 1;
+                        let got = |v: __m512i| {
+                            let mut out = [0u64; 8];
+                            _mm512_storeu_si512(out.as_mut_ptr().cast(), v);
+                            out[lane]
+                        };
+                        assert_eq!((got(lanes.click_first), got(lanes.click_ninth) as u8, got(lanes.click_len)), (rd(click.p), *click.p.add(8), click.len as u64), "click of {text:?}");
+                        assert_eq!((got(lanes.user_first), got(lanes.user_digits), got(lanes.user_len)), (rd(user.p), rd(user.p.add(1)), user.len as u64), "user of {text:?}");
+                        assert_eq!(
+                            (got(lanes.ts_0), got(lanes.ts_8), got(lanes.ts_12), got(lanes.ts_19), got(lanes.ts_len), got(lanes.ts_date)),
+                            (rd(ts.p), rd(ts.p.add(8)), rd(ts.p.add(12)), rd(ts.p.add(19)), ts.len as u64, dates.date_s(ts.p) as u64),
+                            "ts of {text:?}"
+                        );
+                        // The campaign by its bytes is the one the row code finds, where the
+                        // table has it; `NONE` only sends the row to the row code.
+                        let by_bytes = words[K_CAMPAIGN][lane];
+                        let packed = ctx.campaign_index.get(pack_at(campaign.p, campaign.len));
+                        if by_bytes != Campaigns::NONE {
+                            assert_eq!(Some(by_bytes as u32), packed, "campaign of {text:?}");
+                            found += 1;
+                        } else {
+                            assert!(packed.is_none() || campaign.len > 8, "campaign of {text:?} not found");
+                        }
+                    }
+                }
+                assert!(fits > 20_000 && rows > fits && found > 10_000, "{fits} well-formed of {rows} rows, {found} campaigns");
+            }
+
+            #[test]
+            fn raw_rows_are_the_scalar_fields() {
+                let ctx = Ctx::new(parse_f1(b"2026-10-05T00:00:00Z").unwrap(), parse_f1(b"2026-11-02T00:00:00Z").unwrap(), &[], &[]).unwrap();
+                let dates = Dates::new(&ctx);
+                let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+                let (mut fits, mut rows) = (0, 0);
+                for round in 0..60_000 {
+                    // The line, then what may follow it in a file: more lines, any bytes.
+                    let mut buf = vec![b'\n'];
+                    buf.extend(line(&mut rng));
+                    buf.push(b'\n');
+                    for _ in 0..3 {
+                        buf.extend(line(&mut rng));
+                        buf.push(b'\n');
+                    }
+                    buf.resize(buf.len().max(200) + 64, b'"');
+                    // SAFETY: the buffer holds whole lines and at least 263 bytes after its
+                    // first, so every window and word below is inside it.
+                    unsafe {
+                        let p = buf.as_ptr().add(1);
+                        let end = buf[1..].iter().position(|&b| b == b'\n').unwrap() + 1;
+                        let mut want: Option<[Field; 7]> = None;
+                        Scalar::lines::<7>(p, end, &mut Scratch::new(), |fields| want = Some(*fields));
+
+                        let lane = round % 8;
+                        let mut words = [[0x2222_2222_2222_2222u64; ROWS]; R_WORDS];
+                        let next = raw_row(&mut words, lane, p);
+                        if next == 0 {
+                            continue;
+                        }
+                        rows += 1;
+                        assert_eq!(next, end, "{:?}", String::from_utf8_lossy(&buf[1..end]));
+                        let lanes = lanes_of(&words, 0, 0xFF, &dates);
+                        let fit = lanes.fit >> lane & 1 == 1;
+                        // Whatever passes `pairs` is a line `Scalar` takes, and the reverse.
+                        assert_eq!(fit, want.is_some(), "{:?}", String::from_utf8_lossy(&buf[1..end]));
+                        let Some([id, user, ts, ingest, kind, product, _]) = want else { continue };
+                        fits += 1;
+                        let got = |v: __m512i| {
+                            let mut out = [0u64; 8];
+                            _mm512_storeu_si512(out.as_mut_ptr().cast(), v);
+                            out[lane]
+                        };
+                        let text = String::from_utf8_lossy(&buf[1..end]);
+                        assert_eq!((got(lanes.id_first), got(lanes.id_digits), got(lanes.id_len)), (rd(id.p), rd(id.p.add(1)), id.len as u64), "id of {text:?}");
+                        assert_eq!((got(lanes.user_first), got(lanes.user_digits), got(lanes.user_len)), (rd(user.p), rd(user.p.add(1)), user.len as u64), "user of {text:?}");
+                        assert_eq!(
+                            (got(lanes.ts_0), got(lanes.ts_8), got(lanes.ts_12), got(lanes.ts_19), got(lanes.ts_len), got(lanes.ts_date)),
+                            (rd(ts.p), rd(ts.p.add(8)), rd(ts.p.add(12)), rd(ts.p.add(19)), ts.len as u64, dates.date_s(ts.p) as u64),
+                            "ts of {text:?}"
+                        );
+                        assert_eq!(
+                            (got(lanes.ingest_8), got(lanes.ingest_12), got(lanes.ingest_len), got(lanes.ingest_date)),
+                            (rd(ingest.p.add(8)), rd(ingest.p.add(12)), ingest.len as u64, dates.date_s(ingest.p) as u64),
+                            "ingest of {text:?}"
+                        );
+                        assert_eq!((got(lanes.kind) as u32, got(lanes.kind_len)), (rd(kind.p) as u32, kind.len as u64), "type of {text:?}");
+                        assert_eq!(got(lanes.product_len), product.len as u64, "product of {text:?}");
+                    }
+                }
+                assert!(fits > 20_000 && rows > fits, "{fits} well-formed of {rows} rows");
+            }
         }
     }
 }

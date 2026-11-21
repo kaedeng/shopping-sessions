@@ -370,6 +370,8 @@ fn check_ts(dates: &Dates, ctx: &Ctx, text: &[u8]) {
         };
         let (g0, g1, g2, g3) = (all(ts::rd(field)), all(ts::rd(field.add(8))), all(ts::rd(field.add(12))), all(ts::rd(field.add(19))));
         let (len, date) = (all(text.len() as u64), all(dates.date_s(field) as u64));
+        // The date computed month by month is the table's.
+        assert_eq!(lane(dates.date_wide(g0, g1)), dates.date_s(field), "date {:?}", String::from_utf8_lossy(text));
         let (wide_ok, wide_ms, wide_s) = dates.f1_wide(g1, g2, len, date);
         let (f1_ok, f1_ms, f1_s) = dates.f1(field, text.len());
         assert_eq!(wide_ok, if f1_ok { 0xFF } else { 0 }, "f1 {:?}", String::from_utf8_lossy(text));

@@ -60,6 +60,23 @@ pub(crate) struct Dates {
     origin: i64,
     /// 13 when every F3 value in either window has 13 digits, so the SWAR parse applies.
     f3_len: usize,
+    /// The table again, month by month, for `wide::date_wide`.
+    #[cfg_attr(not(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f")), allow(dead_code))]
+    months: Vec<Month>,
+}
+
+/// The dates of the table in one calendar month: they are consecutive days of it.
+#[derive(Clone, Copy)]
+#[cfg_attr(not(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f")), allow(dead_code))]
+struct Month {
+    /// `YYYY-MM-`, as the 8 bytes a date of the month starts with.
+    head: u64,
+    /// The epoch second of the midnight before the month's first day: day `d` starts
+    /// `d * 86400` after it.
+    base_s: i64,
+    /// The first and last day of the month in the table.
+    first: u64,
+    last: u64,
 }
 
 impl Dates {
@@ -81,6 +98,19 @@ impl Dates {
                 })
             })
             .collect();
+        let mut months: Vec<Month> = Vec::new();
+        for day in first..=last {
+            let (year, month, date) = civil_from_days(day);
+            if !(0..=9999).contains(&year) {
+                continue;
+            }
+            let text = format!("{year:04}-{month:02}-");
+            let head = u64::from_le_bytes(text.as_bytes()[..8].try_into().unwrap());
+            match months.last_mut() {
+                Some(known) if known.head == head => known.last = date as u64,
+                _ => months.push(Month { head, base_s: (day - date) * (DAY / SECOND), first: date as u64, last: date as u64 }),
+            }
+        }
         let digits = |ms: i64| if ms > 0 { ms.ilog10() as usize + 1 } else { 0 };
         let f3_len = if digits(ctx.origin) == 13 && digits(ctx.window_end - 1) == 13 { 13 } else { usize::MAX };
         for bits in usize::BITS - (4 * keys.len()).leading_zeros()..=24 {
@@ -90,7 +120,7 @@ impl Dates {
                 if keys.iter().all(|key| slots[(key.tail.wrapping_mul(mul) >> shift) as usize].replace(*key).is_none()) {
                     // A free slot holds a date that hashes elsewhere, so no text can match it there.
                     let slots = slots.into_iter().map(|slot| slot.unwrap_or(keys[0])).collect();
-                    return Dates { slots, mul, shift, origin: ctx.origin, f3_len };
+                    return Dates { slots, mul, shift, origin: ctx.origin, f3_len, months };
                 }
             }
         }
@@ -241,6 +271,44 @@ pub(crate) mod wide {
             // SAFETY: `shift` leaves exactly the bits that index `slots`.
             let slot = unsafe { *self.slots.get_unchecked((tail.wrapping_mul(self.mul) >> self.shift) as usize) };
             if (slot.head == head) & (slot.tail == tail) { slot.s } else { NO_DATE }
+        }
+
+        /// Whether `date_wide` is worth its loop: one step per calendar month of the table.
+        pub(crate) fn few_months(&self) -> bool {
+            self.months.len() <= 16
+        }
+
+        /// `date_s` for 8 fields whose bytes 0..8 are `g0` and bytes 8..16 `g1`, with no
+        /// table lookup (which would be a gather): the table's dates are a few calendar
+        /// months, each a run of consecutive days, so a date of the table is one whose first
+        /// 8 bytes are a month's `YYYY-MM-`, whose next two are digits giving a day of that
+        /// run, and whose 11th is `T`. Agrees with `date_s` on every input
+        /// (`tests::check_ts`, `pos::wide::fused::tests`).
+        #[inline(always)]
+        pub(crate) fn date_wide(&self, g0: __m512i, g1: __m512i) -> __m512i {
+            // SAFETY: register arithmetic.
+            #[allow(unused_unsafe)]
+            unsafe {
+                // A lane that is no month's keeps a run with no day in it.
+                let (mut base, mut days) = (_mm512_setzero_si512(), all(1));
+                for month in &self.months {
+                    let hit = _mm512_cmpeq_epi64_mask(g0, all(month.head));
+                    base = _mm512_mask_mov_epi64(base, hit, all(month.base_s as u64));
+                    days = _mm512_mask_mov_epi64(days, hit, all(month.first | month.last << 8));
+                }
+                let byte = all(0xFF);
+                // A digit is its value after `^ '0'`, and any other byte is over 9.
+                let tens = _mm512_xor_si512(_mm512_and_si512(g1, byte), all(0x30));
+                let units = _mm512_xor_si512(_mm512_and_si512(_mm512_srli_epi64::<8>(g1), byte), all(0x30));
+                let t = _mm512_and_si512(_mm512_srli_epi64::<16>(g1), byte);
+                let day = _mm512_add_epi64(_mm512_add_epi64(_mm512_slli_epi64::<3>(tens), _mm512_slli_epi64::<1>(tens)), units);
+                let ok = _mm512_cmple_epu64_mask(tens, all(9))
+                    & _mm512_cmple_epu64_mask(units, all(9))
+                    & _mm512_cmpeq_epi64_mask(t, all(u64::from(b'T')))
+                    & _mm512_cmpge_epu64_mask(day, _mm512_and_si512(days, byte))
+                    & _mm512_cmple_epu64_mask(day, _mm512_srli_epi64::<8>(days));
+                _mm512_mask_mov_epi64(all(NO_DATE as u64), ok, _mm512_add_epi64(base, _mm512_mul_epu32(day, all(86_400))))
+            }
         }
 
         /// A `YYYY-MM-DDTHH:MM:SS` whose bytes 8..16 are `g1`, bytes 12..20 `g2` and date

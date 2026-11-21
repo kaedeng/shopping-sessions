@@ -437,6 +437,7 @@ pub(crate) mod fused {
     pub(crate) struct Line<const N: usize> {
         pub start: [usize; N],
         pub len: [usize; N],
+        #[cfg_attr(not(test), allow(dead_code))]
         pub next: usize,
     }
 
@@ -449,7 +450,7 @@ pub(crate) mod fused {
 
     /// The `,`, `\n` and `"` bits of the 64 bytes at `p`.
     #[inline(always)]
-    unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
+    pub(crate) unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
         // SAFETY: the caller guarantees 64 readable bytes; AVX-512BW is compiled in (cfg above).
         unsafe {
             let bytes = _mm512_loadu_si512(p.cast());

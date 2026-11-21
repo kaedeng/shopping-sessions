@@ -112,6 +112,49 @@ fn less_slow(a: Id, b: Id) -> bool {
     x < y
 }
 
+/// Eight IDs packed at once (AVX-512), for the positional parse's batches (`ingest::pos`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
+pub mod wide {
+    use core::arch::x86_64::*;
+
+    use super::{HIGH, ONES};
+
+    /// `pack_at` for 8 IDs. Lane `i` is an ID of `len[i]` bytes whose bytes 0..8 are
+    /// `first[i]` (a little-endian word; bytes past the ID are anything) and whose byte 8 is
+    /// the low byte of `ninth[i]`. Returns the packed IDs and the lanes that pack. Any other
+    /// lane's ID takes `pack_at`'s slow path (over 9 bytes, or a byte that does not pack), and
+    /// its value here means nothing. Agrees with `pack_at` on every input
+    /// (`tests::wide_packs_as_pack_at`).
+    #[inline(always)]
+    pub fn pack(first: __m512i, ninth: __m512i, len: __m512i) -> (__m512i, __mmask8) {
+        // SAFETY: register arithmetic; AVX-512 F and BW are compiled in (cfg above).
+        #[allow(unused_unsafe)]
+        unsafe {
+            let all = |value: u64| _mm512_set1_epi64(value as i64);
+            let short = _mm512_cmple_epu64_mask(len, all(9));
+            // The ID's first min(len, 8) bytes: ones shifted right by the bytes not kept (a
+            // count of 64 gives 0, which is what an empty ID needs).
+            let kept = _mm512_min_epu64(len, all(8));
+            let mask = _mm512_srlv_epi64(all(u64::MAX), _mm512_slli_epi64::<3>(_mm512_sub_epi64(all(8), kept)));
+            let nine = _mm512_cmpeq_epi64_mask(len, all(9));
+            let ninth = _mm512_maskz_mov_epi64(nine, _mm512_and_si512(ninth, all(0xFF)));
+            let word = _mm512_and_si512(first, mask);
+            let filled = _mm512_or_si512(word, _mm512_xor_si512(mask, all(u64::MAX)));
+            let zero_byte = _mm512_and_si512(_mm512_andnot_si512(filled, _mm512_sub_epi64(filled, all(ONES))), all(HIGH));
+            let unpackable = _mm512_or_si512(_mm512_or_si512(_mm512_and_si512(word, all(HIGH)), zero_byte), _mm512_and_si512(ninth, all(0x80)));
+            let bad = _mm512_test_epi64_mask(unpackable, unpackable) | (nine & _mm512_testn_epi64_mask(ninth, ninth));
+            // The bytes in order of significance, then the 7 low bits of each squeezed
+            // together (`squeeze`'s shifts: there is no `pext` on a vector).
+            let reverse = _mm512_broadcast_i32x4(_mm_set_epi8(8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7));
+            let x = _mm512_shuffle_epi8(word, reverse);
+            let x = _mm512_or_si512(_mm512_srli_epi64::<1>(_mm512_and_si512(x, all(0x7F00_7F00_7F00_7F00))), _mm512_and_si512(x, all(0x007F_007F_007F_007F)));
+            let x = _mm512_or_si512(_mm512_srli_epi64::<2>(_mm512_and_si512(x, all(0x3FFF_0000_3FFF_0000))), _mm512_and_si512(x, all(0x0000_3FFF_0000_3FFF)));
+            let x = _mm512_or_si512(_mm512_srli_epi64::<4>(_mm512_and_si512(x, all(0x0FFF_FFFF_0000_0000))), _mm512_and_si512(x, all(0x0000_0000_0FFF_FFFF)));
+            (_mm512_or_si512(_mm512_slli_epi64::<7>(x), ninth), short & !bad)
+        }
+    }
+}
+
 #[derive(Default)]
 struct Interner {
     map: HashMap<Box<[u8]>, Id>,
@@ -144,6 +187,50 @@ fn intern(bytes: &[u8]) -> Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
+    #[test]
+    fn wide_packs_as_pack_at() {
+        use core::arch::x86_64::*;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut packed = 0;
+        for round in 0..40_000u64 {
+            // 8 IDs of 0 to 11 bytes, mostly of bytes that pack, each followed by other bytes.
+            let alphabet: &[u8] = if round % 3 == 0 { b"k0z9aA_-\x00\x7f\x80\xff\x01," } else { b"kuec0123456789abcxyz" };
+            let mut buffers = [[0u8; 16]; 8];
+            let (mut first, mut ninth, mut len) = ([0u64; 8], [0u64; 8], [0u64; 8]);
+            for lane in 0..8 {
+                for byte in buffers[lane].iter_mut() {
+                    *byte = alphabet[(next() % alphabet.len() as u64) as usize];
+                }
+                len[lane] = next() % 12;
+                first[lane] = u64::from_le_bytes(buffers[lane][..8].try_into().unwrap());
+                // The low byte is the ID's ninth; the rest is whatever came with it.
+                ninth[lane] = u64::from(buffers[lane][8]) | next() << 8;
+            }
+            // SAFETY: each array holds 8 words.
+            let load = |words: &[u64; 8]| unsafe { _mm512_loadu_si512(words.as_ptr().cast()) };
+            let (ids, ok) = wide::pack(load(&first), load(&ninth), load(&len));
+            let mut got = [0u64; 8];
+            unsafe { _mm512_storeu_si512(got.as_mut_ptr().cast(), ids) };
+            for lane in 0..8 {
+                let want = pack(&buffers[lane][..len[lane] as usize]);
+                let text = &buffers[lane][..len[lane] as usize];
+                assert_eq!(ok >> lane & 1 == 1, want & SLOW == 0, "{text:?}");
+                if want & SLOW == 0 {
+                    assert_eq!(got[lane], want, "{text:?}");
+                    packed += 1;
+                }
+            }
+        }
+        assert!(packed > 100_000, "only {packed} IDs packed");
+    }
 
     #[test]
     fn packs_round_trip_and_keep_byte_order() {
