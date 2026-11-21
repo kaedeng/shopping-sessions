@@ -83,7 +83,7 @@ fn pairs(buf: &[u8]) -> Vec<(&[u8], &[u8])> {
     };
     // SAFETY: `padded` made the buffer a segment.
     unsafe {
-        Scalar::lines::<2>(buf.as_ptr().add(1), buf.len() - 1 - PAD, &mut Scratch::new(), |&[key, value]| {
+        tok::Quick::lines::<2>(buf.as_ptr().add(1), buf.len() - 1 - PAD, &mut Scratch::new(), |&[key, value]| {
             if key.len > 0 {
                 rows.push((bytes(key), bytes(value)));
             }

@@ -410,8 +410,15 @@ mod shape {
 }
 
 #[cfg(all(feature = "tok-shape", target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2"))]
-#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use fused::Fused;
+
+/// The tokenizer for what one thread reads before the workers start (the lookup files, the
+/// key search's sample): the shapes where the build has them, `Scalar` elsewhere. Every
+/// tokenizer gives the same fields; at 20M `Scalar` took about 2 ms of serial time here.
+#[cfg(all(feature = "tok-shape", target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2"))]
+pub(crate) type Quick = fused::Fused;
+#[cfg(not(all(feature = "tok-shape", target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2")))]
+pub(crate) type Quick = Scalar;
 
 /// Slot `pos-fused`: a line's shape as numbers (where each field starts and how long it is),
 /// for a caller that reads the fields' bytes itself (`pos::wide::fused`) instead of taking

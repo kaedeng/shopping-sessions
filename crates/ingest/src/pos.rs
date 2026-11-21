@@ -334,7 +334,7 @@ impl Ingest {
         let len = if len > SAMPLE_BYTES { memrchr(b'\n', &bytes[..SAMPLE_BYTES]).map_or(0, |at| at + 1) } else { len };
         // SAFETY: whole lines of a segment; the fields are inside it.
         unsafe {
-            Scalar::lines::<7>(p, len, &mut Scratch::new(), |fields| {
+            crate::tok::Quick::lines::<7>(p, len, &mut Scratch::new(), |fields| {
                 let (id, user) = (fields[0], fields[1]);
                 if rows.len() < SAMPLE_ROWS
                     && let Some(event) = scramble::canonical_at(id.p, id.len, b'e')
