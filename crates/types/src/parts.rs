@@ -1,8 +1,9 @@
 //! Many append-only lists carved out of one allocation: a worker's dedup partitions in the parse,
-//! its person buckets in the dedup stage (slot `alloc-parallel`, `alternatives.md`).
+//! its person buckets in the dedup stage (slots `alloc-parallel` and `scatter-wc`,
+//! `alternatives.md`).
 //!
-//! One allocation per worker instead of one `Vec` per list. glibc serves a block this large with
-//! a single `mmap` and writes only its first page, so the kernel faults the rest in as the worker
+//! One allocation per worker instead of one `Vec` per list. A block this large is one `mmap`,
+//! and only its first page is touched up front, so the kernel faults the rest in as the worker
 //! writes its records: on the worker's own thread, holding the address-space lock only for
 //! reading, beside the other workers. Thousands of small `Vec`s had glibc write a header into
 //! every page up front and grow its heaps with `mprotect` and `mmap`, which take that lock for
@@ -11,138 +12,141 @@
 //! A list's length is 4 bytes here against a `Vec`'s 24, which also shrinks what a scatter
 //! keeps in L1.
 //!
-//! A list that outgrows its `room` spills into a `Vec` of its own, so any list holds any number
-//! of records; `pieces` returns the carved part, the spill, then what is still staged.
+//! Two ways to write, picked per `Parts` and monomorphized per loop through `Mode`:
+//! - `Plain`: each record is stored straight into its list's room. Into 1,024 lists that is a
+//!   store to a cache line that is usually not in L1, and on x86 (32 KB L1D) the scatter is
+//!   about a third of the parse.
+//! - `Combine` (slot `scatter-wc`): each list stages its records in a buffer of whole cache
+//!   lines; when the buffer is full it goes to the list's room with streaming stores, which
+//!   write the line without reading it first and keep it out of the caches (software
+//!   write-combining, Schuhknecht et al., PVLDB 2015). The staging buffers are `lists *
+//!   lines * 64` bytes. The records still staged are part of the list: `pieces` returns them.
+//!   A writer calls `fence` before other threads read what it wrote (once per task).
 //!
-//! Slot `scatter-wc` (`SS_SCATTER=wc|plain`, the pick on x86-64): a record first goes to a small
-//! staging buffer of its list, and a full buffer moves to the list's end in whole cache lines
-//! with streaming (non-temporal) stores. A scatter to 1,024 lists otherwise takes a cache miss
-//! per new line of every list: the lists' ends (64 KB) do not fit a 32 KB L1D, and each new line
-//! is first read from memory only to be overwritten. Staged, the stores land in a compact area
-//! that stays cached, and a streaming store writes a full line without reading it, so it also
-//! halves the memory traffic of the scatter (Schuhknecht, Khanchandani and Dittrich, PVLDB 2015).
+//! A list that outgrows its `room` spills into a `Vec` of its own, so any list holds any number
+//! of records; `pieces` returns the written part, the staged part, then the spill.
 
-use std::alloc::{self, Layout};
+use std::alloc::{Layout, alloc, dealloc};
+use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::OnceLock;
 
-use crate::{env, mem};
+/// How records reach a list's room: chosen once per loop, never per record.
+pub trait Mode {
+    const COMBINE: bool;
+}
 
-/// A streaming store wants whole cache lines.
+/// Each record stored straight into its list.
+pub struct Plain;
+
+/// Records staged per list and written a buffer at a time with streaming stores.
+pub struct Combine;
+
+impl Mode for Plain {
+    const COMBINE: bool = false;
+}
+
+impl Mode for Combine {
+    const COMBINE: bool = true;
+}
+
 const LINE: usize = 64;
 
-/// Bytes a list stages before they move to its end (`SS_WC_BYTES`). The x86 box measured the
-/// parse at 256 bytes ahead of 128 and 64: a flush is a branch the predictor cannot learn, and
-/// a larger stage takes it less often, while the stages of 1,024 lists still fit L2.
-const STAGE_BYTES: usize = 256;
+/// The write mode for every `Parts` of this run: `SS_SCATTER=combine|plain` (`combine` on
+/// x86-64, where the scatter misses L1, `plain` elsewhere) and `SS_WC_LINES`, the cache lines a
+/// staging buffer holds at least (default 4: on x86, 8 workers, the parse measured 7.7 GB/s
+/// plain, 9.4–9.7 at 1 line, 9.5–10.1 at 2, 10.4–10.6 at 4, 10.3–10.4 at 8). `None` means
+/// plain; read once.
+pub fn mode_from_env() -> Option<usize> {
+    mode_for("SS_SCATTER")
+}
 
-/// The staging of `Parts::new`: 0 for plain stores. Read once.
-fn default_stage_bytes() -> usize {
-    static BYTES: OnceLock<usize> = OnceLock::new();
-    *BYTES.get_or_init(|| {
-        // Streaming stores are an x86 remedy: elsewhere the plain loop stays the pick.
-        let options: &[&str] = match (cfg!(feature = "scatter-wc"), cfg!(target_arch = "x86_64")) {
-            (false, _) => &["plain"],
-            (true, true) => &["wc", "plain"],
-            (true, false) => &["plain", "wc"],
-        };
-        match options[env::pick("SS_SCATTER", options)] {
-            "wc" => env::number("SS_WC_BYTES", STAGE_BYTES).max(1),
-            _ => 0,
+/// The write mode for the person buckets: `SS_SCATTER_BUCKETS=combine|plain`, defaulting to
+/// `SS_SCATTER`'s. Streamed buckets are not in cache when the sessions stage reads them.
+pub fn bucket_mode_from_env() -> Option<usize> {
+    if std::env::var_os("SS_SCATTER_BUCKETS").is_some() { mode_for("SS_SCATTER_BUCKETS") } else { mode_from_env() }
+}
+
+fn mode_for(var: &str) -> Option<usize> {
+    #[cfg(not(feature = "scatter-wc"))]
+    let _ = var;
+    #[cfg(feature = "scatter-wc")]
+    {
+        let options: &[&str] = if cfg!(target_arch = "x86_64") { &["combine", "plain"] } else { &["plain", "combine"] };
+        if options[crate::env::pick(var, options)] == "combine" {
+            let lines = crate::env::number("SS_WC_LINES", 4);
+            assert!(lines.is_power_of_two() && lines <= 16, "SS_WC_LINES={lines}: 1, 2, 4, 8 or 16");
+            return Some(lines);
         }
-    })
+    }
+    None
 }
 
-/// `slots` uninitialised `T`s on a cache-line boundary. Like a `Vec`, a large one is a single
-/// `mmap` of which the allocator touches only the first page.
+/// An aligned block of `T`s; uninitialized, owned, freed on drop.
 struct Block<T> {
-    at: NonNull<T>,
-    slots: usize,
+    ptr: NonNull<T>,
+    layout: Layout,
 }
-
-// SAFETY: a `Block` owns its memory like a `Vec<T>` does.
-unsafe impl<T: Send> Send for Block<T> {}
-unsafe impl<T: Sync> Sync for Block<T> {}
 
 impl<T> Block<T> {
-    fn layout(slots: usize) -> Layout {
-        Layout::array::<T>(slots).and_then(|layout| layout.align_to(LINE)).expect("Parts: the size overflows")
-    }
-
-    fn new(slots: usize) -> Block<T> {
-        let layout = Self::layout(slots);
-        if layout.size() == 0 {
-            return Block { at: NonNull::dangling(), slots };
-        }
-        // SAFETY: the layout has a size.
-        let at = unsafe { alloc::alloc(layout) }.cast::<T>();
-        Block { at: NonNull::new(at).unwrap_or_else(|| alloc::handle_alloc_error(layout)), slots }
-    }
-
-    fn bytes(&self) -> usize {
-        self.slots * size_of::<T>()
+    fn new(count: usize) -> Block<T> {
+        let bytes = count.checked_mul(size_of::<T>()).expect("Parts: size overflows").max(1);
+        let layout = Layout::from_size_align(bytes, LINE.max(align_of::<T>())).expect("Parts: layout");
+        // SAFETY: `layout` has a non-zero size.
+        let ptr = NonNull::new(unsafe { alloc(layout) }.cast::<T>()).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        Block { ptr, layout }
     }
 }
 
 impl<T> Drop for Block<T> {
     fn drop(&mut self) {
-        let layout = Self::layout(self.slots);
-        if layout.size() != 0 {
-            // SAFETY: allocated in `new` with this layout.
-            unsafe { alloc::dealloc(self.at.as_ptr().cast(), layout) };
-        }
+        // SAFETY: allocated in `new` with this layout.
+        unsafe { dealloc(self.ptr.as_ptr().cast(), self.layout) }
     }
 }
+
+// SAFETY: a `Block` is plain owned memory, as a `Vec<T>` is.
+unsafe impl<T: Send> Send for Block<T> {}
+unsafe impl<T: Sync> Sync for Block<T> {}
 
 /// `lists` append-only lists of `T`, each with `room` records carved out of one allocation.
 pub struct Parts<T> {
-    /// `lists * room` slots: list `i` owns slots `i * room ..`, of which the first `lens[i]`
-    /// are written.
+    /// `lists * room` slots: list `i` owns slots `i * room ..`.
     region: Block<T>,
     room: usize,
+    /// Records in each list's room, staged ones included; never more than `room`.
     lens: Vec<u32>,
     spill: Vec<Vec<T>>,
-    /// Slot `scatter-wc`: list `i` stages its newest `fill[i]` records (up to `stage`: a full
-    /// stage moves out when the next record arrives) in slots `i * stage ..` of `staged`.
-    /// `stage` is 0 for plain stores, and then nothing is ever staged.
-    staged: Block<T>,
-    stage: usize,
-    fill: Vec<u8>,
+    /// Records per staging buffer, a power of two; 0 when plain.
+    batch: usize,
+    /// `lists * batch` slots: list `i` stages in slots `i * batch ..`.
+    stage: Block<T>,
+    _records: PhantomData<T>,
 }
 
 impl<T: Copy> Parts<T> {
-    /// Allocates the region; no page of it is touched until a record is written there. Staged
-    /// or plain as `SS_SCATTER` says (module docs).
-    pub fn new(lists: usize, room: usize) -> Parts<T> {
-        Self::with_stage_bytes(lists, room, default_stage_bytes())
-    }
-
-    /// Like `new` with the staging given: each list stages about `stage_bytes` bytes (whole
-    /// cache lines of whole records, at least one line), or nothing when it is 0.
-    pub fn with_stage_bytes(lists: usize, room: usize, stage_bytes: usize) -> Parts<T> {
-        assert!(lists > 0 && room > 0 && room <= u32::MAX as usize, "Parts::new({lists}, {room})");
-        let size = size_of::<T>();
-        let stage = if stage_bytes == 0 || size == 0 || LINE % align_of::<T>() != 0 {
-            0
-        } else {
-            // The fewest records that end on a line boundary, then as many of those groups as fit.
-            let group = LINE / gcd(size, LINE);
-            // `fill` counts a full stage in a `u8`.
-            (group * (stage_bytes / (group * size)).max(1)).min(u8::MAX as usize / group * group)
-        };
-        // A flush moves a whole stage, so a staged list's room is a whole number of stages and
-        // every list starts on a line boundary.
-        let room = if stage == 0 { room } else { room.next_multiple_of(stage) };
-        assert!(room <= u32::MAX as usize, "Parts::new({lists}, {room})");
+    /// Allocates the region (and, to combine, the staging buffers of `lines` cache lines each,
+    /// `mode_from_env`); no page of the region is touched until a record lands there. `room` is
+    /// rounded up to a whole number of staging buffers.
+    pub fn new(lists: usize, room: usize, combine: Option<usize>) -> Parts<T> {
+        assert!(lists > 0 && room > 0 && size_of::<T>() > 0, "Parts::new({lists}, {room})");
+        // Records per buffer: the fewest, a power of two, that fill whole lines and at least the
+        // lines asked for (4 lines: 8 of 32 bytes, 16 of 16, 16 of 24 in 6 lines).
+        let batch = combine.map_or(0, |lines| {
+            let bytes = |n: usize| n * size_of::<T>();
+            let fill = (0..20).map(|shift| 1usize << shift).find(|&n| bytes(n) % LINE == 0 && bytes(n) >= lines * LINE);
+            fill.expect("Parts: no power-of-two count of records fills whole cache lines")
+        });
+        let room = if batch > 0 { room.div_ceil(batch) * batch } else { room };
+        assert!(room <= u32::MAX as usize, "Parts: room {room} over u32");
         let slots = lists.checked_mul(room).expect("Parts: lists * room overflows");
         Parts {
             region: Block::new(slots),
             room,
             lens: vec![0; lists],
             spill: (0..lists).map(|_| Vec::new()).collect(),
-            staged: Block::new(lists * stage),
-            stage,
-            fill: vec![0; lists],
+            batch,
+            stage: Block::new(lists * batch),
+            _records: PhantomData,
         }
     }
 
@@ -150,85 +154,66 @@ impl<T: Copy> Parts<T> {
         self.lens.len()
     }
 
-    /// Appends `rec` to list `list`.
+    /// Whether this `Parts` stages its records: call the loops with `Combine` if so, else `Plain`.
+    pub fn combining(&self) -> bool {
+        self.batch > 0
+    }
+
+    /// Appends `rec` to list `list`, the way `M` says; `M::COMBINE` must equal `combining()`.
     ///
     /// # Safety
     /// `list < self.lists()`.
     #[inline(always)]
-    pub unsafe fn push_unchecked(&mut self, list: usize, rec: T) {
-        // SAFETY: the caller keeps `list` in range, and the closure writes the whole record.
-        unsafe { self.push_with(list, |slot| slot.write(rec)) }
-    }
-
-    /// Appends to list `list` the record `write` writes into the slot it is given. For a record
-    /// of several fields this is the fast form: the fields go straight to the slot. Built as a
-    /// value first, a 32-byte record was stored to the stack field by field and copied out with
-    /// one wide load, which waits for every one of those stores to leave the store buffer (no
-    /// forwarding from several small stores to one wide load): 26% of the parse's samples on
-    /// the x86 box.
-    ///
-    /// # Safety
-    /// `list < self.lists()`, and `write` initialises the whole record.
-    #[inline(always)]
-    pub unsafe fn push_with(&mut self, list: usize, write: impl FnOnce(*mut T)) {
-        // One branch per record on a value fixed for the run, so the predictor always has it;
-        // the two loops are not worth a second copy of every caller.
-        if self.stage != 0 {
-            // SAFETY: the caller keeps `list` in range, and `fill[list] <= stage`.
-            unsafe {
-                let mut at = *self.fill.get_unchecked(list) as usize;
-                // A full stage leaves when the next record comes, not when its last one lands:
-                // by then its stores have retired, so the flush's wide loads do not wait on them.
-                if at == self.stage {
-                    self.flush(list);
-                    at = 0;
-                }
-                write(self.staged.at.as_ptr().add(list * self.stage + at));
-                *self.fill.get_unchecked_mut(list) = at as u8 + 1;
-            }
+    pub unsafe fn push_as<M: Mode>(&mut self, list: usize, rec: T) {
+        debug_assert!(list < self.lists() && M::COMBINE == self.combining());
+        // SAFETY: the caller keeps `list` in range.
+        let at = unsafe { *self.lens.get_unchecked(list) } as usize;
+        if at >= self.room {
+            self.spill(list, rec);
             return;
         }
-        // SAFETY: the caller keeps `list` in range.
-        let len = unsafe { self.lens.get_unchecked_mut(list) };
-        if (*len as usize) < self.room {
-            // SAFETY: `list * room + len < lists * room`, the region's capacity, and each slot is
-            // written at most once before `pieces` reads it.
-            unsafe { write(self.region.at.as_ptr().add(list * self.room + *len as usize)) };
-            *len += 1;
-        } else {
-            let mut rec = std::mem::MaybeUninit::<T>::uninit();
-            write(rec.as_mut_ptr());
-            // SAFETY: `write` initialised it (the caller's contract).
-            self.spill(list, unsafe { rec.assume_init() });
+        // SAFETY: as above; `at < room <= u32::MAX`.
+        unsafe { *self.lens.get_unchecked_mut(list) = at as u32 + 1 };
+        if !M::COMBINE {
+            // SAFETY: `list * room + at < lists * room`, the region's size; each slot is written
+            // once before `pieces` reads it.
+            unsafe { self.region.ptr.as_ptr().add(list * self.room + at).write(rec) };
+            return;
+        }
+        let fill = at & (self.batch - 1);
+        // SAFETY: `list * batch + fill < lists * batch`, the staging buffers' size.
+        let buffer = unsafe { self.stage.ptr.as_ptr().add(list * self.batch) };
+        unsafe { buffer.add(fill).write(rec) };
+        if fill == self.batch - 1 {
+            // The buffer is full: `at + 1 - batch` is a multiple of `batch`, and `room` is too, so
+            // the destination is inside the list's room and aligned to the buffer's size.
+            let to = unsafe { self.region.ptr.as_ptr().add(list * self.room + at + 1 - self.batch) };
+            unsafe { stream(buffer.cast(), to.cast(), self.batch * size_of::<T>()) };
         }
     }
 
-    /// Moves list `list`'s full stage to its end.
-    ///
-    /// # Safety
-    /// `list < self.lists()`, staging is on, and the list's whole stage is written.
-    #[inline(always)]
-    unsafe fn flush(&mut self, list: usize) {
-        // SAFETY: the caller keeps `list` in range; the carved length is a whole number of
-        // stages, so `len + stage <= room` leaves room for all of this one.
-        unsafe {
-            let len = self.lens.get_unchecked_mut(list);
-            let from = self.staged.at.as_ptr().add(list * self.stage);
-            if *len as usize + self.stage <= self.room {
-                let to = self.region.at.as_ptr().add(list * self.room + *len as usize);
-                stream(from.cast(), to.cast(), self.stage * size_of::<T>());
-                *len += self.stage as u32;
-            } else {
-                self.spill_stage(list);
-            }
-        }
-    }
-
-    /// Appends `rec` to list `list`; panics if there is no such list.
+    /// Appends `rec` to list `list`, plain or staged as this `Parts` was built; panics if there
+    /// is no such list. Not for hot loops: it decides the mode per call.
     pub fn push(&mut self, list: usize, rec: T) {
         assert!(list < self.lists(), "list {list} of {}", self.lists());
-        // SAFETY: checked above.
-        unsafe { self.push_unchecked(list, rec) }
+        // SAFETY: checked above; the mode matches `combining()`.
+        unsafe {
+            if self.combining() { self.push_as::<Combine>(list, rec) } else { self.push_as::<Plain>(list, rec) }
+        }
+    }
+
+    /// Makes this thread's streamed lines visible to other threads: call it after the last
+    /// `push_as::<Combine>` of a task, before another thread may read the lists.
+    #[inline]
+    pub fn fence(&self) {
+        #[cfg(target_arch = "x86_64")]
+        if self.combining() {
+            // SAFETY: SSE is part of x86-64 (newer compilers call this intrinsic safe).
+            #[allow(unused_unsafe)]
+            unsafe {
+                core::arch::x86_64::_mm_sfence()
+            }
+        }
     }
 
     #[cold]
@@ -237,44 +222,26 @@ impl<T: Copy> Parts<T> {
         self.spill[list].push(rec);
     }
 
-    #[cold]
-    #[inline(never)]
-    fn spill_stage(&mut self, list: usize) {
-        // SAFETY: called with the list's whole stage written.
-        let stage = unsafe { std::slice::from_raw_parts(self.staged.at.as_ptr().add(list * self.stage), self.stage) };
-        self.spill[list].extend_from_slice(stage);
-    }
-
-    /// Call after a run of `push`es and before another thread reads the lists: streaming stores
-    /// are weakly ordered, and this makes them visible like any other store. Free when nothing
-    /// was streamed.
-    #[inline]
-    pub fn fence(&self) {
-        #[cfg(target_arch = "x86_64")]
-        if self.stage != 0 {
-            // SAFETY: SSE is part of x86-64.
-            unsafe { core::arch::x86_64::_mm_sfence() };
-        }
-    }
-
-    /// List `list` in order of appending: the carved part, the spill (usually empty), then the
-    /// records still staged.
+    /// List `list` in order of appending: the records written to its room, those still staged,
+    /// then the spill. The staged and spilled pieces are usually short or empty.
     pub fn pieces(&self, list: usize) -> [&[T]; 3] {
-        let (len, fill) = (self.lens[list] as usize, self.fill[list] as usize);
-        // SAFETY: the first `len` slots of the list's room and the first `fill` of its stage
-        // were written by `push_unchecked`.
-        let (carved, staged) = unsafe {
-            (
-                std::slice::from_raw_parts(self.region.at.as_ptr().add(list * self.room), len),
-                std::slice::from_raw_parts(self.staged.at.as_ptr().add(list * self.stage), fill),
-            )
-        };
-        [carved, &self.spill[list], staged]
+        let len = self.lens[list] as usize;
+        let staged = if self.batch > 0 { len & (self.batch - 1) } else { 0 };
+        // SAFETY: the first `len - staged` slots of the list's room were written, by
+        // `push_as::<Plain>` or by full buffers; the first `staged` slots of its buffer hold the
+        // rest. A plain `Parts` has `staged == 0` and an empty, aligned buffer.
+        unsafe {
+            [
+                std::slice::from_raw_parts(self.region.ptr.as_ptr().add(list * self.room), len - staged),
+                std::slice::from_raw_parts(self.stage.ptr.as_ptr().add(list * self.batch), staged),
+                &self.spill[list],
+            ]
+        }
     }
 
     /// Records in list `list`.
     pub fn len_of(&self, list: usize) -> usize {
-        self.lens[list] as usize + self.spill[list].len() + self.fill[list] as usize
+        self.lens[list] as usize + self.spill[list].len()
     }
 
     /// Records in all lists.
@@ -297,54 +264,36 @@ impl<T: Copy> Parts<T> {
     }
 
     /// Slot `free-early`: empties every list and hands the region's pages back to the kernel on
-    /// the calling thread (`mem::release`). The lists can be filled again afterwards.
+    /// the calling thread (`mem::release`), instead of leaving them to the one thread that
+    /// exits. The lists can be filled again afterwards.
     pub fn release(&mut self) {
         self.lens.fill(0);
-        self.fill.fill(0);
         self.spill.iter_mut().for_each(|spill| *spill = Vec::new());
         // SAFETY: every list is empty now, so no slot of the region is read before it is
         // written again.
-        unsafe { mem::release(self.region.at.as_ptr().cast(), self.region.bytes()) };
+        unsafe { crate::mem::release(self.region.ptr.as_ptr().cast(), self.region.layout.size()) };
     }
 }
 
-fn gcd(a: usize, b: usize) -> usize {
-    if b == 0 { a } else { gcd(b, a % b) }
-}
-
-/// Copies `bytes` (whole cache lines) from one line boundary to another without reading the
-/// destination's lines into the cache first.
+/// Copies `bytes` (a multiple of 64) from `from` to `to`, both 64-byte aligned, with streaming
+/// stores where the target has them.
 ///
 /// # Safety
-/// Both ranges are valid, apart, and start on a 64-byte boundary; `bytes` is a multiple of 64.
+/// Both ranges are valid and do not overlap.
 #[inline(always)]
 unsafe fn stream(from: *const u8, to: *mut u8, bytes: usize) {
-    debug_assert!(bytes % LINE == 0 && from as usize % LINE == 0 && to as usize % LINE == 0);
     #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-    // SAFETY: the caller's contract; AVX2 is compiled in.
     unsafe {
-        use core::arch::x86_64::{_mm256_load_si256, _mm256_stream_si256};
+        use core::arch::x86_64::{__m256i, _mm256_load_si256, _mm256_stream_si256};
         let mut at = 0;
         while at < bytes {
-            _mm256_stream_si256(to.add(at).cast(), _mm256_load_si256(from.add(at).cast()));
-            _mm256_stream_si256(to.add(at + 32).cast(), _mm256_load_si256(from.add(at + 32).cast()));
-            at += LINE;
+            _mm256_stream_si256(to.add(at).cast::<__m256i>(), _mm256_load_si256(from.add(at).cast::<__m256i>()));
+            at += 32;
         }
     }
-    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-    // SAFETY: the caller's contract; SSE2 is part of x86-64.
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
     unsafe {
-        use core::arch::x86_64::{_mm_load_si128, _mm_stream_si128};
-        let mut at = 0;
-        while at < bytes {
-            _mm_stream_si128(to.add(at).cast(), _mm_load_si128(from.add(at).cast()));
-            at += 16;
-        }
-    }
-    #[cfg(not(target_arch = "x86_64"))]
-    // SAFETY: the caller's contract.
-    unsafe {
-        std::ptr::copy_nonoverlapping(from, to, bytes)
+        core::ptr::copy_nonoverlapping(from, to, bytes)
     }
 }
 
@@ -352,14 +301,13 @@ unsafe fn stream(from: *const u8, to: *mut u8, bytes: usize) {
 mod tests {
     use super::Parts;
 
-    /// Every staging a record size can meet: plain, one line, the default, more than a list
-    /// ever holds.
-    const STAGES: [usize; 5] = [0, 1, 64, 256, 4096];
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    struct Rec24([u64; 3]);
 
-    fn fill_and_check<T: Copy + PartialEq + std::fmt::Debug>(make: impl Fn(u64) -> T) {
-        for stage_bytes in STAGES {
+    fn check<T: Copy + PartialEq + std::fmt::Debug>(make: impl Fn(u64) -> T) {
+        for combine in [None, Some(1), Some(2)] {
             for room in [1, 2, 5, 64] {
-                let mut parts = Parts::with_stage_bytes(7, room, stage_bytes);
+                let mut parts = Parts::new(7, room, combine);
                 let mut expected = vec![Vec::new(); 7];
                 for n in 0..1000u64 {
                     let list = ((n * 2_654_435_761) >> 7) as usize % 7;
@@ -369,39 +317,69 @@ mod tests {
                 parts.fence();
                 for (list, want) in expected.iter().enumerate() {
                     let got: Vec<T> = parts.pieces(list).concat();
-                    assert_eq!(&got, want, "stage {stage_bytes}, room {room}, list {list}");
+                    assert_eq!(&got, want, "combine {combine:?}, room {room}, list {list}");
                     assert_eq!(parts.len_of(list), want.len());
                 }
                 assert_eq!(parts.len(), 1000);
                 assert_eq!(parts.iter().count(), 1000);
-                // A staged list's room is rounded up to whole stages, so it may not spill.
-                if stage_bytes == 0 {
-                    assert_eq!(parts.spilled() > 0, room < 1000 / 7);
-                }
-                parts.release();
-                assert!(parts.is_empty() && parts.spilled() == 0);
-                parts.push(3, make(5));
-                assert_eq!(parts.pieces(3).concat(), [make(5)]);
+                assert!(parts.spilled() > 0);
             }
         }
     }
 
     #[test]
     fn lists_keep_order_and_spill() {
-        // 8, 16, 24 and 32 bytes: the record sizes in use, and one that does not divide a line.
-        fill_and_check(|n| n);
-        fill_and_check(|n| [n, !n]);
-        fill_and_check(|n| [n, !n, n ^ 0x5555]);
-        fill_and_check(|n| [n, !n, n ^ 0x5555, n.rotate_left(17)]);
-        // Smaller alignments and an odd size.
-        fill_and_check(|n| n as u8);
-        fill_and_check(|n| [n as u8, (n >> 8) as u8, 7]);
+        check(|n| n);
+        check(|n| (n, n * 3));
+        check(|n| [n, n + 1, n + 2, n + 3]);
+        check(|n| Rec24([n, !n, n * 7]));
+    }
+
+    #[test]
+    fn release_empties_every_list() {
+        for combine in [None, Some(1), Some(4)] {
+            let mut parts = Parts::new(3, 4, combine);
+            for n in 0..100u64 {
+                parts.push((n % 3) as usize, [n; 2]);
+            }
+            parts.release();
+            assert!(parts.is_empty() && parts.spilled() == 0, "combine {combine:?}");
+            // The lists fill again from their first slot.
+            for n in 0..7u64 {
+                parts.push(2, [n; 2]);
+            }
+            parts.fence();
+            assert_eq!(parts.pieces(2).concat(), (0..7).map(|n| [n; 2]).collect::<Vec<_>>(), "combine {combine:?}");
+            assert_eq!(parts.len(), 7);
+        }
+    }
+
+    #[test]
+    fn buffer_sizes() {
+        assert_eq!(Parts::<[u64; 4]>::new(1, 1, Some(1)).batch, 2);
+        assert_eq!(Parts::<[u64; 4]>::new(1, 1, Some(4)).batch, 8);
+        assert_eq!(Parts::<[u64; 2]>::new(1, 1, Some(4)).batch, 16);
+        assert_eq!(Parts::<[u64; 3]>::new(1, 1, Some(1)).batch, 8);
+        assert_eq!(Parts::<[u64; 3]>::new(1, 1, Some(4)).batch, 16);
+        assert_eq!(Parts::<[u64; 3]>::new(1, 5, Some(4)).room, 16);
+        assert_eq!(Parts::<[u64; 3]>::new(1, 5, None).batch, 0);
+    }
+
+    #[test]
+    fn staged_records_are_listed_before_a_flush() {
+        // 32-byte records, one line: buffers of 2. Three records leave one staged.
+        let mut parts = Parts::new(2, 8, Some(1));
+        for n in 0..3u64 {
+            parts.push(1, [n; 4]);
+        }
+        assert_eq!(parts.pieces(1).map(<[_]>::len), [2, 1, 0]);
+        assert_eq!(parts.pieces(1).concat(), vec![[0; 4], [1; 4], [2; 4]]);
     }
 
     #[test]
     fn empty_lists() {
-        for stage_bytes in STAGES {
-            let parts: Parts<u32> = Parts::with_stage_bytes(3, 4, stage_bytes);
+        for combine in [None, Some(1)] {
+            let parts: Parts<u32> = Parts::new(3, 4, combine);
             assert!(parts.is_empty());
             assert!((0..3).all(|list| parts.pieces(list).iter().all(|piece| piece.is_empty())));
         }

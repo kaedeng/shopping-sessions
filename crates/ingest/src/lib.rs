@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use memchr::{memchr, memrchr};
 use types::hash::hash;
 use types::id::{pack, pack_at};
-use types::parts::Parts;
+use types::parts::{Combine, Mode, Parts, Plain};
 use types::record::{ClickRec, EventRec, MAX_PRICE, PAY_CATEGORY_SHIFT, VALID};
 use types::time::{DAY, SECOND, parse_f1};
 use types::{Ctx, Id, env};
@@ -192,6 +192,8 @@ pub struct Ingest {
     /// The tokenizer's monomorphized loops, picked once.
     parse_fn: ParseFn,
     links_fn: LinksFn,
+    /// How the partitions are written: `types::parts::mode_from_env` (slot `scatter-wc`).
+    scatter: Option<usize>,
     /// Slot `reader-populate`, picked by `SS_READER=populate`.
     #[cfg(all(feature = "reader-populate", target_os = "linux"))]
     populate: bool,
@@ -254,6 +256,7 @@ impl Ingest {
             link_rows,
             parse_fn,
             links_fn,
+            scatter: types::parts::mode_from_env(),
             #[cfg(all(feature = "reader-populate", target_os = "linux"))]
             populate: false,
         })
@@ -270,7 +273,7 @@ impl Ingest {
         // A quarter to spare: workers pull tasks unevenly, and rows hash unevenly to partitions.
         let room = |rows: usize, ways: usize| rows / ctx.workers / ways * 5 / 4 + 16;
         ParseOut {
-            parts: Parts::new(parts, room(self.event_rows, parts)),
+            parts: Parts::new(parts, room(self.event_rows, parts), self.scatter),
             clicks: Vec::with_capacity(room(self.click_rows, 1)),
             scratch: Scratch::new(),
         }
@@ -381,14 +384,25 @@ fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, task: usize, out: &mut ParseOu
         if *click {
             let clicks = &mut out.clicks;
             T::lines::<4>(p, len, &mut out.scratch, |fields| click_row(ctx, dates, fields, clicks));
+        } else if out.parts.combining() {
+            events::<T, Combine>(p, len, ctx, dates, out);
         } else {
-            let (parts, shift) = (&mut out.parts, 64 - ctx.part_bits);
-            T::lines::<7>(p, len, &mut out.scratch, |fields| event_row(ctx, dates, shift, fields, parts));
-            // The dedup stage reads these partitions from other threads.
-            out.parts.fence();
+            events::<T, Plain>(p, len, ctx, dates, out);
         }
     }
     ingest.release(seg);
+}
+
+/// One event chunk, its partitions written the way `M` says (`out.parts.combining()`).
+///
+/// # Safety
+/// `p, len` is a segment.
+#[inline(always)]
+unsafe fn events<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, out: &mut ParseOut) {
+    let (parts, shift) = (&mut out.parts, 64 - ctx.part_bits);
+    unsafe { T::lines::<7>(p, len, &mut out.scratch, |fields| event_row::<M>(ctx, dates, shift, fields, parts)) };
+    // Streamed lines become visible to the dedup stage's threads.
+    parts.fence();
 }
 
 fn links_with<T: Tok>(ingest: &Ingest) -> Vec<[Id; 2]> {
@@ -416,7 +430,7 @@ fn links_with<T: Tok>(ingest: &Ingest) -> Vec<[Id; 2]> {
 /// # Safety
 /// The fields are from a segment.
 #[inline(always)]
-unsafe fn event_row(ctx: &Ctx, dates: &Dates, shift: u32, fields: &[Field; 7], parts: &mut Parts<EventRec>) {
+unsafe fn event_row<M: Mode>(ctx: &Ctx, dates: &Dates, shift: u32, fields: &[Field; 7], parts: &mut Parts<EventRec>) {
     let [id, user, ts, ingest, kind, product, price] = *fields;
     let id = unsafe { pack_at(id.p, id.len) };
     if id == 0 {
@@ -449,13 +463,9 @@ unsafe fn event_row(ctx: &Ctx, dates: &Dates, shift: u32, fields: &[Field; 7], p
         & price_ok
         & ingest_ok
         & (ingest_ms - ts <= DAY);
-    // SAFETY: `shift` leaves `part_bits` bits, and there are `1 << part_bits` partitions. The
-    // record is written where it goes (`Parts::push_with`), every field of it.
-    unsafe {
-        parts.push_with((hash(id) >> shift) as usize, |slot| {
-            slot.write(EventRec { id, user, ts: ts as u32, ingest: ingest_rel, pay, flags: VALID * u32::from(valid) })
-        })
-    };
+    let rec = EventRec { id, user, ts: ts as u32, ingest: ingest_rel, pay, flags: VALID * u32::from(valid) };
+    // SAFETY: `shift` leaves `part_bits` bits, and there are `1 << part_bits` partitions.
+    unsafe { parts.push_as::<M>((hash(id) >> shift) as usize, rec) };
 }
 
 /// An `ingest_ts` outside the date table (or not F1, which the rules leave undefined: such an

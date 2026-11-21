@@ -30,8 +30,14 @@ fn event_key(e: &EventRec) -> (u64, u64, u32, u32, u32, u32) {
 }
 
 /// Every task of `data` on one `ParseOut`, records sorted so runs compare as multisets.
-fn parse_dir(data: &Path, ctx: &Ctx, chunk: usize, batch: usize, (parse, links): Pick) -> Parsed {
-    let ingest = Ingest::open_with(data, ctx, chunk, parse, links).unwrap();
+fn parse_dir(data: &Path, ctx: &Ctx, chunk: usize, batch: usize, pick: Pick) -> Parsed {
+    parse_dir_scatter(data, ctx, chunk, batch, pick, types::parts::mode_from_env())
+}
+
+/// `parse_dir` with the partitions written plain (`None`) or staged in buffers of that many lines.
+fn parse_dir_scatter(data: &Path, ctx: &Ctx, chunk: usize, batch: usize, (parse, links): Pick, scatter: Option<usize>) -> Parsed {
+    let mut ingest = Ingest::open_with(data, ctx, chunk, parse, links).unwrap();
+    ingest.scatter = scatter;
     let mut out = ingest.new_out(ctx);
     out.scratch.batch = batch;
     for task in 0..ingest.tasks() {
@@ -427,4 +433,20 @@ fn mask_matches_scalar_on_dev() {
         assert!(parse_dir(&dev, &ctx, chunk, batch, MASK) == reference, "mask, {chunk}-byte chunks");
     }
     assert!(parse_dir(&dev, &ctx, 1 << 20, 4096, MASK) == reference, "mask, 4 KB batches");
+}
+
+/// Slot `scatter-wc`: the partitions hold the same records whether written plain or staged, with
+/// any buffer size, on `dev/` when present and on a fixture with every kind of row otherwise.
+#[test]
+fn scatter_modes_agree() {
+    let dev = root().join("dev");
+    let data = if dev.join("manifest.json").exists() { dev } else { fixture("E1") };
+    let ctx = load_ctx(&data).unwrap();
+    let batch = Scratch::new().batch;
+    let reference = parse_dir_scatter(&data, &ctx, 1 << 20, batch, SCALAR, None);
+    for pick in PICKS {
+        for scatter in [None, Some(1), Some(2), Some(4)] {
+            assert!(parse_dir_scatter(&data, &ctx, 1 << 20, batch, *pick, scatter) == reference, "scatter {scatter:?}");
+        }
+    }
 }

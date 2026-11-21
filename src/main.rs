@@ -62,6 +62,8 @@ fn run() -> Result<(), String> {
     let (data, out) = (dir("DATA_DIR", "/data"), dir("OUTPUT_DIR", "/output"));
     let (ctx, ingest) = ingest::open(&data)?;
     let parallel_alloc = ALLOC[types::env::pick("SS_ALLOC", ALLOC)] == "parallel";
+    // Slot `scatter-wc`: how the person buckets are written (the parse partitions: `Ingest`).
+    let scatter = types::parts::bucket_mode_from_env();
     lap("inputs");
 
     // Stage 1. Task 0 is the union-find, the only serial job; its worker then joins the parse.
@@ -85,8 +87,8 @@ fn run() -> Result<(), String> {
     let clicks: usize = parsed.iter().map(|out| out.clicks.len()).sum();
     let room = |rows: usize| rows / ctx.workers / buckets * 9 / 8 + 64;
     let mut scattered: Vec<Scattered> = par::init(ctx.workers, parallel_alloc, |_| Scattered {
-        events: Parts::new(buckets, room(events)),
-        clicks: Parts::new(buckets, room(clicks)),
+        events: Parts::new(buckets, room(events), scatter),
+        clicks: Parts::new(buckets, room(clicks), scatter),
         scratch: Default::default(),
     });
     par::run(&mut scattered, parts + click_tasks.len(), |_, mine, task| {

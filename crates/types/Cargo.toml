@@ -11,8 +11,7 @@ rec-32 = []
 hash-mul = []
 table-linear = []
 par-counter = []
-# `Parts` stages each list's records and flushes whole cache lines with streaming stores
-# (`SS_SCATTER=wc|plain`; the pick on x86-64 only).
+# `parts::Combine`: staged lists written with streaming stores, `SS_SCATTER=combine|plain`.
 scatter-wc = []
 # Buffers go back to the kernel as soon as they are dead (`SS_FREE=early|exit`).
 free-early = []

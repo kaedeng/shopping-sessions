@@ -41,7 +41,7 @@ rec-32 = ["types/rec-32"]
 hash-mul = ["types/hash-mul"]
 table-linear = ["types/table-linear"]
 par-counter = ["types/par-counter"]
-# Write-combining buffers with streaming stores in every scatter (`SS_SCATTER=wc|plain`).
+# Write-combining buffers with streaming stores in both scatters (`SS_SCATTER=combine|plain`).
 scatter-wc = ["types/scatter-wc"]
 # ingest
 reader-mmap = ["ingest/reader-mmap"]
