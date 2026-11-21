@@ -62,6 +62,8 @@ agg-dense = ["sessions/agg-dense"]
 out-arrow = ["output/out-arrow"]
 # process
 fast-exit = []
+# Not a slot: `SS_TRACE=FILE` writes every task as a span, for ui.perfetto.dev (implementation.md).
+trace = ["types/trace"]
 # A process has one global allocator, so this one swaps at build time; no env var.
 alloc-mimalloc = ["dep:mimalloc"]
 
@@ -70,3 +72,11 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+
+# The release build plus symbols and line tables, so samply and perf can name inlined frames.
+# `make profiling` builds it with the `trace` feature into target/profiling/shopping-sessions.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = "none"
+split-debuginfo = "packed"

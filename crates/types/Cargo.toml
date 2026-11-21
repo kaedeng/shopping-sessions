@@ -11,3 +11,5 @@ rec-32 = []
 hash-mul = []
 table-linear = []
 par-counter = []
+# Not a slot: records every task as a span for `par::trace::write` (`SS_TRACE`).
+trace = []

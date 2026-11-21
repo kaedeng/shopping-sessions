@@ -2,3 +2,5 @@ target/
 dev/
 full/
 out/
+half/
+prof/

@@ -68,6 +68,7 @@ Knobs, each read once:
 | `DATA_DIR`, `OUTPUT_DIR` | `/data`, `/output` | Input and output folders |
 | `NCPU` | 8 | Worker threads; the scorer sets it to the CPU quota |
 | `SS_TIMING` | unset | Any value prints each stage's wall time to stderr |
+| `SS_TRACE` | unset | With the `trace` feature (off by default, on in `make profiling`): a file to write every task as a span, Chrome trace JSON for ui.perfetto.dev |
 | `SS_CHUNK_KB` | 1024 | Parse chunk size |
 | `SS_PART_BITS` | 10 | Dedup partitions = 2^n, 1 to 20 |
 | `SS_BUCKET_BITS` | 10 | Person buckets = 2^n |
@@ -127,6 +128,7 @@ These came out of measurements while building. None changes a result; each is a 
 - `make check-dev` against `dev-answer/`: an exact match with the defaults and with `SS_CHUNK_KB=1`, `NCPU` 1, 2, 3 and 12, 2 to 4,096 partitions and buckets, `SS_TOK=scalar`, and a build with only the scalar tokenizer.
 - Full size has no published answer. On two seeds the rules' self-check holds: summed `sessions` and `revenue_cents` are equal in the two tables, no key repeats, `organic` never assists. The arm64 and x86 binaries write identical tables.
 - Each crate has an `examples/*bench.rs` for its stage alone.
+- README "Benchmarking and profiling" has the whole-run tools: `scripts/bench.py` (variants in turns, median per stage and rusage), samply and perf flamegraphs, Instruments and strace syscall summaries, page-fault flamegraphs, and the `trace` timeline. The `trace` feature (`types::par::trace`) costs two clock reads and a locked push per task: 0.6% on the median total at full size on the Mac, inside the noise. Its test runs with `cargo test --release -p types --features trace`.
 
 ## Measurements
 
@@ -141,6 +143,7 @@ Wall time from `SS_TIMING=1`, 8 workers, warm page cache. The Mac is an M4 Pro (
 
 - Full size on the Mac spends 4.3 s of user time and 1.2 to 1.3 s of system time, the latter mostly first-touch page faults.
 - The Linux container is a VM with 12.6 GB, too little for the full set next to its page cache (runs of 1.0 to 2.2 s under memory pressure), so only the half set is a fair number there.
+- Linux container, half size, warm, through the profiling image (`make linux-syscalls`, `make linux-bench`): 0.364 s ± 1.3% elapsed over 3 runs at 7.0 CPUs, 26.2K minor faults and no major ones (the glibc tunables give most buffers 2 MB pages), 3,724 syscalls (2,039 `write`, 325 `futex`, 136 `openat` and `close`, 174 `mmap`), peak RSS 5.5 GB. Of the page faults 82% are taken in `parse_with` (the mapped input and the partition buffers it fills), 11% in `run`. The profiling build times the same as release there (median total 322.5 against 329.9 ms, inside the noise).
 - In the Linux container the process ends about 24 ms after its last output at half size: the kernel unmapping about 5 GB. `fast-exit` does not remove that. With the glibc tunables that gap is about 10 ms, since 2 MB pages are quicker to unmap.
 
 ## Decisions in `crates/ingest`

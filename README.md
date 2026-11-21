@@ -30,3 +30,23 @@ Every alternative is a Cargo feature that only adds code, and each slot with mor
 cargo build --release --features tok-scalar
 SS_TOK=scalar SS_TIMING=1 DATA_DIR=full OUTPUT_DIR=out target/release/shopping-sessions
 ```
+
+## Benchmarking and profiling
+
+`make profiling` builds `target/profiling/shopping-sessions`: the release build plus symbols, line tables and the `trace` feature. It times the same as release. Native targets read `DATA` (default `full`).
+
+| What | Mac (16 KB pages) | Linux VM (4 KB pages, glibc, like the scorer's kernel) |
+| --- | --- | --- |
+| Variants in turns, median per stage, CPU time, page faults, peak RSS | `make bench BENCH="A 'SS_X=y B'"` | `make linux-bench ARGS="/app/shopping-sessions 'NCPU=4 /app/shopping-sessions'"` |
+| CPU flamegraph | `make samply`: Firefox Profiler with flame graph, call tree, thread tracks, assembly | `make linux-flame`: `prof/linux-cpu.svg` and the top functions in `prof/linux-cpu.txt` |
+| Hot instructions | samply's assembly view (double-click a function) | `make linux-annotate` after `make linux-flame`: `prof/linux-annotate.txt`, hottest function first |
+| Syscalls | `make systrace-mac` (Instruments System Trace, no sudo) | `make linux-syscalls`: `strace -f -c` and `perf stat` |
+| Page faults by code | `make systrace-mac` | `make linux-faults`: `prof/linux-faults.svg` |
+| Per-task timeline, a track per worker | `make trace`, then open `prof/trace.json` in ui.perfetto.dev | `make linux-trace` |
+| Cold page cache | `python3 scripts/bench.py --prepare 'sudo purge' target/release/shopping-sessions` | `make linux-bench ARGS="--prepare 'echo 3 > /proc/sys/vm/drop_caches' /app/shopping-sessions"` |
+
+The Linux targets run in OrbStack (`open -ga OrbStack`); stop it (`orbctl stop`) before timing natively at full size, since the VM's memory can push the Mac into compressing pages. One-time setup: `make half GENERATE=generator/target/release/generate` (30M events; the VM's 12.6 GB cannot hold the full set beside its page cache), `make linux-data` (copies it into the volume `ss-half`), `make profile-image` (`scripts/profile.Dockerfile`: the arm64 scorer image plus perf, strace and the profiling build; rebuild it after a code change). The VM is arm64 with no hardware counters, so it profiles the NEON path by timer sampling, not the scorer's AVX2 code.
+
+Where the methods come from: the alternating runs with a change column are DataFusion's `bench.sh compare` and DuckDB's regression runner; cold and warm runs are ClickBench's; the per-task timeline plays the part of Polars' `profile()` and DuckDB's operator profiling; the `profiling` Cargo profile is the one DataFusion and Polars keep. To compare against an older build, keep a copy of its binary (`cp target/release/shopping-sessions target/base`) and pass both to `make bench`.
+
+Not set up: hardware counters (cycles, cache misses), since the VM has none and the Mac has them only through Instruments' CPU Counters template; instruction counting under Valgrind as Polars' CodSpeed runs do; criterion micro-benchmarks, whose place the `examples/*bench.rs` of each crate take.

@@ -4,6 +4,7 @@
 //! Reads  $DATA_DIR   (default /data)
 //! Writes $OUTPUT_DIR (default /output): user_daily/ and campaign_daily/ as Parquet
 //! `SS_TIMING=1` prints each stage's wall time to stderr; implementation.md lists every knob.
+//! Built with `--features trace`, `SS_TRACE=FILE` saves every task as a span (`types::par::trace`).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -130,6 +131,11 @@ fn run() -> Result<(), String> {
     lap("output");
     if timing {
         eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
+    }
+    #[cfg(feature = "trace")]
+    if let Some(path) = std::env::var_os("SS_TRACE") {
+        let stages = ["parse", "dedup", "sessions", "output"];
+        par::trace::write(path.as_ref(), &stages).map_err(|error| format!("SS_TRACE: {error}"))?;
     }
     // Slot `fast-exit`: the files are written, so skip the destructors and let the kernel reclaim.
     if cfg!(feature = "fast-exit") {
