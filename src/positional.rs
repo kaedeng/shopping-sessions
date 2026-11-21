@@ -22,6 +22,7 @@
 
 use std::path::Path;
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering::Relaxed};
 
 use ingest::Ingest;
 use ingest::pos::{Link, PosOut, PosPlan};
@@ -289,7 +290,7 @@ impl Grouped {
     }
 }
 
-/// A worker's buffers for the placing stage.
+/// A worker's buffers for placing a partition.
 #[derive(Default)]
 struct Placing {
     /// The partition's slots while its rows are placed: the kept copy of each event number.
@@ -299,12 +300,40 @@ struct Placing {
     slow_events: Vec<PersonEvent>,
 }
 
-/// A worker's state for the sessions stage.
+/// A worker's state for the stages after the parse.
 struct Work {
     agg: Agg,
     slow_events: Vec<PersonEvent>,
     slow_clicks: Vec<ClickRec>,
+    placing: Placing,
+    /// The fused stages' partition, once placed: its two columns (`scan`) and its runs.
+    times: Vec<u32>,
+    users: Vec<u32>,
+    runs: Vec<Run>,
+    /// The fused stages' count of runs taken and of those sent to the classic lane, then the
+    /// latter's slots by reason (`Fused::take`).
+    stats: [u64; 6],
 }
+
+impl Work {
+    fn new(ctx: &Ctx) -> Work {
+        Work {
+            agg: Agg::new(ctx),
+            slow_events: Vec::new(),
+            slow_clicks: Vec::new(),
+            placing: Placing::default(),
+            times: Vec::new(),
+            users: Vec::new(),
+            runs: Vec::new(),
+            stats: [0; 6],
+        }
+    }
+}
+
+/// How the stages after the parse run, the pick first (`SS_POS_STAGES`): a partition placed and
+/// its sessions cut in one task (`fused_stages`), or the table placed whole and then read
+/// (`split_stages`), which is also what `fused` falls back to.
+const STAGES: &[&str] = &["fused", "split"];
 
 /// Runs the whole pipeline after the inputs stage. `lap` marks a stage for `SS_TIMING`.
 pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_alloc: bool, lap: &mut dyn FnMut(&str)) -> Result<(), String> {
@@ -340,214 +369,54 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
             }
         }
     }
+    extras.sort_unstable_by_key(|extra| extra.person);
 
-    // Stage 2. Each event partition placed into its stretch of the table; each click range
-    // grouped by person.
-    let (events, persons) = (plan.events(), plan.persons as usize);
-    // Zeroed lazily by the kernel: a slot nobody writes reads 0, "no event" (a valid `ts` is
-    // at least `event_lo`, 7 days).
-    let (mut times, mut users) = (vec![0u32; events], vec![0u32; events]);
+    // Stage 2. Each click range grouped by person: a person's sessions need its clicks.
+    let persons = plan.persons as usize;
     let mut click_aliases = vec![0u64; persons];
     let mut flags = vec![0u8; persons];
-    let (times_at, users_at) = (Shared(times.as_mut_ptr()), Shared(users.as_mut_ptr()));
     let (click_aliases_at, flags_at) = (Shared(click_aliases.as_mut_ptr()), Shared(flags.as_mut_ptr()));
-    let placed: Vec<OnceLock<Placed>> = (0..plan.parts).map(|_| OnceLock::new()).collect();
     let grouped: Vec<OnceLock<Grouped>> = (0..plan.click_parts).map(|_| OnceLock::new()).collect();
-    let mut placing: Vec<Placing> = par::init(ctx.workers, parallel_alloc, |_| Placing::default());
-    par::run(&mut placing, plan.parts + plan.click_parts, |_, work, task| {
-        if task < plan.parts {
-            // SAFETY: partition `task` owns event numbers `task << shift ..`, and only this
-            // task writes them.
-            if let Some(result) = unsafe { place(task, plan, &parsed, links, times_at, users_at, work) } {
-                drop(placed[task].set(result));
-            }
-        } else {
-            let range = task - plan.parts;
-            // SAFETY: range `range` owns its persons' entries of both arrays in this stage.
-            if let Some(result) = unsafe { group_clicks(range, plan, &parsed, click_aliases_at, flags_at) } {
-                drop(grouped[range].set(result));
-            }
+    let mut works: Vec<Work> = par::init(ctx.workers, parallel_alloc, |_| Work::new(ctx));
+    par::run(&mut works, plan.click_parts, |_, _, range| {
+        // SAFETY: range `range` owns its persons' entries of both arrays in this stage.
+        if let Some(result) = unsafe { group_clicks(range, plan, &parsed, click_aliases_at, flags_at) } {
+            drop(grouped[range].set(result));
         }
     });
-    for work in &mut placing {
-        slow_events.append(&mut work.slow_events);
-    }
     // The clicks whose user is not a number: classic lane, by the general table.
     let mut slow_clicks: Vec<ClickRec> = Vec::new();
     for out in &parsed {
         slow_clicks.extend(out.odd_clicks.iter().map(|click| ClickRec { user: links.general.person(click.user), ..*click }));
     }
-    if free_early {
-        par::each(&mut parsed, |_, out| out.release());
-    }
-    lap("place");
+    lap("clicks");
 
-    // The runs stay with their partitions (copying them all into one list was most of this
-    // serial part). A run that crosses partitions is joined into the one it starts in, and
-    // skipped where it continues; then what the runs say about each person.
-    let mut placed: Vec<Placed> = placed.into_iter().map(|part| part.into_inner().unwrap_or_default()).collect();
-    // The partition that holds the table's last run so far.
-    let mut open: Option<usize> = None;
-    for at in 0..placed.len() {
-        let Some(&next) = placed[at].runs.first() else { continue };
-        if let Some(from) = open
-            && let Some(last) = placed[from].runs.last_mut()
-            && last.person == next.person
-        {
-            last.unfit |= next.unfit | (next.first_ts < last.last_ts);
-            (last.end, last.last_ts, last.aliases) = (next.end, next.last_ts, last.aliases | next.aliases);
-            placed[at].skip = 1;
-            // A partition that is all one run leaves that run open where it began.
-            if placed[at].runs.len() == 1 {
-                continue;
+    // Stages 3 and 4. Fused where every person turns out to have one run; the split stages
+    // otherwise, from the same lists.
+    let timing = std::env::var_os("SS_TIMING").is_some();
+    let mut stats = None;
+    if STAGES[types::env::pick("SS_POS_STAGES", STAGES)] == "fused" {
+        let state: Vec<AtomicU8> = (0..persons).map(|_| AtomicU8::new(0)).collect();
+        let conflict = AtomicBool::new(false);
+        let shared = Fused { ctx, plan, parsed: &parsed, links, extras: &extras, grouped: &grouped, click_aliases: &click_aliases, flags: &flags, state: &state, conflict: &conflict };
+        if fused_stages(&shared, &mut works, &mut slow_events, lap) {
+            let sum = |at: usize| works.iter().map(|work| work.stats[at]).sum::<u64>();
+            stats = Some((sum(0) as usize, sum(1) as usize, [sum(2), sum(3), sum(4), sum(5)]));
+            if free_early {
+                par::each(&mut parsed, |_, out| out.release());
             }
+        } else {
+            // A person with two runs: the first is in some worker's counters already.
+            if timing {
+                eprintln!("positional: a person's events are not one stretch, the split stages take over");
+            }
+            works = par::init(ctx.workers, parallel_alloc, |_| Work::new(ctx));
         }
-        open = Some(at);
+        std::mem::forget(state);
     }
-    let placed = placed;
-    let mut event_aliases = vec![0u64; persons];
-    for run in placed.iter().flat_map(Placed::own) {
-        let person = run.person as usize;
-        event_aliases[person] |= run.aliases;
-        // A second run of a person: its events are not one stretch.
-        flags[person] |= if flags[person] & SEEN != 0 || run.unfit { UNFIT | SEEN } else { SEEN };
+    if stats.is_none() {
+        stats = Some(split_stages(ctx, plan, &mut parsed, links, &extras, &grouped, &click_aliases, &mut flags, &mut works, &mut slow_events, free_early, timing, lap));
     }
-    extras.sort_unstable_by_key(|extra| extra.person);
-    for extra in &extras {
-        let (person, alias) = (extra.person as usize, extra.u & ALIAS_MASK);
-        event_aliases[person] |= 1 << (alias & (MASK_ALIASES - 1));
-        // No run to join: the person's events are these alone, and the classic lane takes them.
-        flags[person] |= if flags[person] & SEEN == 0 || alias >= MASK_ALIASES { UNFIT | EXTRA } else { EXTRA };
-    }
-    // A person is one fast-lane person when nothing above disqualifies it and every ID its
-    // rows use is in its one link component, or it has no links and uses a single ID.
-    let fit = |person: usize| {
-        let ids = event_aliases[person] | click_aliases[person];
-        flags[person] & UNFIT == 0
-            && match links.state[person] {
-                ONE => ids & !links.mask[person] == 0,
-                NONE => ids.count_ones() <= 1,
-                _ => false,
-            }
-    };
-    for extra in &extras {
-        if !fit(extra.person as usize) {
-            slow_events.push(PersonEvent { person: links.person(extra.u), ts: extra.ts, pay: extra.pay });
-        }
-    }
-    lap("runs");
-
-    // Stage 3. A partition's runs per task, with its purchases; then the click ranges, for
-    // the clicks of the classic lane's persons.
-    let run_tasks = placed.len();
-    let mut works: Vec<Work> =
-        par::init(ctx.workers, parallel_alloc, |_| Work { agg: Agg::new(ctx), slow_events: Vec::new(), slow_clicks: Vec::new() });
-    let (table, table_users) = (&times[..], &users[..]);
-    par::run(&mut works, run_tasks + plan.click_parts, |_, work, task| {
-        let (times, users) = (table, table_users);
-        if task < run_tasks {
-            let part = &placed[task];
-            // The purchases of a run that reaches past this partition, from each it passes.
-            let mut passing: Vec<(u32, u32)> = Vec::new();
-            let mut own_next = 0;
-            for run in part.own() {
-                let person = run.person as usize;
-                let stretch = run.first as usize..run.end as usize;
-                // Only the partition's last run can reach past it.
-                let crossing = stretch.end > (task + 1) << plan.shift;
-                if crossing {
-                    let from = part.pays.partition_point(|&(number, _)| number < run.first);
-                    passing.extend_from_slice(&part.pays[from..]);
-                    for (_, more) in placed.iter().enumerate().skip(task + 1).take_while(|&(later, _)| later << plan.shift < stretch.end) {
-                        passing.extend(more.pays.iter().take_while(|&&(number, _)| number < run.end));
-                    }
-                }
-                let pays: &[(u32, u32)] = if crossing { &passing } else { &part.pays };
-                let mut next_pay = if crossing { 0 } else { own_next };
-                // Purchases of events that left the table (none in practice) or of a skipped run.
-                while pays.get(next_pay).is_some_and(|&(number, _)| number < run.first) {
-                    next_pay += 1;
-                }
-                if fit(person) {
-                    let name = match links.state[person] {
-                        ONE => links.name[person],
-                        _ => scramble::id_of(u64::from(users[stretch.start]), plan.user_key, b'u'),
-                    };
-                    let range = person >> plan.click_shift;
-                    let clicks: &mut [Click] = match grouped[range].get() {
-                        // SAFETY: a fit person has one run, so only this task takes its clicks,
-                        // and the click tasks below read only the clicks of unfit persons.
-                        Some(group) => unsafe {
-                            let at = group.range(person - (range << plan.click_shift));
-                            std::slice::from_raw_parts_mut(group.clicks.0.add(at.start), at.len())
-                        },
-                        None => &mut [],
-                    };
-                    if flags[person] & EXTRA == 0 {
-                        sessions::positional::person(ctx, name, &times[stretch], run.first, &pays, &mut next_pay, clicks, &mut work.agg);
-                    } else {
-                        // The table's events, which are in time order, with the extras
-                        // merged in: a few rows, sorted alone. (Sorting them all together was
-                        // 1.4% of a run's instructions at 20M: the whales have extras.)
-                        let from = extras.partition_point(|extra| (extra.person as usize) < person);
-                        let mut own: Vec<(u32, u32)> =
-                            extras[from..].iter().take_while(|extra| extra.person as usize == person).map(|extra| (extra.ts, extra.pay)).collect();
-                        own.sort_unstable_by_key(|&(ts, _)| ts);
-                        let mut next_own = 0;
-                        let mut all: Vec<(u32, u32)> = Vec::with_capacity(stretch.len() + own.len());
-                        for number in stretch {
-                            if times[number] != 0 {
-                                let pay = match pays.get(next_pay) {
-                                    Some(&(at, pay)) if at as usize == number => {
-                                        next_pay += 1;
-                                        pay
-                                    }
-                                    _ => 0,
-                                };
-                                while own.get(next_own).is_some_and(|&(ts, _)| ts <= times[number]) {
-                                    all.push(own[next_own]);
-                                    next_own += 1;
-                                }
-                                all.push((times[number], pay));
-                            }
-                        }
-                        all.extend_from_slice(&own[next_own..]);
-                        sessions::positional::person_pairs(ctx, name, &all, clicks, &mut work.agg);
-                    }
-                } else {
-                    for number in stretch {
-                        if times[number] != 0 {
-                            let pay = match pays.get(next_pay) {
-                                Some(&(at, pay)) if at as usize == number => {
-                                    next_pay += 1;
-                                    pay
-                                }
-                                _ => 0,
-                            };
-                            work.slow_events.push(PersonEvent { person: links.person(users[number]), ts: times[number], pay });
-                        }
-                    }
-                }
-                if !crossing {
-                    own_next = next_pay;
-                }
-            }
-        } else if let Some(group) = grouped[task - run_tasks].get() {
-            let first = (task - run_tasks) << plan.click_shift;
-            for local in 0..group.ends.len() {
-                let at = group.range(local);
-                if !at.is_empty() && !fit(first + local) {
-                    for i in at {
-                        // SAFETY: an unfit person's clicks are read here only, and written nowhere.
-                        let click = unsafe { *group.clicks.0.add(i) };
-                        let u = ((first + local) as u32) << ALIAS_BITS | u32::from(group.aliases[i]);
-                        work.slow_clicks.push(ClickRec { user: links.person(u), click: click.id, ts: click.ts, campaign: click.campaign });
-                    }
-                }
-            }
-        }
-    });
-    lap("sessions");
 
     // The classic lane: its events and clicks by person hash into a few buckets, each through
     // the classic sessions code, into the same counters.
@@ -591,60 +460,542 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
     let aggs: Vec<Agg> = works.into_iter().map(|work| work.agg).collect();
     output::campaign_daily(&campaign_folder, ctx, sessions::campaign_daily(ctx, &aggs))?;
     lap("output");
-    if std::env::var_os("SS_TIMING").is_some() {
-        let runs = || placed.iter().flat_map(Placed::own);
-        let unfit = runs().filter(|run| !fit(run.person as usize)).count();
-        // Why, in events: flagged (split, out of order, wide alias, outside the numbering),
+    if timing && let Some((runs, unfit, why)) = stats {
+        // Why, in slots: flagged (split, out of order, wide alias, outside the numbering),
         // mixed links, an ID outside the one component, several unlinked IDs.
-        let mut why = [0u64; 4];
-        for run in runs().filter(|run| !fit(run.person as usize)) {
-            let person = run.person as usize;
-            let reason = if flags[person] & UNFIT != 0 {
-                0
-            } else {
-                match links.state[person] {
-                    MIXED => 1,
-                    ONE => 2,
-                    _ => 3,
-                }
-            };
-            why[reason] += u64::from(run.end - run.first);
-        }
         eprintln!("unfit slots by reason: flagged {}, mixed links {}, outside the component {}, unlinked IDs {}", why[0], why[1], why[2], why[3]);
         eprintln!(
-            "positional: {} runs, {unfit} in the classic lane with {} events and {} clicks; {odd_rows} rows outside the numbering",
-            runs().count(),
-            slow.0,
-            slow.1
+            "positional: {runs} runs, {unfit} in the classic lane with {} events and {} clicks; {odd_rows} rows outside the numbering",
+            slow.0, slow.1
         );
     }
     // The exit path skips destructors (`fast-exit`), and these are large.
-    std::mem::forget((times, users, placed, grouped, aggs));
+    std::mem::forget((grouped, aggs));
     Ok(())
 }
 
-/// Writes partition `part`'s rows into its stretch of the table: a slot keeps the copy with the
-/// smallest `ingest` (copies that tie are identical, rules "Events" step 2), its `ts` when
-/// that copy is valid and 0 when it is not, so an invalid kept copy leaves no event. Then
-/// lists the kept purchases and the runs. `None` for a partition without rows.
+/// What the fused stages' tasks share.
+struct Fused<'a> {
+    ctx: &'a Ctx,
+    plan: &'a PosPlan,
+    parsed: &'a [PosOut],
+    links: &'a Links,
+    /// By person.
+    extras: &'a [Extra],
+    grouped: &'a [OnceLock<Grouped>],
+    click_aliases: &'a [u64],
+    /// `UNFIT` for a person with a click alias over the masks (`group_clicks`).
+    flags: &'a [u8],
+    /// Per person: `SEEN` once a run of it is taken, `UNFIT` once that run is found to be the
+    /// classic lane's.
+    state: &'a [AtomicU8],
+    /// A second run of some person was met. Its first is in a worker's counters by then, so
+    /// everything these stages did is void.
+    conflict: &'a AtomicBool,
+}
+
+/// A partition's first or last run, set aside with its events: it may be a piece of a run that
+/// crosses partitions (`fused_stages` joins them).
+struct Edge {
+    run: Run,
+    /// Whether it is its partition's first run, and its last.
+    first: bool,
+    last: bool,
+    /// `(ts, pay, u)` of its events, in table order.
+    events: Vec<(u32, u32, u32)>,
+}
+
+impl<'a> Fused<'a> {
+    fn extras_of(&self, person: usize) -> &'a [Extra] {
+        let from = self.extras.partition_point(|extra| (extra.person as usize) < person);
+        let count = self.extras[from..].iter().take_while(|extra| extra.person as usize == person).count();
+        &self.extras[from..from + count]
+    }
+
+    /// Takes `person` for its run, whose rows use `aliases` and which is `unfit` if out of
+    /// time order or with an alias over the masks. `None` when a run of the person was taken
+    /// before (`conflict`). Otherwise whether it is one fast-lane person (as `fit` in
+    /// `split_stages`: nothing disqualifies it, and every ID its rows use is in its one link
+    /// component, or it has no links and uses a single ID), and whether it has extras.
+    fn take(&self, person: usize, aliases: u64, unfit: bool, slots: u64, stats: &mut [u64; 6]) -> Option<(bool, bool)> {
+        if self.state[person].fetch_or(SEEN, Relaxed) & SEEN != 0 {
+            self.conflict.store(true, Relaxed);
+            return None;
+        }
+        let own = self.extras_of(person);
+        let (mut ids, mut flagged) = (aliases | self.click_aliases[person], unfit | (self.flags[person] & UNFIT != 0));
+        for extra in own {
+            let alias = extra.u & ALIAS_MASK;
+            ids |= 1 << (alias & (MASK_ALIASES - 1));
+            flagged |= alias >= MASK_ALIASES;
+        }
+        let state = self.links.state[person];
+        let fit = !flagged
+            && match state {
+                ONE => ids & !self.links.mask[person] == 0,
+                NONE => ids.count_ones() <= 1,
+                _ => false,
+            };
+        stats[0] += 1;
+        if !fit {
+            self.state[person].fetch_or(UNFIT, Relaxed);
+            stats[1] += 1;
+            let reason = match state {
+                _ if flagged => 0,
+                MIXED => 1,
+                ONE => 2,
+                _ => 3,
+            };
+            stats[2 + reason] += slots;
+        }
+        Some((fit, !own.is_empty()))
+    }
+
+    /// Whether `person` is a fast-lane person, once every run is taken: for its clicks and its
+    /// extras.
+    fn fit(&self, person: usize) -> bool {
+        let state = self.state[person].load(Relaxed);
+        if state & SEEN != 0 {
+            return state & UNFIT == 0;
+        }
+        // No run. With extras, those are its events and the classic lane's; without, only
+        // its clicks' IDs are there to judge.
+        let ids = self.click_aliases[person];
+        self.flags[person] & UNFIT == 0
+            && self.extras_of(person).is_empty()
+            && match self.links.state[person] {
+                ONE => ids & !self.links.mask[person] == 0,
+                NONE => ids.count_ones() <= 1,
+                _ => false,
+            }
+    }
+
+    /// A fast-lane person's name: its component's, or the one ID it uses.
+    fn name(&self, person: usize, u: u32) -> Id {
+        match self.links.state[person] {
+            ONE => self.links.name[person],
+            _ => scramble::id_of(u64::from(u), self.plan.user_key, b'u'),
+        }
+    }
+
+    /// A person's clicks.
+    ///
+    /// # Safety
+    /// The caller took the person (`take`), so nothing else reads or writes its clicks.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn clicks(&self, person: usize) -> &'a mut [Click] {
+        let range = person >> self.plan.click_shift;
+        match self.grouped[range].get() {
+            // SAFETY: the positions are the person's, inside the range's clicks.
+            Some(group) => unsafe {
+                let at = group.range(person - (range << self.plan.click_shift));
+                std::slice::from_raw_parts_mut(group.clicks.0.add(at.start), at.len())
+            },
+            None => &mut [],
+        }
+    }
+
+    /// Places partition `part` in the worker's own slots and, while they are in cache, takes
+    /// every run but the first and the last through its sessions. Returns those two.
+    fn partition(&self, part: usize, work: &mut Work) -> Vec<Edge> {
+        let Work { agg, slow_events, placing, times, users, runs, stats, .. } = work;
+        let Some(pays) = place_rows(part, self.plan, self.parsed, self.links, placing) else { return Vec::new() };
+        let (slots, base) = (1usize << self.plan.shift, part << self.plan.shift);
+        // `scan` writes every slot.
+        times.resize(slots, 0);
+        users.resize(slots, 0);
+        runs.clear();
+        scan(&placing.kept, times, users, base, runs);
+        let (times, users) = (&times[..], &users[..]);
+        // The `pay` of the event in `slot`, 0 for none; the purchases come in slot order.
+        let pay_of = |slot: usize, next_pay: &mut usize| match pays.get(*next_pay) {
+            Some(&(number, pay)) if number as usize == base + slot => {
+                *next_pay += 1;
+                pay
+            }
+            _ => 0,
+        };
+        let (mut edges, mut next_pay) = (Vec::new(), 0);
+        for (at, run) in runs.iter().enumerate() {
+            let person = run.person as usize;
+            let (first, end) = (run.first as usize - base, run.end as usize - base);
+            // Purchases of events that left the table (none in practice).
+            while pays.get(next_pay).is_some_and(|&(number, _)| number < run.first) {
+                next_pay += 1;
+            }
+            if at == 0 || at + 1 == runs.len() {
+                let events = (first..end).filter(|&slot| times[slot] != 0).map(|slot| (times[slot], pay_of(slot, &mut next_pay), users[slot])).collect();
+                edges.push(Edge { run: *run, first: at == 0, last: at + 1 == runs.len(), events });
+                continue;
+            }
+            let Some((fit, extra)) = self.take(person, run.aliases, run.unfit, (end - first) as u64, stats) else { break };
+            if !fit {
+                for slot in first..end {
+                    if times[slot] != 0 {
+                        let pay = pay_of(slot, &mut next_pay);
+                        slow_events.push(PersonEvent { person: self.links.person(users[slot]), ts: times[slot], pay });
+                    }
+                }
+                continue;
+            }
+            let name = self.name(person, users[first]);
+            // SAFETY: taken just above.
+            let clicks = unsafe { self.clicks(person) };
+            if !extra {
+                sessions::positional::person(self.ctx, name, &times[first..end], run.first, &pays, &mut next_pay, clicks, agg);
+            } else {
+                let table = (first..end).filter(|&slot| times[slot] != 0).map(|slot| (times[slot], pay_of(slot, &mut next_pay)));
+                let all = with_extras(table, self.extras_of(person), end - first);
+                sessions::positional::person_pairs(self.ctx, name, &all, clicks, agg);
+            }
+        }
+        edges
+    }
+
+    /// One run from the pieces set aside at partitions' edges.
+    fn joined(&self, pieces: &[Edge], work: &mut Work) {
+        let Work { agg, slow_events, stats, .. } = work;
+        let mut run = pieces[0].run;
+        for next in &pieces[1..] {
+            run.unfit |= next.run.unfit | (next.run.first_ts < run.last_ts);
+            (run.last_ts, run.aliases) = (next.run.last_ts, run.aliases | next.run.aliases);
+        }
+        let person = run.person as usize;
+        let slots: u64 = pieces.iter().map(|piece| u64::from(piece.run.end - piece.run.first)).sum();
+        let Some((fit, extra)) = self.take(person, run.aliases, run.unfit, slots, stats) else { return };
+        let events = pieces.iter().flat_map(|piece| piece.events.iter().copied());
+        if !fit {
+            slow_events.extend(events.map(|(ts, pay, u)| PersonEvent { person: self.links.person(u), ts, pay }));
+            return;
+        }
+        let name = self.name(person, pieces[0].events[0].2);
+        // SAFETY: taken just above.
+        let clicks = unsafe { self.clicks(person) };
+        let table = events.map(|(ts, pay, _)| (ts, pay));
+        let all: Vec<(u32, u32)> = if extra { with_extras(table, self.extras_of(person), 0) } else { table.collect() };
+        sessions::positional::person_pairs(self.ctx, name, &all, clicks, agg);
+    }
+}
+
+/// A person's table events (in time order) with its extras merged in: a few rows, sorted
+/// alone. (Sorting them all together was 1.4% of a run's instructions at 20M: the whales have
+/// extras.)
+fn with_extras(table: impl Iterator<Item = (u32, u32)>, extras: &[Extra], room: usize) -> Vec<(u32, u32)> {
+    let mut own: Vec<(u32, u32)> = extras.iter().map(|extra| (extra.ts, extra.pay)).collect();
+    own.sort_unstable_by_key(|&(ts, _)| ts);
+    let mut next_own = 0;
+    let mut all = Vec::with_capacity(room + own.len());
+    for (ts, pay) in table {
+        while own.get(next_own).is_some_and(|&(extra_ts, _)| extra_ts <= ts) {
+            all.push(own[next_own]);
+            next_own += 1;
+        }
+        all.push((ts, pay));
+    }
+    all.extend_from_slice(&own[next_own..]);
+    all
+}
+
+/// Slot `pos-stages-fused`: each partition placed in the worker's own slots and its runs taken
+/// straight through their sessions, while the slots are in cache. There is no table of all
+/// event numbers (two columns of 4 bytes a number, zeroed by the kernel, written once and read
+/// once), no list of all runs and no serial pass over it.
 ///
-/// # Safety
-/// No other thread touches event numbers `part << shift .. (part + 1) << shift` of the arrays.
-unsafe fn place(
-    part: usize,
+/// What a task cannot see is a person's run in another partition. A run that only crosses
+/// into the next partition is its partition's last and the next one's first: those two runs
+/// of every partition are set aside (`Edge`) and joined afterwards. A person whose events are
+/// two stretches with other persons' between is found when its second run is taken; the
+/// first is in a worker's counters by then, so this returns `false` with nothing of the
+/// caller's changed but `works` and the laps, and the split stages run instead. On generated
+/// data a person is one stretch: no seed tried has taken that way out.
+fn fused_stages(shared: &Fused, works: &mut Vec<Work>, slow_events: &mut Vec<PersonEvent>, lap: &mut dyn FnMut(&str)) -> bool {
+    let plan = shared.plan;
+    let over = || shared.conflict.load(Relaxed);
+    let edges: Vec<OnceLock<Vec<Edge>>> = (0..plan.parts).map(|_| OnceLock::new()).collect();
+    par::run(works, plan.parts, |_, work, part| {
+        if !over() {
+            drop(edges[part].set(shared.partition(part, work)));
+        }
+    });
+    if over() {
+        return false;
+    }
+    lap("sessions");
+
+    // The edge runs in table order; one that is its partition's last joins the next
+    // partition's first when they are one person's.
+    let edges: Vec<Edge> = edges.into_iter().filter_map(OnceLock::into_inner).flatten().collect();
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0;
+    while at < edges.len() {
+        let mut end = at + 1;
+        while end < edges.len() && edges[end - 1].last && edges[end].first && edges[end].run.person == edges[at].run.person {
+            end += 1;
+        }
+        groups.push((at, end));
+        at = end;
+    }
+    par::run(works, groups.len(), |_, work, group| {
+        if !over() {
+            let (from, to) = groups[group];
+            shared.joined(&edges[from..to], work);
+        }
+    });
+    if over() {
+        return false;
+    }
+    // The clicks and the extras of the classic lane's persons, now that every run is taken.
+    par::run(works, plan.click_parts, |_, work, range| {
+        let Some(group) = shared.grouped[range].get() else { return };
+        let first = range << plan.click_shift;
+        for local in 0..group.ends.len() {
+            let at = group.range(local);
+            if !at.is_empty() && !shared.fit(first + local) {
+                for i in at {
+                    // SAFETY: an unfit person's clicks are read here only, and written nowhere.
+                    let click = unsafe { *group.clicks.0.add(i) };
+                    let u = ((first + local) as u32) << ALIAS_BITS | u32::from(group.aliases[i]);
+                    work.slow_clicks.push(ClickRec { user: shared.links.person(u), click: click.id, ts: click.ts, campaign: click.campaign });
+                }
+            }
+        }
+    });
+    for extra in shared.extras {
+        if !shared.fit(extra.person as usize) {
+            slow_events.push(PersonEvent { person: shared.links.person(extra.u), ts: extra.ts, pay: extra.pay });
+        }
+    }
+    for work in works.iter_mut() {
+        slow_events.append(&mut work.placing.slow_events);
+    }
+    lap("edges");
+    true
+}
+
+/// The stages after the clicks as three: every partition placed into one table of all event
+/// numbers, the runs of the whole table joined and judged on one thread, then the sessions,
+/// partition by partition. A person with two runs is simply the classic lane's here, so this
+/// is also what `fused_stages` falls back to. Returns the runs, those in the classic lane and
+/// their slots by reason.
+#[allow(clippy::too_many_arguments)]
+fn split_stages(
+    ctx: &Ctx,
     plan: &PosPlan,
-    parsed: &[PosOut],
+    parsed: &mut Vec<PosOut>,
     links: &Links,
-    times: Shared<u32>,
-    users: Shared<u32>,
-    work: &mut Placing,
-) -> Option<Placed> {
+    extras: &[Extra],
+    grouped: &[OnceLock<Grouped>],
+    click_aliases: &[u64],
+    flags: &mut [u8],
+    works: &mut Vec<Work>,
+    slow_events: &mut Vec<PersonEvent>,
+    free_early: bool,
+    timing: bool,
+    lap: &mut dyn FnMut(&str),
+) -> (usize, usize, [u64; 4]) {
+    let (events, persons) = (plan.events(), plan.persons as usize);
+    // Zeroed lazily by the kernel: a slot nobody writes reads 0, "no event" (a valid `ts` is
+    // at least `event_lo`, 7 days).
+    let (mut times, mut users) = (vec![0u32; events], vec![0u32; events]);
+    let (times_at, users_at) = (Shared(times.as_mut_ptr()), Shared(users.as_mut_ptr()));
+    let placed: Vec<OnceLock<Placed>> = (0..plan.parts).map(|_| OnceLock::new()).collect();
+    {
+        let parsed = &parsed[..];
+        par::run(works, plan.parts, |_, work, task| {
+            // SAFETY: partition `task` owns event numbers `task << shift ..`, and only this
+            // task writes them.
+            if let Some(result) = unsafe { place(task, plan, parsed, links, times_at, users_at, &mut work.placing) } {
+                drop(placed[task].set(result));
+            }
+        });
+    }
+    for work in works.iter_mut() {
+        slow_events.append(&mut work.placing.slow_events);
+    }
+    if free_early {
+        par::each(parsed, |_, out| out.release());
+    }
+    lap("place");
+
+    // The runs stay with their partitions (copying them all into one list was most of this
+    // serial part). A run that crosses partitions is joined into the one it starts in, and
+    // skipped where it continues; then what the runs say about each person.
+    let mut placed: Vec<Placed> = placed.into_iter().map(|part| part.into_inner().unwrap_or_default()).collect();
+    // The partition that holds the table's last run so far.
+    let mut open: Option<usize> = None;
+    for at in 0..placed.len() {
+        let Some(&next) = placed[at].runs.first() else { continue };
+        if let Some(from) = open
+            && let Some(last) = placed[from].runs.last_mut()
+            && last.person == next.person
+        {
+            last.unfit |= next.unfit | (next.first_ts < last.last_ts);
+            (last.end, last.last_ts, last.aliases) = (next.end, next.last_ts, last.aliases | next.aliases);
+            placed[at].skip = 1;
+            // A partition that is all one run leaves that run open where it began.
+            if placed[at].runs.len() == 1 {
+                continue;
+            }
+        }
+        open = Some(at);
+    }
+    let placed = placed;
+    let mut event_aliases = vec![0u64; persons];
+    for run in placed.iter().flat_map(Placed::own) {
+        let person = run.person as usize;
+        event_aliases[person] |= run.aliases;
+        // A second run of a person: its events are not one stretch.
+        flags[person] |= if flags[person] & SEEN != 0 || run.unfit { UNFIT | SEEN } else { SEEN };
+    }
+    for extra in extras {
+        let (person, alias) = (extra.person as usize, extra.u & ALIAS_MASK);
+        event_aliases[person] |= 1 << (alias & (MASK_ALIASES - 1));
+        // No run to join: the person's events are these alone, and the classic lane takes them.
+        flags[person] |= if flags[person] & SEEN == 0 || alias >= MASK_ALIASES { UNFIT | EXTRA } else { EXTRA };
+    }
+    let flags = &flags[..];
+    // A person is one fast-lane person when nothing above disqualifies it and every ID its
+    // rows use is in its one link component, or it has no links and uses a single ID.
+    let fit = |person: usize| {
+        let ids = event_aliases[person] | click_aliases[person];
+        flags[person] & UNFIT == 0
+            && match links.state[person] {
+                ONE => ids & !links.mask[person] == 0,
+                NONE => ids.count_ones() <= 1,
+                _ => false,
+            }
+    };
+    for extra in extras {
+        if !fit(extra.person as usize) {
+            slow_events.push(PersonEvent { person: links.person(extra.u), ts: extra.ts, pay: extra.pay });
+        }
+    }
+    lap("runs");
+
+    // A partition's runs per task, with its purchases; then the click ranges, for the clicks
+    // of the classic lane's persons.
+    let run_tasks = placed.len();
+    let (table, table_users) = (&times[..], &users[..]);
+    par::run(works, run_tasks + plan.click_parts, |_, work, task| {
+        let (times, users) = (table, table_users);
+        if task < run_tasks {
+            let part = &placed[task];
+            // The purchases of a run that reaches past this partition, from each it passes.
+            let mut passing: Vec<(u32, u32)> = Vec::new();
+            let mut own_next = 0;
+            for run in part.own() {
+                let person = run.person as usize;
+                let stretch = run.first as usize..run.end as usize;
+                // Only the partition's last run can reach past it.
+                let crossing = stretch.end > (task + 1) << plan.shift;
+                if crossing {
+                    let from = part.pays.partition_point(|&(number, _)| number < run.first);
+                    passing.extend_from_slice(&part.pays[from..]);
+                    for (_, more) in placed.iter().enumerate().skip(task + 1).take_while(|&(later, _)| later << plan.shift < stretch.end) {
+                        passing.extend(more.pays.iter().take_while(|&&(number, _)| number < run.end));
+                    }
+                }
+                let pays: &[(u32, u32)] = if crossing { &passing } else { &part.pays };
+                let mut next_pay = if crossing { 0 } else { own_next };
+                // Purchases of events that left the table (none in practice) or of a skipped run.
+                while pays.get(next_pay).is_some_and(|&(number, _)| number < run.first) {
+                    next_pay += 1;
+                }
+                let pay_of = |number: usize, next_pay: &mut usize| match pays.get(*next_pay) {
+                    Some(&(at, pay)) if at as usize == number => {
+                        *next_pay += 1;
+                        pay
+                    }
+                    _ => 0,
+                };
+                if fit(person) {
+                    let name = match links.state[person] {
+                        ONE => links.name[person],
+                        _ => scramble::id_of(u64::from(users[stretch.start]), plan.user_key, b'u'),
+                    };
+                    let range = person >> plan.click_shift;
+                    let clicks: &mut [Click] = match grouped[range].get() {
+                        // SAFETY: a fit person has one run, so only this task takes its clicks,
+                        // and the click tasks below read only the clicks of unfit persons.
+                        Some(group) => unsafe {
+                            let at = group.range(person - (range << plan.click_shift));
+                            std::slice::from_raw_parts_mut(group.clicks.0.add(at.start), at.len())
+                        },
+                        None => &mut [],
+                    };
+                    if flags[person] & EXTRA == 0 {
+                        sessions::positional::person(ctx, name, &times[stretch], run.first, pays, &mut next_pay, clicks, &mut work.agg);
+                    } else {
+                        let from = extras.partition_point(|extra| (extra.person as usize) < person);
+                        let count = extras[from..].iter().take_while(|extra| extra.person as usize == person).count();
+                        let room = stretch.len();
+                        let table = stretch.filter(|&number| times[number] != 0).map(|number| (times[number], pay_of(number, &mut next_pay)));
+                        let all = with_extras(table, &extras[from..from + count], room);
+                        sessions::positional::person_pairs(ctx, name, &all, clicks, &mut work.agg);
+                    }
+                } else {
+                    for number in stretch {
+                        if times[number] != 0 {
+                            let pay = pay_of(number, &mut next_pay);
+                            work.slow_events.push(PersonEvent { person: links.person(users[number]), ts: times[number], pay });
+                        }
+                    }
+                }
+                if !crossing {
+                    own_next = next_pay;
+                }
+            }
+        } else if let Some(group) = grouped[task - run_tasks].get() {
+            let first = (task - run_tasks) << plan.click_shift;
+            for local in 0..group.ends.len() {
+                let at = group.range(local);
+                if !at.is_empty() && !fit(first + local) {
+                    for i in at {
+                        // SAFETY: an unfit person's clicks are read here only, and written nowhere.
+                        let click = unsafe { *group.clicks.0.add(i) };
+                        let u = ((first + local) as u32) << ALIAS_BITS | u32::from(group.aliases[i]);
+                        work.slow_clicks.push(ClickRec { user: links.person(u), click: click.id, ts: click.ts, campaign: click.campaign });
+                    }
+                }
+            }
+        }
+    });
+    lap("sessions");
+
+    let mut stats = (0, 0, [0u64; 4]);
+    if timing {
+        // Why, in slots: flagged (split, out of order, wide alias, outside the numbering),
+        // mixed links, an ID outside the one component, several unlinked IDs.
+        for run in placed.iter().flat_map(Placed::own) {
+            let person = run.person as usize;
+            stats.0 += 1;
+            if !fit(person) {
+                stats.1 += 1;
+                let reason = match links.state[person] {
+                    _ if flags[person] & UNFIT != 0 => 0,
+                    MIXED => 1,
+                    ONE => 2,
+                    _ => 3,
+                };
+                stats.2[reason] += u64::from(run.end - run.first);
+            }
+        }
+    }
+    // The exit path skips destructors (`fast-exit`), and these are large.
+    std::mem::forget((times, users, placed));
+    stats
+}
+
+/// Places partition `part`'s rows in the worker's slots, `work.kept`: a slot keeps the copy
+/// with the smallest `ingest` (copies that tie are identical, rules "Events" step 2). Returns
+/// the kept purchases as `(event number, pay)`, ascending; `None` for a partition without
+/// rows. A kept copy whose user is not a number leaves the slots for the classic lane
+/// (`work.slow_events`).
+fn place_rows(part: usize, plan: &PosPlan, parsed: &[PosOut], links: &Links, work: &mut Placing) -> Option<Vec<(u32, u32)>> {
     if parsed.iter().all(|out| out.events.len_of(part) == 0) {
         return None;
     }
     let (slots, base) = (1usize << plan.shift, part << plan.shift);
-    // SAFETY: the caller's contract; the arrays hold `parts << shift` slots.
-    let (times, users) = unsafe { (std::slice::from_raw_parts_mut(times.0.add(base), slots), std::slice::from_raw_parts_mut(users.0.add(base), slots)) };
     let Placing { kept, odd, slow_events } = work;
     // One 16-byte slot per event number while placing: a row reads and writes one cache line
     // of a table that fits L2. Three arrays (ingest, time, user) were three lines a row, and
@@ -685,36 +1036,47 @@ unsafe fn place(
         }
     }
     let valid = |row: &PosEvent| row.flags() & POS_VALID != 0;
-    let mut result = Placed::default();
+    let mut pays: Vec<(u32, u32)> = Vec::new();
     for out in parsed {
         for piece in out.pays.pieces(part) {
             for pay in piece {
                 let slot = pay.slot as usize & (slots - 1);
                 // The kept copy has this `ingest`, so it is this row or its twin.
                 if kept[slot].ingest() == pay.ingest && valid(&kept[slot]) {
-                    result.pays.push(((base + slot) as u32, pay.pay));
+                    pays.push(((base + slot) as u32, pay.pay));
                 }
             }
         }
     }
     // By event number, then `pay`, as one word a pair: the pairs compared field by field
     // were 135 instructions a purchase.
-    result.pays.sort_unstable_by_key(|&(number, pay)| u64::from(number) << 32 | u64::from(pay));
-    result.pays.dedup_by_key(|&mut (number, _)| number);
+    pays.sort_unstable_by_key(|&(number, pay)| u64::from(number) << 32 | u64::from(pay));
+    pays.dedup_by_key(|&mut (number, _)| number);
     // A kept copy whose user is not a number leaves the table for the classic lane.
     if !odd.is_empty() {
         for &(slot, row_ingest, worker, index) in odd.iter() {
             let row = kept[slot as usize];
             if row.flags() & POS_ODD_USER != 0 && row.ingest() == row_ingest && valid(&row) {
                 let number = base as u32 + slot;
-                let pay = result.pays.binary_search_by_key(&number, |&(at, _)| at).map_or(0, |at| result.pays[at].1);
+                let pay = pays.binary_search_by_key(&number, |&(at, _)| at).map_or(0, |at| pays[at].1);
                 let person = links.general.person(parsed[worker as usize].odd_users[index as usize]);
                 slow_events.push(PersonEvent { person, ts: row.ts(), pay });
                 kept[slot as usize] = PosEvent::new(0, 0, row_ingest, slot as u16, 0);
             }
         }
-        result.pays.retain(|&(number, _)| valid(&kept[number as usize - base]));
+        pays.retain(|&(number, _)| valid(&kept[number as usize - base]));
     }
+    Some(pays)
+}
+
+/// A placed partition's two columns (the `ts` of a valid kept copy, 0 for anything else, so an
+/// invalid kept copy leaves no event; and the user) and its runs, in one pass over the slots.
+/// `times` and `users` are the partition's stretch of the table, or a worker's own.
+fn scan(kept: &[PosEvent], times: &mut [u32], users: &mut [u32], base: usize, runs: &mut Vec<Run>) {
+    let slots = kept.len();
+    assert!(times.len() == slots && users.len() == slots);
+    #[cfg_attr(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl"), allow(unused_variables))]
+    let valid = |row: &PosEvent| row.flags() & POS_VALID != 0;
     // The table's two columns (the `ts` of a valid kept copy, 0 for anything else, and the
     // user) and the runs, in one pass over the slots: a person's first event opens a run.
     let mut open = Open::none();
@@ -765,7 +1127,7 @@ unsafe fn place(
                 while rest != 0 {
                     let slot = at + rest.trailing_zeros() as usize;
                     rest &= rest - 1;
-                    open.event(slot, *times.get_unchecked(slot), *users.get_unchecked(slot), base, &mut result.runs);
+                    open.event(slot, *times.get_unchecked(slot), *users.get_unchecked(slot), base, runs);
                 }
             }
         }
@@ -775,11 +1137,25 @@ unsafe fn place(
         times[slot] = if valid(row) { row.ts() } else { 0 };
         users[slot] = row.u();
         if times[slot] != 0 {
-            open.event(slot, times[slot], users[slot], base, &mut result.runs);
+            open.event(slot, times[slot], users[slot], base, runs);
         }
     }
-    open.close(base, &mut result.runs);
-    Some(result)
+    open.close(base, runs);
+}
+
+/// Writes partition `part`'s rows into its stretch of the table (`place_rows`, then `scan`)
+/// and lists the kept purchases and the runs. `None` for a partition without rows.
+///
+/// # Safety
+/// No other thread touches event numbers `part << shift .. (part + 1) << shift` of the arrays.
+unsafe fn place(part: usize, plan: &PosPlan, parsed: &[PosOut], links: &Links, times: Shared<u32>, users: Shared<u32>, work: &mut Placing) -> Option<Placed> {
+    let pays = place_rows(part, plan, parsed, links, work)?;
+    let (slots, base) = (1usize << plan.shift, part << plan.shift);
+    // SAFETY: the caller's contract; the arrays hold `parts << shift` slots.
+    let (times, users) = unsafe { (std::slice::from_raw_parts_mut(times.0.add(base), slots), std::slice::from_raw_parts_mut(users.0.add(base), slots)) };
+    let mut runs = Vec::new();
+    scan(&work.kept, times, users, base, &mut runs);
+    Some(Placed { runs, skip: 0, pays })
 }
 
 #[cold]
