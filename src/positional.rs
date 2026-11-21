@@ -35,8 +35,6 @@ use types::{Ctx, Id};
 
 /// Aliases a person's masks tell apart; a higher alias sends the person down the classic lane.
 const MASK_ALIASES: u32 = 64;
-/// Runs per sessions task.
-const RUNS_PER_TASK: usize = 2048;
 /// Classic-lane buckets, as bits.
 const SLOW_BITS: u32 = 6;
 /// `flags` of a person.
@@ -206,9 +204,20 @@ struct Run {
 /// One event partition placed.
 #[derive(Default)]
 struct Placed {
+    /// The partition's runs in table order. The last may reach into later partitions once
+    /// the runs are joined (`run`); the first is then not this partition's (`skip`).
     runs: Vec<Run>,
+    /// 1 when the first run continues an earlier partition's last, which holds it whole.
+    skip: usize,
     /// `(event number, pay)` of the kept purchases, ascending.
     pays: Vec<(u32, u32)>,
+}
+
+impl Placed {
+    /// The runs that start in this partition.
+    fn own(&self) -> &[Run] {
+        &self.runs[self.skip..]
+    }
 }
 
 /// One click range grouped by person.
@@ -323,25 +332,31 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
     }
     lap("place");
 
-    // The runs of the whole table in order, a run that crosses partitions joined, and what
-    // they say about each person.
-    let mut runs: Vec<Run> = Vec::with_capacity(placed.iter().filter_map(OnceLock::get).map(|part| part.runs.len()).sum());
-    let mut pays: Vec<(u32, u32)> = Vec::with_capacity(placed.iter().filter_map(OnceLock::get).map(|part| part.pays.len()).sum());
-    for part in placed.iter().filter_map(OnceLock::get) {
-        pays.extend_from_slice(&part.pays);
-        let mut rest = &part.runs[..];
-        if let (Some(last), Some(next)) = (runs.last_mut(), rest.first())
+    // The runs stay with their partitions (copying them all into one list was most of this
+    // serial part). A run that crosses partitions is joined into the one it starts in, and
+    // skipped where it continues; then what the runs say about each person.
+    let mut placed: Vec<Placed> = placed.into_iter().map(|part| part.into_inner().unwrap_or_default()).collect();
+    // The partition that holds the table's last run so far.
+    let mut open: Option<usize> = None;
+    for at in 0..placed.len() {
+        let Some(&next) = placed[at].runs.first() else { continue };
+        if let Some(from) = open
+            && let Some(last) = placed[from].runs.last_mut()
             && last.person == next.person
         {
             last.unfit |= next.unfit | (next.first_ts < last.last_ts);
             (last.end, last.last_ts, last.aliases) = (next.end, next.last_ts, last.aliases | next.aliases);
-            rest = &rest[1..];
+            placed[at].skip = 1;
+            // A partition that is all one run leaves that run open where it began.
+            if placed[at].runs.len() == 1 {
+                continue;
+            }
         }
-        runs.extend_from_slice(rest);
+        open = Some(at);
     }
-    drop(placed);
+    let placed = placed;
     let mut event_aliases = vec![0u64; persons];
-    for run in &runs {
+    for run in placed.iter().flat_map(Placed::own) {
         let person = run.person as usize;
         event_aliases[person] |= run.aliases;
         // A second run of a person: its events are not one stretch.
@@ -372,20 +387,33 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
     }
     lap("runs");
 
-    // Stage 3. Runs in table order, a fixed count per task; then the click ranges, for the
-    // clicks of the classic lane's persons.
-    let run_tasks = runs.len().div_ceil(RUNS_PER_TASK);
+    // Stage 3. A partition's runs per task, with its purchases; then the click ranges, for
+    // the clicks of the classic lane's persons.
+    let run_tasks = placed.len();
     let mut works: Vec<Work> =
         par::init(ctx.workers, parallel_alloc, |_| Work { agg: Agg::new(ctx), slow_events: Vec::new(), slow_clicks: Vec::new() });
     let (table, table_users) = (&times[..], &users[..]);
     par::run(&mut works, run_tasks + plan.click_parts, |_, work, task| {
         let (times, users) = (table, table_users);
         if task < run_tasks {
-            let chunk = &runs[task * RUNS_PER_TASK..runs.len().min((task + 1) * RUNS_PER_TASK)];
-            let mut next_pay = pays.partition_point(|&(number, _)| number < chunk[0].first);
-            for run in chunk {
+            let part = &placed[task];
+            // The purchases of a run that reaches past this partition, from each it passes.
+            let mut passing: Vec<(u32, u32)> = Vec::new();
+            let mut own_next = 0;
+            for run in part.own() {
                 let person = run.person as usize;
                 let stretch = run.first as usize..run.end as usize;
+                // Only the partition's last run can reach past it.
+                let crossing = stretch.end > (task + 1) << plan.shift;
+                if crossing {
+                    let from = part.pays.partition_point(|&(number, _)| number < run.first);
+                    passing.extend_from_slice(&part.pays[from..]);
+                    for (_, more) in placed.iter().enumerate().skip(task + 1).take_while(|&(later, _)| later << plan.shift < stretch.end) {
+                        passing.extend(more.pays.iter().take_while(|&&(number, _)| number < run.end));
+                    }
+                }
+                let pays: &[(u32, u32)] = if crossing { &passing } else { &part.pays };
+                let mut next_pay = if crossing { 0 } else { own_next };
                 // Purchases of events that left the table (none in practice) or of a skipped run.
                 while pays.get(next_pay).is_some_and(|&(number, _)| number < run.first) {
                     next_pay += 1;
@@ -450,6 +478,9 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
                         }
                     }
                 }
+                if !crossing {
+                    own_next = next_pay;
+                }
             }
         } else if let Some(group) = grouped[task - run_tasks].get() {
             let first = (task - run_tasks) << plan.click_shift;
@@ -511,11 +542,12 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
     output::campaign_daily(&campaign_folder, ctx, sessions::campaign_daily(ctx, &aggs))?;
     lap("output");
     if std::env::var_os("SS_TIMING").is_some() {
-        let unfit = runs.iter().filter(|run| !fit(run.person as usize)).count();
+        let runs = || placed.iter().flat_map(Placed::own);
+        let unfit = runs().filter(|run| !fit(run.person as usize)).count();
         // Why, in events: flagged (split, out of order, wide alias, outside the numbering),
         // mixed links, an ID outside the one component, several unlinked IDs.
         let mut why = [0u64; 4];
-        for run in runs.iter().filter(|run| !fit(run.person as usize)) {
+        for run in runs().filter(|run| !fit(run.person as usize)) {
             let person = run.person as usize;
             let reason = if flags[person] & UNFIT != 0 {
                 0
@@ -531,13 +563,13 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
         eprintln!("unfit slots by reason: flagged {}, mixed links {}, outside the component {}, unlinked IDs {}", why[0], why[1], why[2], why[3]);
         eprintln!(
             "positional: {} runs, {unfit} in the classic lane with {} events and {} clicks; {odd_rows} rows outside the numbering",
-            runs.len(),
+            runs().count(),
             slow.0,
             slow.1
         );
     }
     // The exit path skips destructors (`fast-exit`), and these are large.
-    std::mem::forget((times, users, runs, pays, grouped, aggs));
+    std::mem::forget((times, users, placed, grouped, aggs));
     Ok(())
 }
 
