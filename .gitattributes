@@ -1,0 +1,10 @@
+# Shell scripts and Dockerfiles run inside Linux containers: always LF in the working tree, whatever
+# core.autocrlf says. A CRLF run.sh builds an image whose entry point fails with
+# "exec /app/run.sh: no such file or directory" (Windows checkouts with core.autocrlf=true).
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.Dockerfile text eol=lf
+# Datasets, fixtures and expected outputs are read byte for byte, and a \r is data (rules.md, CSV
+# dialect), so git must never convert them: with core.autocrlf=true the fixtures fail on \r.
+*.csv -text
+*.json -text

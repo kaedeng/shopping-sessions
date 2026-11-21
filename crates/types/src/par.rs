@@ -21,6 +21,40 @@ pub fn run<S: Send>(states: &mut [S], tasks: usize, task: impl Fn(usize, &mut S,
     });
 }
 
+/// Builds one state per worker, worker `w`'s by `make(w)`: when `parallel`, each on its own
+/// thread (worker 0's on the calling thread), else all on the calling thread, one after another.
+/// Building a state allocates its buffers, and glibc writes a header into every chunk, so the
+/// builder takes the page faults: with 2 MB pages the kernel zeroes almost every reserved page
+/// right there. Built in parallel, that zeroing is spread over the workers instead of stalling
+/// them all behind one thread (slot `alloc-parallel` in `alternatives.md`).
+/// Either way it is one trace stage, so `SS_TRACE` shows how long the build took.
+pub fn init<S: Send>(workers: usize, parallel: bool, make: impl Fn(usize) -> S + Sync) -> Vec<S> {
+    assert!(workers > 0, "at least one worker");
+    let stage = trace::claim_stage();
+    if !parallel {
+        let start = trace::now();
+        let states = (0..workers).map(&make).collect();
+        trace::span(stage, 0, trace::WHOLE, start);
+        return states;
+    }
+    let make = |worker| {
+        let start = trace::now();
+        let state = make(worker);
+        trace::span(stage, worker, trace::WHOLE, start);
+        state
+    };
+    thread::scope(|scope| {
+        let rest: Vec<_> = (1..workers)
+            .map(|worker| {
+                let make = &make;
+                scope.spawn(move || make(worker))
+            })
+            .collect();
+        let first = make(0);
+        std::iter::once(first).chain(rest.into_iter().map(|handle| handle.join().expect("worker panicked"))).collect()
+    })
+}
+
 /// Runs `job(worker, state)` once per worker, the first on the calling thread.
 pub fn each<S: Send>(states: &mut [S], job: impl Fn(usize, &mut S) + Sync) {
     let (first, rest) = states.split_first_mut().expect("at least one worker");
@@ -111,6 +145,17 @@ mod tests {
         let mut sums = vec![0usize; 4];
         super::run(&mut sums, 1000, |_, sum, index| *sum += index);
         assert_eq!(sums.iter().sum::<usize>(), 999 * 1000 / 2);
+    }
+
+    #[test]
+    fn init_builds_states_in_worker_order() {
+        for parallel in [false, true] {
+            for workers in [1, 2, 7] {
+                let states = super::init(workers, parallel, |worker| vec![worker; 1 << 12]);
+                assert_eq!(states.len(), workers);
+                assert!(states.iter().enumerate().all(|(worker, state)| state.iter().all(|&w| w == worker)));
+            }
+        }
     }
 
     #[cfg(feature = "trace")]

@@ -14,16 +14,24 @@
 # The VM has no hardware counters (no PMU under Apple's hypervisor): perf samples on a timer and
 # counts only software events. The run is privileged so perf sees kernel stacks and bench.py
 # can drop the page cache: --prepare 'echo 3 > /proc/sys/vm/drop_caches'.
+#
+# On an x86 machine (WSL2 or Linux), profile the scorer's AVX2 code natively (x86.md):
+#   PLATFORM=linux/amd64 VOLUME=ss-p20 scripts/profile_linux.sh flame
+# with the profile image built from the amd64 release image. WSL2 has no PMU either.
 set -eu
 IMAGE="${PROFILE_IMAGE:-shopping-sessions:profile}"
 VOLUME="${VOLUME:-ss-half}"
 CPUS="${CPUS:-8}"
+PLATFORM="${PLATFORM:-linux/arm64}"
 BIN=/app/shopping-sessions-profiling
 mkdir -p prof
+# Git Bash on Windows: hand docker.exe a Windows path and stop MSYS rewriting /prof, /data etc.
+export MSYS_NO_PATHCONV=1
+PROF=$(cd prof && { pwd -W 2>/dev/null || pwd; })
 
 run() {
-  docker run --rm $TTY --privileged --platform linux/arm64 --cpus "$CPUS" -e NCPU="${CPUS%.*}" \
-    -e DATA_DIR=/data -e OUTPUT_DIR=/tmp/out -v "$VOLUME":/data:ro -v "$PWD/prof":/prof -w /prof \
+  docker run --rm $TTY --privileged --platform "$PLATFORM" --cpus "$CPUS" -e NCPU="${CPUS%.*}" \
+    -e DATA_DIR=/data -e OUTPUT_DIR=/tmp/out -v "$VOLUME":/data:ro -v "$PROF":/prof -w /prof \
     "$IMAGE" "$@"
 }
 TTY=
@@ -40,13 +48,13 @@ svg="perf script --no-inline 2>/dev/null -i"
 case "$mode" in
   flame) run sh -c "$warm; perf record -F 999 -g -o linux-cpu.data $BIN >/dev/null \
     && $report -i linux-cpu.data | rustfilt > linux-cpu.txt \
-    && $svg linux-cpu.data | $collapse | inferno-flamegraph --title 'CPU, Linux arm64' > linux-cpu.svg \
+    && $svg linux-cpu.data | $collapse | inferno-flamegraph --title 'CPU, $PLATFORM' > linux-cpu.svg \
     && grep -E '^ +[0-9.]+%' linux-cpu.txt | head -25" ;;
   annotate) run sh -c "perf annotate -i linux-cpu.data --stdio --no-source 2>/dev/null | rustfilt > linux-annotate.txt \
     && grep -E 'Percent \\||^ +([1-9][0-9]*|0\\.[5-9])[0-9.]* :' linux-annotate.txt | head -80" ;;
   faults) run sh -c "$warm; perf record -e page-faults -c 1 -g -o linux-faults.data $BIN >/dev/null \
     && $report -i linux-faults.data | rustfilt > linux-faults.txt \
-    && $svg linux-faults.data | $collapse | inferno-flamegraph --title 'Page faults, Linux arm64' --countname faults > linux-faults.svg \
+    && $svg linux-faults.data | $collapse | inferno-flamegraph --title 'Page faults, $PLATFORM' --countname faults > linux-faults.svg \
     && grep -E '^ +[0-9.]+%' linux-faults.txt | head -25" ;;
   syscalls) run sh -c "$warm; strace -f -c -w -o linux-strace.txt $BIN && cat linux-strace.txt \
     && perf stat -r 3 -e task-clock,page-faults,minor-faults,major-faults,context-switches,cpu-migrations \

@@ -20,7 +20,7 @@ Each crate's `lib.rs` opens with its public contract. The binary calls only that
 
 ## Pipeline
 
-Four thread scopes (`types::par`), each joined before the next starts. The first two joins are the barriers of decision "Parallelism".
+Four thread scopes (`types::par`), each joined before the next starts. The first two joins are the barriers of decision "Parallelism". Before each of stages 2 to 4, `types::par::init` builds the workers' buffers for it, each worker's on its own thread (slot `alloc-parallel`). The dedup partitions and person buckets are lists carved out of one allocation per worker (`types::parts::Parts`), so their pages are faulted in by the workers' own writes, in parallel, not by the allocator.
 
 1. **Inputs** (serial): `ingest::load_ctx` reads `manifest.json`, `products.csv` and `campaigns.csv` into `Ctx`; `Ingest::open` maps the files and cuts the chunk tasks.
 2. **Parse**: task 0 parses the links files and builds the link table (`ingest.links()`, then `links::build`), and its worker then joins the others on the chunk tasks, largest first. Each worker fills its own `ParseOut`: 1,024 dedup partitions of `EventRec` and one list of valid `ClickRec`.
@@ -43,11 +43,13 @@ To add an alternative: a new file beside the pick that keeps the contract, a fea
 | Hash | `hash-mul` | | | `crates/types/src/hash.rs` |
 | Small tables | `table-linear` | | | `crates/types/src/table.rs` (products, campaigns) |
 | Parallelism | `par-counter` | | `NCPU` | `crates/types/src/par.rs` |
+| Buffer allocation | `alloc-parallel` | serial build (always built: the pre-slot threading, with the same carved lists) | `SS_ALLOC=parallel\|serial` | `crates/types/src/parts.rs` (`Parts`), `crates/types/src/par.rs` (`init`), `src/main.rs` |
 | Reader | `reader-mmap` | `reader-populate` (Linux only, off by default) | `SS_CHUNK_KB`, `SS_READER=mmap\|populate` | `crates/ingest/src/lib.rs` (`plan`, `Buf`, `parse_with`) |
 | Tokenizer | `tok-mask` | `tok-scalar` | `SS_TOK=mask\|scalar` | `crates/ingest/src/tok.rs` |
 | Timestamps | `ts-table` | | | `crates/ingest/src/ts.rs` |
 | Links | `links-serial` | | | `crates/links/src/links_serial.rs` |
 | Person lookup | `lookup-prefetch` | | | `crates/links/src/lookup_prefetch.rs` |
+| Scatter writes (parse partitions, person buckets) | `scatter-wc` (x86-64 default) | plain (default elsewhere) | `SS_SCATTER=combine\|plain`, `SS_SCATTER_BUCKETS`, `SS_WC_LINES` | `crates/types/src/parts.rs` (`Mode`, `push_as`) |
 | Event dedup | `dedup-partitioned` | | `SS_PART_BITS` | `crates/dedup/src/dedup_partitioned.rs` |
 | Sessionize | `sess-partitioned` | | `SS_BUCKET_BITS` | `crates/sessions/src/partitioned.rs` |
 | Purchase payload | `sess-purchase-side` | | | `crates/sessions/src/purchase_side.rs` |
@@ -74,6 +76,10 @@ Knobs, each read once:
 | `SS_BUCKET_BITS` | 10 | Person buckets = 2^n |
 | `SS_TOK` | `mask` | Tokenizer, among those compiled in |
 | `SS_READER` | `mmap` | `populate` pre-faults each chunk, when `reader-populate` is compiled in on Linux |
+| `SS_ALLOC` | `parallel` | `serial` builds every worker's buffers on the main thread, as before `alloc-parallel` |
+| `SS_SCATTER` | `combine` on x86-64, `plain` elsewhere | How the scatters write their lists: staged in cache-line buffers and streamed (`combine`), or one store per record (`plain`) |
+| `SS_SCATTER_BUCKETS` | `SS_SCATTER`'s value | The same, for the person buckets alone |
+| `SS_WC_LINES` | 4 | Cache lines a staging buffer holds at least, a power of two up to 16 |
 | `GLIBC_TUNABLES` | set by the image | glibc malloc settings, see "Decisions outside the crates" |
 
 ## Shared layouts (`crates/types`)
@@ -86,7 +92,9 @@ Knobs, each read once:
 - **`PersonEvent`** (16 bytes): `person`, `ts`, `pay`.
 - **Output columns** (`rows.rs`): `UserDaily` and `CampaignDaily` as plain `Vec`s. Counts are `i64` so they move into Arrow buffers without a copy; the person is an ID until the writer turns it into bytes; `top_category` is a category index, 0xFF for null.
 - **`Ctx`**: the window, the derived bounds, the worker and partition counts, the categories in byte order with `unknown` among them (so a larger index is a larger name), product -> category and campaign -> index maps, and the campaigns with `organic` appended last.
-- **`par`**: `run(states, tasks, f)` gives each worker its own state and hands out task indexes from one atomic counter, in order, so the caller orders tasks largest-first; `each(states, f)` runs once per worker. Threads are scoped and spawned per stage; the calling thread is worker 0.
+- **`par`**: `run(states, tasks, f)` gives each worker its own state and hands out task indexes from one atomic counter, in order, so the caller orders tasks largest-first; `each(states, f)` runs once per worker; `init(workers, parallel, make)` builds the states, each on its own thread when `parallel`. Threads are scoped and spawned per stage; the calling thread is worker 0. Every `init`, `each` and `run` is one stage of the `SS_TRACE` timeline, so the main binary's trace names seven: `parse init`, `parse`, `dedup init`, `dedup`, `sessions init`, `sessions`, `output`.
+- **`parts`**: `Parts<T>` is many append-only lists carved out of one allocation: list `i` owns slots `i * room ..` of a 64-byte-aligned block of `lists * room` records, with a `u32` length per list and a `Vec` per list for what outgrows its room (a cold call). Two write modes, chosen per `Parts` at construction and per loop by a type parameter (`push_as::<Plain>` or `push_as::<Combine>`, after `combining()`), so no row decides: `Plain` stores each record into its list; `Combine` (slot `scatter-wc`) stages it in the list's buffer of whole cache lines (`batch` records, `room` rounded up to a multiple of it) and, when the buffer fills, copies it to the list's room with `_mm256_stream_si256` (plain copies off x86). `pieces(i)` returns three slices: the records in the room, the ones still staged, the spill; that is how the dedup partitions and person buckets reach `dedup::partition` and `sessions::bucket`, which already take a list as pieces. A writer calls `fence()` (an `sfence`) at the end of each task, before the stage barrier lets other threads read. `spilled()` counts the lists that spilled; `SS_TIMING` prints the totals.
+- **Why `init` and `Parts` exist** (x86, `x86.md`): glibc writes a header into every chunk it hands out, so whoever allocates a buffer takes its page faults, and with transparent huge pages each first touch zeroes 2 MB. Built on the main thread as `Vec`s, the parse buffers (8 × 1,024 partitions) and the stage-2 buffers (8 × 2,048 buckets) were serial gaps of 62 and 40 ms at 20M events on the x86 box, with seven workers waiting; on the Mac they took 0.2 ms, since nothing touches 16 KB pages before they are written. Building those `Vec`s on 8 threads did not help: glibc grows its per-thread arenas with `mprotect` and `mmap`, which take the address-space lock for writing, while each fault holds it for reading through its zeroing, so they took turns. One allocation per worker and record type leaves the faults to the workers' writes, holding that lock only for reading. A state built on another thread is still freely movable: glibc's per-thread arenas only decide where the memory comes from.
 
 ## Decisions outside the crates
 
@@ -132,7 +140,7 @@ These came out of measurements while building. None changes a result; each is a 
 
 ## Measurements
 
-Wall time from `SS_TIMING=1`, 8 workers, warm page cache. The Mac is an M4 Pro (8 performance cores, 16 KB pages). Nothing has run on an amd64 machine.
+Wall time from `SS_TIMING=1`, 8 workers, warm page cache. The Mac is an M4 Pro (8 performance cores, 16 KB pages). The x86 rows are the Ryzen box in Docker Desktop on WSL2 with the scorer's flags (`x86.md`, `scripts/bench_docker.py`), on the scorer-sized set: seed 7, 20M events, 5M clicks, 1.9 GB.
 
 | Run | Total | Inputs | Parse | Dedup + scatter | Sessions | Output | Process wall |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -140,6 +148,11 @@ Wall time from `SS_TIMING=1`, 8 workers, warm page cache. The Mac is an M4 Pro (
 | Half size (seed 2, 30M events, 7.5M clicks, 2.7 GiB), Mac | 0.35 s | 8 ms | 184 ms | 64 ms | 75 ms | 19 ms | 0.39 s |
 | Half size, Linux arm64 container on the same Mac (4 KB pages, scorer flags, data on a Docker volume), before the glibc tunables | 0.35 to 0.37 s | 7 ms | 162 to 165 ms | 91 to 102 ms | 74 to 78 ms | 16 ms | 0.38 to 0.39 s |
 | The same through the image as built, with the glibc tunables | 0.32 s | 7 ms | 146 to 149 ms | 67 to 72 ms | 74 to 76 ms | 16 ms | 0.33 s |
+| x86, 20M, HEAD `5c1e1f2`, median of 6 runs each after 12 s idle (the scorer-like run) | 0.742 s | 17 ms | 452 ms | 170 ms | 86 ms | 17 ms | |
+| x86, 20M, with `alloc-parallel`, the same rounds | 0.597 s | 17 ms | 365 ms | 129 ms | 79 ms | 16 ms | |
+| x86, 20M, with `alloc-parallel`, median of 10 back to back | 0.561 s | 17 ms | 320 ms | 118 ms | 87 ms | 16 ms | |
+| x86, 20M, with `alloc-parallel` and `scatter-wc`, median of 6 after 12 s idle (two suites) | 0.479–0.492 s | 16 ms | 254–271 ms | 101–103 ms | 89–92 ms | 17 ms | |
+| x86, 20M, with `alloc-parallel` and `scatter-wc`, median of 10 back to back | 0.506 s | 16 ms | 259 ms | 110 ms | 100 ms | 19 ms | |
 
 - Full size on the Mac spends 4.3 s of user time and 1.2 to 1.3 s of system time, the latter mostly first-touch page faults.
 - The Linux container is a VM with 12.6 GB, too little for the full set next to its page cache (runs of 1.0 to 2.2 s under memory pressure), so only the half set is a fair number there.
@@ -170,7 +183,7 @@ Decisions `decisions.md` left open. Times are from an Apple M4 Pro, warm page ca
 - **Price:** up to 8 bytes are right-aligned in one word, filled with `'0'`, then SWAR-checked and parsed. Empty or longer than 8 bytes (only leading zeros can be valid there) takes a cold path.
 - **Event type:** one `u64` load, compared masked to `view` and `cart` (length 4) and whole to `purchase` (length 8).
 - **Clicks:** the campaign probe runs only after the other checks pass.
-- **Buffer sizing:** rows are estimated from the newline density of the first 256 KB of the largest segment. Each partition gets `rows / workers / parts * 5/4 + 16` and the click list `rows / workers * 5/4 + 16`. The OS maps lazily, so `new_out` for 8 workers takes 0.2 ms.
+- **Buffer sizing:** rows are estimated from the newline density of the first 256 KB of the largest segment. Each partition gets a room of `rows / workers / parts * 5/4 + 16` in the worker's `Parts` and the click list `rows / workers * 5/4 + 16`. The OS maps lazily and `Parts::new` touches only the region's first page, so `new_out` takes under 1 ms per worker (`SS_TRACE`, x86); the pages fault in as the parse writes them. No partition spills on the 20M set (`SS_TIMING`); full size is not checked.
 - **`SS_PART_BITS` range:** `open` rejects values outside 1 to 20. 0 would shift by 64 into an unchecked index.
 
 ### Measurements
@@ -241,8 +254,8 @@ on a shared, noisy machine: `cargo run --release -p links --example linksbench`,
   rows of each call are prefetched before the loop, since each call is one dedup partition.
 - **Tombstones are neither prefetched nor looked up.**
 - **One generic loop serves both `scatter_events` and `scatter_clicks`.** It asserts
-  `bucket_bits` in `1..=32` and `out.len() == 1 << bucket_bits` once per call (`bucket_bits = 0`
-  would shift by 64), then indexes the buckets unchecked.
+  `bucket_bits` in `1..=32` and `out.lists() == 1 << bucket_bits` once per call (`bucket_bits = 0`
+  would shift by 64), then appends to the buckets unchecked (`Parts::push_unchecked`).
 
 ### Ideas not taken, for later
 

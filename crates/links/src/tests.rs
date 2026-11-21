@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use types::hash::person_hash;
 use types::id::{SLOW, pack};
+use types::parts::Parts;
 use types::record::{ClickRec, EventRec, PersonEvent, VALID};
 
 use crate::{build, scatter_clicks, scatter_events};
@@ -204,7 +205,8 @@ fn scatter_puts_each_record_in_its_persons_bucket() {
     let bits = 4;
     let bucket = |person: u64| (person_hash(person) >> (64 - bits)) as usize;
 
-    for rows in [0, 1, 63, 64, 65, 3000] {
+    // Plain, and staged in buffers of one and two lines (slot `scatter-wc`).
+    for (rows, combine) in [0, 1, 63, 64, 65, 3000].into_iter().flat_map(|rows| [None, Some(1), Some(2)].map(|c| (rows, c))) {
         let events: Vec<(EventRec, &[u8])> = (0..rows)
             .map(|n| {
                 let user = &users[random.below(users.len())];
@@ -214,14 +216,20 @@ fn scatter_puts_each_record_in_its_persons_bucket() {
             })
             .collect();
         let kept: Vec<EventRec> = events.iter().map(|e| e.0).collect();
-        let mut out = vec![Vec::new(); 1 << bits];
-        scatter_events(&table, &kept, bits, &mut out);
+        // A room of 3 (rounded up to a whole buffer when staged) makes the busier buckets spill,
+        // so every piece of a list is checked.
+        fn lists<T: Copy>(parts: &Parts<T>) -> Vec<Vec<T>> {
+            (0..parts.lists()).map(|list| parts.pieces(list).concat()).collect()
+        }
+        let mut parts = Parts::new(1 << bits, 3, combine);
+        scatter_events(&table, &kept, bits, &mut parts);
+        let out = lists(&parts);
         let mut expected = vec![Vec::new(); 1 << bits];
         for (rec, user) in events.iter().filter(|e| e.0.flags & VALID != 0) {
             let person = person(user);
             expected[bucket(person)].push(PersonEvent { person, ts: rec.ts, pay: rec.pay });
         }
-        assert_eq!(out, expected, "{rows} events");
+        assert_eq!(out, expected, "{rows} events, {combine:?}");
 
         let clicks: Vec<(ClickRec, &[u8])> = (0..rows)
             .map(|n| {
@@ -230,13 +238,14 @@ fn scatter_puts_each_record_in_its_persons_bucket() {
             })
             .collect();
         let recs: Vec<ClickRec> = clicks.iter().map(|c| c.0).collect();
-        let mut out = vec![Vec::new(); 1 << bits];
-        scatter_clicks(&table, &recs, bits, &mut out);
+        let mut parts = Parts::new(1 << bits, 3, combine);
+        scatter_clicks(&table, &recs, bits, &mut parts);
+        let out = lists(&parts);
         let mut expected = vec![Vec::new(); 1 << bits];
         for (rec, user) in &clicks {
             let person = person(user);
             expected[bucket(person)].push(ClickRec { user: person, ..*rec });
         }
-        assert_eq!(out, expected, "{rows} clicks");
+        assert_eq!(out, expected, "{rows} clicks, {combine:?}");
     }
 }
