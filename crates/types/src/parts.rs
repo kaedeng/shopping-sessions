@@ -317,9 +317,14 @@ impl<T: Copy> Parts<T> {
     /// each with huge pages) made a worker's first chunk take two to three times as long as
     /// its later ones. The lists are empty; nothing reads these bytes before a record
     /// overwrites them.
-    pub fn touch(&mut self, stop: &impl Fn() -> bool) {
+    ///
+    /// `lists`: only the first so many lists (the others are not expected to get a record:
+    /// their pages are then backed when one does).
+    pub fn touch(&mut self, lists: usize, stop: &impl Fn() -> bool) {
         const PAGE: usize = 4096;
-        for block in [(self.stage.ptr.as_ptr().cast::<u8>(), self.stage.layout.size()), (self.region.ptr.as_ptr().cast::<u8>(), self.region.layout.size())] {
+        let lists = lists.min(self.lists());
+        let (stage, region) = (lists * self.batch * size_of::<T>(), lists * self.room * size_of::<T>());
+        for block in [(self.stage.ptr.as_ptr().cast::<u8>(), stage.min(self.stage.layout.size())), (self.region.ptr.as_ptr().cast::<u8>(), region.min(self.region.layout.size()))] {
             let (bytes, len) = block;
             let mut at = 0;
             while at < len {

@@ -96,10 +96,14 @@ pub(crate) fn event_lists(workers: usize, shape: &PosShape, scatter: Option<usiz
 /// A worker's lists for the click lines (`PosOut::clicks`), for about `event_rows` event
 /// lines and `click_rows` click lines.
 pub(crate) fn click_lists(workers: usize, shape: &PosShape, event_rows: usize, click_rows: usize, scatter: Option<usize>) -> Parts<PosClick> {
-    // The persons in use are about a 30th of the events, far fewer than the lists allow.
-    let lists_in_use = ((event_rows / 30) >> shape.click_shift).max(1);
-    let click_room = click_rows / workers / lists_in_use * 5 / 4 + 64;
+    let click_room = click_rows / workers / lists_in_use(shape, event_rows) * 5 / 4 + 64;
     Parts::new(shape.click_parts, click_room, scatter)
+}
+
+/// The click lists expected to get clicks: the persons in use are about a 30th of the events,
+/// far fewer than the lists allow, and they are numbered from 0.
+pub(crate) fn lists_in_use(shape: &PosShape, event_rows: usize) -> usize {
+    ((event_rows / 30) >> shape.click_shift).max(1)
 }
 
 impl PosOut {
@@ -120,17 +124,19 @@ impl PosOut {
         }
     }
 
-    /// Has the kernel back the buffers now, until `stop` says so (`Parts::touch`).
-    pub(crate) fn touch(&mut self, stop: &impl Fn() -> bool) {
+    /// Has the kernel back the buffers now, until `stop` says so (`Parts::touch`): the chunk
+    /// buffer, the event lists, and the first `click_lists` click lists, those of the persons
+    /// expected (`lists_in_use`).
+    pub(crate) fn touch(&mut self, click_lists: usize, stop: &impl Fn() -> bool) {
         for page in self.input.chunks_mut(4096) {
             if stop() {
                 return;
             }
             page[0] = 0;
         }
-        self.events.touch(stop);
-        self.pays.touch(stop);
-        self.clicks.touch(stop);
+        self.events.touch(usize::MAX, stop);
+        self.clicks.touch(click_lists, stop);
+        self.pays.touch(usize::MAX, stop);
     }
 }
 
@@ -1203,6 +1209,20 @@ pub(crate) mod wide {
             }
         }
 
+        /// The byte of an event line from which its newline is looked for first (`events`);
+        /// the 64 bytes from there are inside `EVENT_WINDOW`.
+        const GUESS_FROM: usize = 40;
+
+        /// The `\n` bits of the 64 bytes at `p`.
+        ///
+        /// # Safety
+        /// 64 bytes readable at `p`.
+        #[inline(always)]
+        unsafe fn newline_bits(p: *const u8) -> u64 {
+            // SAFETY: the caller's contract; AVX-512BW is compiled in (cfg above).
+            unsafe { _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(p.cast()), _mm512_set1_epi8(b'\n' as i8)) }
+        }
+
         /// One event chunk.
         ///
         /// # Safety
@@ -1219,8 +1239,21 @@ pub(crate) mod wide {
             unsafe {
                 while at < len {
                     *raw.words.get_unchecked_mut(R_AT).get_unchecked_mut(rows) = at as u64;
-                    let next = if at + EVENT_WINDOW <= len + crate::PAD { raw_row(&mut raw.words, rows, p.add(at)) } else { 0 };
-                    if next != 0 {
+                    let inside = at + EVENT_WINDOW <= len + crate::PAD;
+                    // Where the next line begins, guessed from this line's address alone: after
+                    // the first newline from byte `GUESS_FROM` on (an event line is 63 to 102
+                    // bytes). `raw_row` finds the same end through the line's two windows, the
+                    // second of which starts where the first one's third comma is: taken from
+                    // there, a line's address waited for the whole of the line before it, two
+                    // loads and a dozen steps (about 45 cycles a line, whatever else the core
+                    // could do meanwhile). The guess is used only when it is `raw_row`'s
+                    // answer, so nothing depends on it but the time.
+                    let guess = if inside { GUESS_FROM + newline_bits(p.add(at + GUESS_FROM)).trailing_zeros() as usize + 1 } else { 0 };
+                    let ahead = at + guess;
+                    let next = if inside { raw_row(&mut raw.words, rows, p.add(at)) } else { 0 };
+                    if (next == guess) & (next != 0) {
+                        at = ahead;
+                    } else if next != 0 {
                         at += next;
                     } else {
                         // Not a line `pairs` could pass: a quote that is no field's.
@@ -1699,7 +1732,10 @@ pub(crate) mod wide {
                 // pairs gives any length here, and any answer: `pairs` rejects the row.
                 let wrapped = (quotes >> (p2 + 1)) as usize & 1;
                 set(K_CAMPAIGN, campaigns.get(line.add(p2 + 1 + wrapped), (p3 - p2 - 1).wrapping_sub(2 * wrapped)));
-                end.trailing_zeros() as usize + 1
+                // `end` is the window's first newline (checked above). Taken from the newline
+                // bits, the next line's address waits for one compare and one count, not for
+                // the three steps through the separators before it.
+                newlines.trailing_zeros() as usize + 1
             }
         }
 

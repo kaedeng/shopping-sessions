@@ -374,7 +374,8 @@ pub fn open(data: &Path, workers: usize, positional: Option<bool>, keep_open: bo
             let clicks = pos::click_lists(workers, shape, *event_rows, click_rows, scatter);
             let out = _out.insert(pos::PosOut::new(events, pays, clicks, chunk));
             types::tl::mark("lists");
-            out.touch(&|| keys.0.get().is_some() && base.0.get().is_some() && table.0.get().is_some() && folders[2].0.get().is_some());
+            let click_lists = pos::lists_in_use(shape, *event_rows) * 5 / 4 + 1;
+            out.touch(click_lists, &|| keys.0.get().is_some() && base.0.get().is_some() && table.0.get().is_some() && folders[2].0.get().is_some());
             types::tl::mark("touched");
         }
     });
