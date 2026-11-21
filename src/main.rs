@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use ingest::{Ingest, ParseOut};
+use ingest::ParseOut;
 use sessions::Agg;
 use types::par;
 use types::parts::Parts;
@@ -60,8 +60,7 @@ fn run() -> Result<(), String> {
     };
 
     let (data, out) = (dir("DATA_DIR", "/data"), dir("OUTPUT_DIR", "/output"));
-    let ctx = ingest::load_ctx(&data)?;
-    let ingest = Ingest::open(&data, &ctx)?;
+    let (ctx, ingest) = ingest::open(&data)?;
     let parallel_alloc = ALLOC[types::env::pick("SS_ALLOC", ALLOC)] == "parallel";
     lap("inputs");
 
