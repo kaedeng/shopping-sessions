@@ -31,7 +31,7 @@ default = [
     "reader-mmap", "tok-mask", "ts-table",
     "links-serial", "lookup-prefetch",
     "dedup-partitioned",
-    "sess-partitioned", "sess-purchase-side", "sort-std", "attr-sweep", "agg-dense",
+    "sess-partitioned", "sess-purchase-side", "sort-grouped", "sort-std", "attr-sweep", "agg-dense",
     "out-arrow",
     "fast-exit", "alloc-parallel", "free-early", "scatter-wc",
 ]
@@ -58,6 +58,7 @@ dedup-partitioned = ["dedup/dedup-partitioned"]
 sess-partitioned = ["sessions/sess-partitioned"]
 sess-purchase-side = ["sessions/sess-purchase-side"]
 sort-std = ["sessions/sort-std"]
+sort-grouped = ["sessions/sort-grouped"]
 attr-sweep = ["sessions/attr-sweep"]
 agg-dense = ["sessions/agg-dense"]
 # output

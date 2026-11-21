@@ -228,7 +228,7 @@ pub fn bucket<'a>(
         }));
     }
     let persons = scratch.persons.len();
-    rows.sort(ts_bits + (usize::BITS - persons.leading_zeros()));
+    rows.sort(ts_bits + (usize::BITS - persons.leading_zeros()), ts_bits);
     scratch.gather_clicks(clicks);
 
     let ts_mask = (1u64 << ts_bits) - 1;
