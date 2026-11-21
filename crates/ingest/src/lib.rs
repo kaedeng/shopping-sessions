@@ -163,13 +163,11 @@ impl Ingest {
         if !(1..=20).contains(&ctx.part_bits) {
             return Err(format!("SS_PART_BITS={}: 1 to 20 supported", ctx.part_bits));
         }
-        let (mut bufs, mut segs) = (Vec::new(), [Vec::new(), Vec::new(), Vec::new()]);
-        for (folder, segs) in ["events", "clicks", "links"].into_iter().zip(&mut segs) {
-            for path in csv_files(&data.join(folder))? {
-                plan(&path, chunk, &mut bufs, segs)?;
-            }
+        let mut files = Vec::new();
+        for (kind, folder) in ["events", "clicks", "links"].into_iter().enumerate() {
+            files.extend(csv_files(&data.join(folder))?.into_iter().map(|path| (kind, path)));
         }
-        let [events, clicks, links] = segs;
+        let (bufs, [events, clicks, links]) = plan_all(&files, chunk, ctx.workers)?;
         let rows = |segs: &[Seg]| {
             let bytes: usize = segs.iter().map(|seg| seg.end - seg.start).sum();
             segs.iter().max_by_key(|seg| seg.end - seg.start).map_or(0, |seg| {
@@ -252,37 +250,90 @@ fn csv_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
-/// Cuts one file's lines after the header into segments of about `chunk` bytes, each ending
-/// after a `\n`. The last lines, from at least `PAD` bytes before the end, go to a padded copy,
-/// so no read leaves the mapping.
-fn plan(path: &Path, chunk: usize, bufs: &mut Vec<Buf>, segs: &mut Vec<Seg>) -> Result<(), String> {
+/// Plans every file (`(0 events | 1 clicks | 2 links, path)`) and returns the buffers and each
+/// kind's segments in file order: per file its tail copy, then its chunks.
+///
+/// Mapping is serial and cutting chunks is parallel. The cuts read a page at every chunk boundary
+/// (about 2,000 at 20M events): on one thread that was 610 ms with the input read from disk, one
+/// synchronous read at a time (x86, `scripts/bench_docker.py --cold`), against 7 ms cached.
+/// `mmap` takes the address-space lock for writing, which made planning whole files on 8
+/// threads slower when cached (17 ms), so only the cuts, which just fault pages in, are spread.
+fn plan_all(files: &[(usize, PathBuf)], chunk: usize, workers: usize) -> Result<(Vec<Buf>, [Vec<Seg>; 3]), String> {
+    let mut bufs = Vec::new();
+    // Per file: its kind, its tail segment, and the index in `ranges` of its lines to cut.
+    let mut planned: Vec<(usize, Option<Seg>, Option<usize>)> = Vec::new();
+    // Per mapped file: its buffer, and the bytes from after the header to the tail copy.
+    let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+    for (kind, path) in files {
+        let (tail, lines) = map_file(path, &mut bufs)?;
+        let lines = lines.map(|range| {
+            ranges.push(range);
+            ranges.len() - 1
+        });
+        planned.push((*kind, tail, lines));
+    }
+    let mut order: Vec<usize> = (0..ranges.len()).collect();
+    order.sort_by_key(|&range| Reverse(ranges[range].2 - ranges[range].1));
+    let mut cut: Vec<Vec<(usize, Vec<Seg>)>> = (0..workers.clamp(1, ranges.len().max(1))).map(|_| Vec::new()).collect();
+    types::par::run(&mut cut, order.len(), |_, mine, task| {
+        let (buf, data, tail) = ranges[order[task]];
+        let Buf::Map(map) = &bufs[buf] else { unreachable!("`map_file` maps every file with lines to cut") };
+        mine.push((order[task], cut_chunks(map, buf, data, tail, chunk)));
+    });
+    let mut chunks: Vec<Vec<Seg>> = (0..ranges.len()).map(|_| Vec::new()).collect();
+    for (range, segs) in cut.into_iter().flatten() {
+        chunks[range] = segs;
+    }
+    let mut segs = [Vec::new(), Vec::new(), Vec::new()];
+    for (kind, tail, lines) in planned {
+        segs[kind].extend(tail);
+        if let Some(range) = lines {
+            segs[kind].append(&mut chunks[range]);
+        }
+    }
+    Ok((bufs, segs))
+}
+
+/// Maps one file and copies its last lines, from at least `PAD` bytes before the end, to a padded
+/// buffer, so no read leaves the mapping. Returns the copy's segment and, if lines are left
+/// before it, `(buffer, first byte after the header, first byte of the copy)` to cut.
+fn map_file(path: &Path, bufs: &mut Vec<Buf>) -> Result<(Option<Seg>, Option<(usize, usize, usize)>), String> {
     let error = |error: std::io::Error| format!("{}: {error}", path.display());
     let file = File::open(path).map_err(error)?;
     if file.metadata().map_err(error)?.len() == 0 {
-        return Ok(());
+        return Ok((None, None));
     }
     // SAFETY: the inputs are read-only and nothing writes them during the run.
     let map = unsafe { memmap2::Mmap::map(&file) }.map_err(error)?;
-    let Some(header) = memchr(b'\n', &map) else { return Ok(()) };
+    let Some(header) = memchr(b'\n', &map) else { return Ok((None, None)) };
     let (data, len) = (header + 1, map.len());
     let tail = if len - data <= PAD { data } else { memrchr(b'\n', &map[data..len - PAD]).map_or(data, |at| data + at + 1) };
+    let mut copy = None;
     if tail < len {
         let own = padded(&map[tail..]);
-        segs.push(Seg { buf: bufs.len(), start: 1, end: own.len() - PAD });
+        copy = Some(Seg { buf: bufs.len(), start: 1, end: own.len() - PAD });
         bufs.push(Buf::Own(own));
     }
     if data < tail {
-        let mut start = data;
-        while start < tail {
-            // `map[tail - 1]` is a `\n`, so the search always finds one.
-            let from = (start + chunk - 1).min(tail - 1);
-            let end = from + memchr(b'\n', &map[from..tail]).unwrap() + 1;
-            segs.push(Seg { buf: bufs.len(), start, end });
-            start = end;
-        }
         bufs.push(Buf::Map(map));
+        return Ok((copy, Some((bufs.len() - 1, data, tail))));
     }
-    Ok(())
+    Ok((copy, None))
+}
+
+/// Cuts `map[data..tail]`, whole lines, into segments of about `chunk` bytes, each ending after
+/// a `\n`.
+fn cut_chunks(map: &[u8], buf: usize, data: usize, tail: usize, chunk: usize) -> Vec<Seg> {
+    let mut segs = Vec::new();
+    let mut start = data;
+    while start < tail {
+        // `map[tail - 1]` is a `\n`, so the search always finds one.
+        let from = (start + chunk - 1).min(tail - 1);
+        let end = from + memchr(b'\n', &map[from..tail]).unwrap() + 1;
+        segs.push(Seg { buf, start, end });
+        start = end;
+    }
+    segs
 }
 
 fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, task: usize, out: &mut ParseOut) {

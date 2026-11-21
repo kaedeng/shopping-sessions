@@ -61,6 +61,7 @@ fn run() -> Result<(), String> {
 
     let (data, out) = (dir("DATA_DIR", "/data"), dir("OUTPUT_DIR", "/output"));
     let ctx = ingest::load_ctx(&data)?;
+    lap("ctx");
     let ingest = Ingest::open(&data, &ctx)?;
     let parallel_alloc = ALLOC[types::env::pick("SS_ALLOC", ALLOC)] == "parallel";
     // Slot `scatter-wc`: how the person buckets are written (the parse partitions: `Ingest`).
@@ -148,7 +149,7 @@ fn run() -> Result<(), String> {
     #[cfg(feature = "trace")]
     if let Some(path) = std::env::var_os("SS_TRACE") {
         // One name per `par` scope, in order: each `par::init` is a stage of its own.
-        let stages = ["parse init", "parse", "dedup init", "dedup", "sessions init", "sessions", "output"];
+        let stages = ["plan", "parse init", "parse", "dedup init", "dedup", "sessions init", "sessions", "output"];
         par::trace::write(path.as_ref(), &stages).map_err(|error| format!("SS_TRACE: {error}"))?;
     }
     // Slot `fast-exit`: the files are written, so skip the destructors and let the kernel reclaim.
