@@ -31,6 +31,7 @@ use types::hash::person_hash;
 use types::par;
 use types::pos::{POS_ODD_USER, POS_VALID, PosEvent};
 use types::record::{ClickRec, PersonEvent, VALID};
+use types::rows::UserDaily;
 use types::scramble::{self, ALIAS_BITS, ALIAS_MASK};
 use types::{Ctx, Id};
 
@@ -271,22 +272,69 @@ impl Placed {
     }
 }
 
-/// One click range grouped by person.
+/// Every click grouped by person, range after range, in one array.
+///
+/// One allocation for all ranges, made before their tasks run. A task that allocated its own
+/// arrays grew its thread's heap (`mprotect`, which takes the address-space lock for writing)
+/// while the other tasks took page faults (the same lock, for reading): at 20M a click cost 50
+/// ns with 8 workers against 12 ns on one, and the stage was 28 ms for 66 ms of work.
 struct Grouped {
-    /// One past each person's last click in `clicks`, by person number less the range's first.
-    ends: Vec<u32>,
+    /// Each range's first position in `clicks`, and one more: the total.
+    bases: Vec<u32>,
+    /// One past each person's last click in `clicks`, for the persons of a range with clicks:
+    /// an entry per person number, written by the range's task.
+    ends: Shared<u32>,
     clicks: Shared<Click>,
     /// Each click's alias, beside `clicks`.
-    aliases: Vec<u16>,
-    /// Owns `clicks`.
-    _owner: Vec<Click>,
+    aliases: Shared<u16>,
+    click_shift: u32,
+    /// Own the three arrays, which are read and written through the pointers only (the
+    /// lengths of the first two stay 0).
+    _owners: (Vec<Click>, Vec<u16>, Vec<u32>),
 }
 
 impl Grouped {
-    /// The positions of a person's clicks (`local`: person number less the range's first).
-    fn range(&self, local: usize) -> std::ops::Range<usize> {
-        let start = if local == 0 { 0 } else { self.ends[local - 1] as usize };
-        start..self.ends[local] as usize
+    /// Room for the clicks of `parsed`, nothing grouped yet.
+    fn new(plan: &PosPlan, parsed: &[PosOut]) -> Grouped {
+        let mut bases = Vec::with_capacity(plan.click_parts + 1);
+        let mut total = 0usize;
+        for range in 0..plan.click_parts {
+            bases.push(total as u32);
+            total += parsed.iter().map(|out| out.clicks.len_of(range)).sum::<usize>();
+        }
+        assert!(total <= u32::MAX as usize, "{total} clicks: positions are 32 bits");
+        bases.push(total as u32);
+        let (mut clicks, mut aliases): (Vec<Click>, Vec<u16>) = (Vec::with_capacity(total), Vec::with_capacity(total));
+        // Zeroed lazily by the kernel; a range's task counts in its own stretch.
+        let mut ends = vec![0u32; plan.persons as usize];
+        Grouped {
+            bases,
+            ends: Shared(ends.as_mut_ptr()),
+            clicks: Shared(clicks.as_mut_ptr()),
+            aliases: Shared(aliases.as_mut_ptr()),
+            click_shift: plan.click_shift,
+            _owners: (clicks, aliases, ends),
+        }
+    }
+
+    /// The clicks in range `range`.
+    fn total(&self, range: usize) -> usize {
+        (self.bases[range + 1] - self.bases[range]) as usize
+    }
+
+    /// The positions of a person's clicks, once its range is grouped. `person` is below
+    /// `PosPlan::persons`.
+    fn range(&self, person: usize) -> std::ops::Range<usize> {
+        let range = person >> self.click_shift;
+        if self.total(range) == 0 {
+            return 0..0;
+        }
+        assert!(person < self._owners.2.len());
+        // SAFETY: an entry per person number, checked above; the range's task wrote them all.
+        unsafe {
+            let start = if person == range << self.click_shift { self.bases[range] } else { *self.ends.0.add(person - 1) };
+            start as usize..*self.ends.0.add(person) as usize
+        }
     }
 }
 
@@ -303,12 +351,26 @@ struct Placing {
     pay_at: Vec<u32>,
 }
 
+/// A worker's share of a click range that all workers group together (`group_clicks_wide`),
+/// per person of the range.
+#[derive(Default)]
+struct Share {
+    /// How many clicks of the person the worker's list holds; then where its next one goes.
+    counts: Vec<u32>,
+    /// The aliases of those clicks, and whether one is over the masks.
+    masks: Vec<u64>,
+    over: Vec<u8>,
+}
+
 /// A worker's state for the stages after the parse.
 struct Work {
     agg: Agg,
     slow_events: Vec<PersonEvent>,
     slow_clicks: Vec<ClickRec>,
     placing: Placing,
+    share: Share,
+    /// The worker's classic-lane events and clicks, by bucket.
+    lane: (Vec<Vec<PersonEvent>>, Vec<Vec<ClickRec>>),
     /// The fused stages' partition, once placed: its two columns (`scan`) and its runs.
     times: Vec<u32>,
     users: Vec<u32>,
@@ -319,12 +381,19 @@ struct Work {
 }
 
 impl Work {
-    fn new(ctx: &Ctx) -> Work {
+    /// `rows`: the `user_daily` rows to make room for. The six columns grow together, and
+    /// doubling them a row at a time meant some 800 reallocations a run on the workers'
+    /// threads, each a copy into fresh pages; reserved, a page is touched when a row lands.
+    fn new(ctx: &Ctx, rows: usize) -> Work {
+        let mut agg = Agg::new(ctx);
+        agg.user_daily.reserve(rows);
         Work {
-            agg: Agg::new(ctx),
+            agg,
             slow_events: Vec::new(),
             slow_clicks: Vec::new(),
             placing: Placing::default(),
+            share: Share::default(),
+            lane: Default::default(),
             times: Vec::new(),
             users: Vec::new(),
             runs: Vec::new(),
@@ -382,14 +451,28 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
         flags[extra.person as usize] |= EXTRA;
     }
     let (click_aliases_at, flags_at) = (Shared(click_aliases.as_mut_ptr()), Shared(flags.as_mut_ptr()));
-    let grouped: Vec<OnceLock<Grouped>> = (0..plan.click_parts).map(|_| OnceLock::new()).collect();
-    let mut works: Vec<Work> = par::init(ctx.workers, parallel_alloc, |_| Work::new(ctx));
+    let grouped = Grouped::new(plan, &parsed);
+    let ends_at = grouped.ends;
+    // A person-day with a session is a row: at 20M one for 9 events. Room for one per 5.
+    let rows = plan.events() / ctx.workers / 5 + 1024;
+    let mut works: Vec<Work> = par::init(ctx.workers, parallel_alloc, |_| Work::new(ctx, rows));
+    // Persons are numbered largest first, so the first range holds a large share of all the
+    // clicks (the whales are in it): as one task it kept one worker busy long after the others
+    // had finished (the stage was 28 ms on 8 threads for 66 ms of work at 20M, and 100 to 140
+    // ms at 60M). A range with more than a 16th of the clicks is grouped by all workers
+    // together, after the others.
+    let wide = (grouped.bases[plan.click_parts] as usize / 16).max(types::env::number("SS_POS_CLICK_WIDE", 1 << 16));
     par::run(&mut works, plan.click_parts, |_, _, range| {
-        // SAFETY: range `range` owns its persons' entries of both arrays in this stage.
-        if let Some(result) = unsafe { group_clicks(range, plan, &parsed, click_aliases_at, flags_at) } {
-            drop(grouped[range].set(result));
+        if grouped.total(range) > 0 && grouped.total(range) <= wide {
+            // SAFETY: range `range` owns its persons' entries of the three arrays in this
+            // stage, and its stretch of the clicks.
+            unsafe { group_clicks(range, plan, &parsed, click_aliases_at, flags_at, ends_at, &grouped) };
         }
     });
+    for range in (0..plan.click_parts).filter(|&range| grouped.total(range) > wide) {
+        // SAFETY: as above, and nothing else runs.
+        unsafe { group_clicks_wide(range, plan, &parsed, click_aliases_at, flags_at, ends_at, &grouped, &mut works) };
+    }
     // The clicks whose user is not a number: classic lane, by the general table.
     let mut slow_clicks: Vec<ClickRec> = Vec::new();
     for out in &parsed {
@@ -416,7 +499,7 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
             if timing {
                 eprintln!("positional: a person's events are not one stretch, the split stages take over");
             }
-            works = par::init(ctx.workers, parallel_alloc, |_| Work::new(ctx));
+            works = par::init(ctx.workers, parallel_alloc, |_| Work::new(ctx, rows));
         }
         std::mem::forget(state);
     }
@@ -426,26 +509,32 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
 
     // The classic lane: its events and clicks by person hash into a few buckets, each through
     // the classic sessions code, into the same counters.
-    for work in &mut works {
-        slow_events.append(&mut work.slow_events);
-        slow_clicks.append(&mut work.slow_clicks);
-    }
-    let slow = (slow_events.len(), slow_clicks.len());
-    if !slow_events.is_empty() {
+    // Each worker puts its own into buckets (one thread doing it for all was 2 ms of a 250 ms
+    // run at 20M); what this thread gathered goes with worker 0's.
+    works[0].slow_events.append(&mut slow_events);
+    works[0].slow_clicks.append(&mut slow_clicks);
+    let slow = (works.iter().map(|work| work.slow_events.len()).sum::<usize>(), works.iter().map(|work| work.slow_clicks.len()).sum::<usize>());
+    if slow.0 > 0 {
         let bucket_of = |person: Id| (person_hash(person) >> (64 - SLOW_BITS)) as usize;
-        let mut event_buckets: Vec<Vec<PersonEvent>> = vec![Vec::new(); 1 << SLOW_BITS];
-        let mut click_buckets: Vec<Vec<ClickRec>> = vec![Vec::new(); 1 << SLOW_BITS];
-        for event in slow_events {
-            event_buckets[bucket_of(event.person)].push(event);
-        }
-        for click in slow_clicks {
-            click_buckets[bucket_of(click.user)].push(click);
-        }
+        par::each(&mut works, |_, work| {
+            let (mut events, mut clicks) = (vec![Vec::new(); 1 << SLOW_BITS], vec![Vec::new(); 1 << SLOW_BITS]);
+            for event in std::mem::take(&mut work.slow_events) {
+                events[bucket_of(event.person)].push(event);
+            }
+            for click in std::mem::take(&mut work.slow_clicks) {
+                clicks[bucket_of(click.user)].push(click);
+            }
+            work.lane = (events, clicks);
+        });
+        let lanes: Vec<(Vec<Vec<PersonEvent>>, Vec<Vec<ClickRec>>)> = works.iter_mut().map(|work| std::mem::take(&mut work.lane)).collect();
         par::run(&mut works, 1 << SLOW_BITS, |_, work, bucket| {
-            if !event_buckets[bucket].is_empty() {
-                sessions::bucket_stretch(ctx, std::iter::once(&event_buckets[bucket][..]), std::iter::once(&click_buckets[bucket][..]), &mut work.agg);
+            let events = lanes.iter().map(|lane| &lane.0[bucket][..]);
+            if events.clone().any(|piece| !piece.is_empty()) {
+                sessions::bucket_stretch(ctx, events, lanes.iter().map(|lane| &lane.1[bucket][..]), &mut work.agg);
             }
         });
+        // The exit path skips destructors (`fast-exit`).
+        std::mem::forget(lanes);
     }
     lap("classic");
 
@@ -453,18 +542,24 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
     for folder in [&user_folder, &campaign_folder] {
         std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
     }
+    // `campaign_daily` is summed and written by a thread of its own while the workers write
+    // their `user_daily` files (after them, on this thread, it was 2 ms at the end of the run).
+    let mut tables: Vec<UserDaily> = works.iter_mut().map(|work| std::mem::take(&mut work.agg.user_daily)).collect();
+    let aggs: Vec<Agg> = works.into_iter().map(|work| work.agg).collect();
     let failure = OnceLock::new();
-    par::each(&mut works, |worker, work| {
-        let rows = std::mem::take(&mut work.agg.user_daily);
-        if let Err(error) = output::user_daily(&user_folder, worker, ctx, rows) {
-            drop(failure.set(error));
-        }
+    let campaigns = std::thread::scope(|scope| {
+        let campaigns = scope.spawn(|| output::campaign_daily(&campaign_folder, ctx, sessions::campaign_daily(ctx, &aggs)));
+        par::each(&mut tables, |worker, table| {
+            if let Err(error) = output::user_daily(&user_folder, worker, ctx, std::mem::take(table)) {
+                drop(failure.set(error));
+            }
+        });
+        campaigns.join().expect("the campaign_daily thread panicked")
     });
     if let Some(error) = failure.into_inner() {
         return Err(error);
     }
-    let aggs: Vec<Agg> = works.into_iter().map(|work| work.agg).collect();
-    output::campaign_daily(&campaign_folder, ctx, sessions::campaign_daily(ctx, &aggs))?;
+    campaigns?;
     lap("output");
     if timing && let Some((runs, unfit, why)) = stats {
         // Why, in slots: flagged (split, out of order, wide alias, outside the numbering),
@@ -488,7 +583,7 @@ struct Fused<'a> {
     links: &'a Links,
     /// By person.
     extras: &'a [Extra],
-    grouped: &'a [OnceLock<Grouped>],
+    grouped: &'a Grouped,
     click_aliases: &'a [u64],
     /// `UNFIT` for a person with a click alias over the masks (`group_clicks`), `EXTRA` for
     /// one with extras.
@@ -595,15 +690,9 @@ impl<'a> Fused<'a> {
     /// The caller took the person (`take`), so nothing else reads or writes its clicks.
     #[allow(clippy::mut_from_ref)]
     unsafe fn clicks(&self, person: usize) -> &'a mut [Click] {
-        let range = person >> self.plan.click_shift;
-        match self.grouped[range].get() {
-            // SAFETY: the positions are the person's, inside the range's clicks.
-            Some(group) => unsafe {
-                let at = group.range(person - (range << self.plan.click_shift));
-                std::slice::from_raw_parts_mut(group.clicks.0.add(at.start), at.len())
-            },
-            None => &mut [],
-        }
+        let at = self.grouped.range(person);
+        // SAFETY: the positions are the person's, inside the clicks.
+        unsafe { std::slice::from_raw_parts_mut(self.grouped.clicks.0.add(at.start), at.len()) }
     }
 
     /// Places partition `part` in the worker's own slots and, while they are in cache, takes
@@ -757,15 +846,18 @@ fn fused_stages(shared: &Fused, works: &mut Vec<Work>, slow_events: &mut Vec<Per
     }
     // The clicks and the extras of the classic lane's persons, now that every run is taken.
     par::run(works, plan.click_parts, |_, work, range| {
-        let Some(group) = shared.grouped[range].get() else { return };
+        let group = shared.grouped;
+        if group.total(range) == 0 {
+            return;
+        }
         let first = range << plan.click_shift;
-        for local in 0..group.ends.len() {
-            let at = group.range(local);
-            if !at.is_empty() && !shared.fit(first + local) {
+        for person in first..(first + (1 << plan.click_shift)).min(plan.persons as usize) {
+            let at = group.range(person);
+            if !at.is_empty() && !shared.fit(person) {
                 for i in at {
                     // SAFETY: an unfit person's clicks are read here only, and written nowhere.
-                    let click = unsafe { *group.clicks.0.add(i) };
-                    let u = ((first + local) as u32) << ALIAS_BITS | u32::from(group.aliases[i]);
+                    let (click, alias) = unsafe { (*group.clicks.0.add(i), *group.aliases.0.add(i)) };
+                    let u = (person as u32) << ALIAS_BITS | u32::from(alias);
                     work.slow_clicks.push(ClickRec { user: shared.links.person(u), click: click.id, ts: click.ts, campaign: click.campaign });
                 }
             }
@@ -795,7 +887,7 @@ fn split_stages(
     parsed: &mut Vec<PosOut>,
     links: &Links,
     extras: &[Extra],
-    grouped: &[OnceLock<Grouped>],
+    grouped: &Grouped,
     click_aliases: &[u64],
     flags: &mut [u8],
     works: &mut Vec<Work>,
@@ -924,16 +1016,10 @@ fn split_stages(
                         ONE => links.name[person],
                         _ => scramble::id_of(u64::from(users[stretch.start]), plan.user_key, b'u'),
                     };
-                    let range = person >> plan.click_shift;
-                    let clicks: &mut [Click] = match grouped[range].get() {
-                        // SAFETY: a fit person has one run, so only this task takes its clicks,
-                        // and the click tasks below read only the clicks of unfit persons.
-                        Some(group) => unsafe {
-                            let at = group.range(person - (range << plan.click_shift));
-                            std::slice::from_raw_parts_mut(group.clicks.0.add(at.start), at.len())
-                        },
-                        None => &mut [],
-                    };
+                    let at = grouped.range(person);
+                    // SAFETY: a fit person has one run, so only this task takes its clicks,
+                    // and the click tasks below read only the clicks of unfit persons.
+                    let clicks: &mut [Click] = unsafe { std::slice::from_raw_parts_mut(grouped.clicks.0.add(at.start), at.len()) };
                     if flags[person] & EXTRA == 0 {
                         sessions::positional::person(ctx, name, &times[stretch], run.first, pays, &mut next_pay, clicks, &mut work.agg);
                     } else {
@@ -956,15 +1042,15 @@ fn split_stages(
                     own_next = next_pay;
                 }
             }
-        } else if let Some(group) = grouped[task - run_tasks].get() {
+        } else if grouped.total(task - run_tasks) > 0 {
             let first = (task - run_tasks) << plan.click_shift;
-            for local in 0..group.ends.len() {
-                let at = group.range(local);
-                if !at.is_empty() && !fit(first + local) {
+            for person in first..(first + (1 << plan.click_shift)).min(plan.persons as usize) {
+                let at = grouped.range(person);
+                if !at.is_empty() && !fit(person) {
                     for i in at {
                         // SAFETY: an unfit person's clicks are read here only, and written nowhere.
-                        let click = unsafe { *group.clicks.0.add(i) };
-                        let u = ((first + local) as u32) << ALIAS_BITS | u32::from(group.aliases[i]);
+                        let (click, alias) = unsafe { (*grouped.clicks.0.add(i), *grouped.aliases.0.add(i)) };
+                        let u = (person as u32) << ALIAS_BITS | u32::from(alias);
                         work.slow_clicks.push(ClickRec { user: links.person(u), click: click.id, ts: click.ts, campaign: click.campaign });
                     }
                 }
@@ -1183,34 +1269,116 @@ unsafe fn place(part: usize, plan: &PosPlan, parsed: &[PosOut], links: &Links, t
     Some(Placed { runs, skip: 0, pays })
 }
 
+/// `group_clicks` for a range with a large share of the clicks, by all workers together: each
+/// counts the clicks of its own list per person, the counts become each worker's positions
+/// (a person's clicks from worker 0's list first, as `group_clicks` leaves them), and each
+/// scatters its own list. The range has clicks.
+///
+/// # Safety
+/// As `group_clicks`, and worker `w` of `works` is the one that parsed `parsed[w]`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn group_clicks_wide(
+    range: usize,
+    plan: &PosPlan,
+    parsed: &[PosOut],
+    click_aliases: Shared<u64>,
+    flags: Shared<u8>,
+    ends: Shared<u32>,
+    grouped: &Grouped,
+    works: &mut [Work],
+) {
+    assert_eq!(parsed.len(), works.len());
+    let first = range << plan.click_shift;
+    let persons = (1usize << plan.click_shift).min(plan.persons as usize - first);
+    par::each(works, |worker, work| {
+        let Share { counts, masks, over } = &mut work.share;
+        counts.clear();
+        counts.resize(persons, 0);
+        masks.clear();
+        masks.resize(persons, 0);
+        over.clear();
+        over.resize(persons, 0);
+        for piece in parsed[worker].clicks.pieces(range) {
+            for click in piece {
+                let (local, alias) = ((click.u() >> ALIAS_BITS) as usize - first, click.u() & ALIAS_MASK);
+                counts[local] += 1;
+                masks[local] |= 1 << (alias & (MASK_ALIASES - 1));
+                over[local] |= u8::from(alias >= MASK_ALIASES);
+            }
+        }
+    });
+    // SAFETY: the caller's contract; the three arrays hold `plan.persons` entries.
+    let (click_aliases, flags, ends) = unsafe {
+        (
+            std::slice::from_raw_parts_mut(click_aliases.0.add(first), persons),
+            std::slice::from_raw_parts_mut(flags.0.add(first), persons),
+            std::slice::from_raw_parts_mut(ends.0.add(first), persons),
+        )
+    };
+    let mut at = grouped.bases[range];
+    for local in 0..persons {
+        for work in works.iter_mut() {
+            let share = &mut work.share;
+            click_aliases[local] |= share.masks[local];
+            if share.over[local] != 0 {
+                flags[local] |= UNFIT;
+            }
+            (share.counts[local], at) = (at, at + share.counts[local]);
+        }
+        ends[local] = at;
+    }
+    debug_assert_eq!(at, grouped.bases[range + 1]);
+    let (click_room, alias_room) = (grouped.clicks, grouped.aliases);
+    par::each(works, |worker, work| {
+        // The wrappers whole, not their pointers: those are what may cross threads.
+        let (click_room, alias_room) = (click_room, alias_room);
+        let counts = &mut work.share.counts;
+        for piece in parsed[worker].clicks.pieces(range) {
+            for click in piece {
+                let at = &mut counts[(click.u() >> ALIAS_BITS) as usize - first];
+                // SAFETY: a worker's positions for a person are its own stretch of the
+                // person's, by the counts of these same clicks: all workers' together are a
+                // permutation of the range's positions, inside the reserved room.
+                unsafe {
+                    click_room.0.add(*at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.click });
+                    alias_room.0.add(*at as usize).write((click.u() & ALIAS_MASK) as u16);
+                }
+                *at += 1;
+            }
+        }
+    });
+}
+
 #[cold]
 #[inline(never)]
 fn odd_user(row: &PosEvent, worker: usize, odd: &mut Vec<(u32, u32, u32, u32)>) {
     odd.push((u32::from(row.slot()), row.ingest(), worker as u32, row.u()));
 }
 
-/// Groups click range `range` by person with a counting scatter, and notes each person's click
-/// aliases. `None` for a range without clicks.
+/// Groups click range `range` by person with a counting scatter into its stretch of
+/// `grouped`'s arrays, and notes each person's click aliases. `ends` is `grouped.ends`, to
+/// write: the range's entries are zero on entry and each person's end on return.
 ///
 /// # Safety
-/// No other thread touches the entries of `click_aliases` and `flags` for persons
-/// `range << click_shift .. (range + 1) << click_shift`.
-unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_aliases: Shared<u64>, flags: Shared<u8>) -> Option<Grouped> {
-    let total: usize = parsed.iter().map(|out| out.clicks.len_of(range)).sum();
-    if total == 0 {
-        return None;
-    }
+/// No other thread touches the entries of `click_aliases`, `flags` and `ends` for persons
+/// `range << click_shift .. (range + 1) << click_shift`, nor the range's positions of the
+/// clicks; `parsed` is what `grouped` was made for.
+unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_aliases: Shared<u64>, flags: Shared<u8>, ends: Shared<u32>, grouped: &Grouped) {
     let first = range << plan.click_shift;
     let persons = (1usize << plan.click_shift).min(plan.persons as usize - first);
-    // SAFETY: the caller's contract; both arrays hold `plan.persons` entries.
-    let (click_aliases, flags) =
-        unsafe { (std::slice::from_raw_parts_mut(click_aliases.0.add(first), persons), std::slice::from_raw_parts_mut(flags.0.add(first), persons)) };
-    let mut ends = vec![0u32; persons + 1];
+    // SAFETY: the caller's contract; the three arrays hold `plan.persons` entries.
+    let (click_aliases, flags, ends) = unsafe {
+        (
+            std::slice::from_raw_parts_mut(click_aliases.0.add(first), persons),
+            std::slice::from_raw_parts_mut(flags.0.add(first), persons),
+            std::slice::from_raw_parts_mut(ends.0.add(first), persons),
+        )
+    };
     for out in parsed {
         for piece in out.clicks.pieces(range) {
             for click in piece {
                 let (local, alias) = ((click.u() >> ALIAS_BITS) as usize - first, click.u() & ALIAS_MASK);
-                ends[local + 1] += 1;
+                ends[local] += 1;
                 click_aliases[local] |= 1 << (alias & (MASK_ALIASES - 1));
                 if alias >= MASK_ALIASES {
                     flags[local] |= UNFIT;
@@ -1218,20 +1386,19 @@ unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_al
             }
         }
     }
-    for local in 1..=persons {
-        ends[local] += ends[local - 1];
+    // Each person's first position; the scatter moves it to one past the last.
+    let mut at = grouped.bases[range];
+    for end in ends.iter_mut() {
+        (*end, at) = (at, at + *end);
     }
-    // `ends[local]` is the person's first position, and the scatter moves it to one past the last.
-    // Both arrays are written here and nowhere before: filled with zeros first, they were
-    // written twice.
-    let (mut clicks, mut aliases): (Vec<Click>, Vec<u16>) = (Vec::with_capacity(total), Vec::with_capacity(total));
-    let (click_room, alias_room) = (clicks.as_mut_ptr(), aliases.as_mut_ptr());
+    debug_assert_eq!(at, grouped.bases[range + 1]);
+    let (click_room, alias_room) = (grouped.clicks.0, grouped.aliases.0);
     for out in parsed {
         for piece in out.clicks.pieces(range) {
             for click in piece {
                 let at = &mut ends[(click.u() >> ALIAS_BITS) as usize - first];
                 // SAFETY: the counts above are of these same clicks, so the positions are a
-                // permutation of `0..total`, inside the reserved room.
+                // permutation of the range's, inside the room reserved for all the clicks.
                 unsafe {
                     click_room.add(*at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.click });
                     alias_room.add(*at as usize).write((click.u() & ALIAS_MASK) as u16);
@@ -1240,11 +1407,4 @@ unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_al
             }
         }
     }
-    // SAFETY: every position in `0..total` of both was written once above.
-    unsafe {
-        clicks.set_len(total);
-        aliases.set_len(total);
-    }
-    ends.truncate(persons);
-    Some(Grouped { ends, clicks: Shared(clicks.as_mut_ptr()), aliases, _owner: clicks })
 }

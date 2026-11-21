@@ -19,6 +19,18 @@ pub struct UserDaily {
     pub top_category: Vec<u8>,
 }
 
+impl UserDaily {
+    /// Room for `rows` more rows in every column.
+    pub fn reserve(&mut self, rows: usize) {
+        self.person.reserve(rows);
+        self.day.reserve(rows);
+        self.sessions.reserve(rows);
+        self.events.reserve(rows);
+        self.revenue_cents.reserve(rows);
+        self.top_category.reserve(rows);
+    }
+}
+
 /// All of `campaign_daily`.
 #[derive(Default)]
 pub struct CampaignDaily {
