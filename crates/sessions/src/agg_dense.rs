@@ -122,10 +122,19 @@ impl Counters {
 }
 
 pub fn campaign_daily<'a>(ctx: &Ctx, workers: impl Iterator<Item = &'a Counters>) -> CampaignDaily {
+    campaign_daily_part(ctx, workers, 0, 1)
+}
+
+/// Part `part` of `parts` of `campaign_daily`: the rows of an even share of the cells, so the
+/// parts together are the table. A part is summed and written by one worker while the others
+/// do theirs: summed whole by one thread, the table was a millisecond at the end of a run of
+/// twenty at 1M events (4.5 MB of counters read cold, a megabyte of sums on fresh pages).
+pub fn campaign_daily_part<'a>(ctx: &Ctx, workers: impl Iterator<Item = &'a Counters>, part: usize, parts: usize) -> CampaignDaily {
     let cells = ctx.campaigns.len() * ctx.n_days;
-    let mut sums = vec![[0i64; 4]; cells];
+    let (from, to) = (cells * part / parts, cells * (part + 1) / parts);
+    let mut sums = vec![[0i64; 4]; to - from];
     for counters in workers {
-        for ((sum, credited), &assisted) in sums.iter_mut().zip(&counters.credited).zip(&counters.assisted) {
+        for ((sum, credited), &assisted) in sums.iter_mut().zip(&counters.credited[from..to]).zip(&counters.assisted[from..to]) {
             sum[0] += i64::from(credited.sessions);
             sum[1] += i64::from(credited.purchasing);
             sum[2] += credited.revenue as i64;
@@ -133,7 +142,14 @@ pub fn campaign_daily<'a>(ctx: &Ctx, workers: impl Iterator<Item = &'a Counters>
         }
     }
     let mut out = CampaignDaily::default();
-    for (cell, &[sessions, purchasing, revenue, assisted]) in sums.iter().enumerate() {
+    let rows = sums.iter().filter(|sum| sum[0] > 0 || sum[3] > 0).count();
+    out.campaign.reserve_exact(rows);
+    out.day.reserve_exact(rows);
+    out.sessions.reserve_exact(rows);
+    out.purchasing_sessions.reserve_exact(rows);
+    out.revenue_cents.reserve_exact(rows);
+    out.assisted_sessions.reserve_exact(rows);
+    for (cell, &[sessions, purchasing, revenue, assisted]) in (from..to).zip(&sums) {
         if sessions > 0 || assisted > 0 {
             out.campaign.push((cell % ctx.campaigns.len()) as u32);
             out.day.push(ctx.day0 + (cell / ctx.campaigns.len()) as i32);

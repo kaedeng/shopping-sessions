@@ -3,7 +3,7 @@
 use crate::env;
 use crate::id::{self, Id};
 use crate::rows::NO_CATEGORY;
-use crate::table::IdMap;
+use crate::table::{IdMap, Products};
 use crate::time::{DAY, SECOND, WEEK};
 
 pub struct Ctx {
@@ -34,7 +34,7 @@ pub struct Ctx {
     /// The index of `unknown`, for a product not in `products.csv`.
     pub unknown: u8,
     /// product_id -> category index.
-    pub products: IdMap<u8>,
+    pub products: Products,
     /// `(campaign_id, channel)` in file order, then `organic` last.
     pub campaigns: Vec<(Vec<u8>, Vec<u8>)>,
     /// campaign_id -> index into `campaigns`. `organic` is not in it.
@@ -53,15 +53,6 @@ impl Ctx {
         products: &[(Id, &[u8])],
         campaigns: &[(&[u8], &[u8])],
     ) -> Result<Ctx, String> {
-        let origin = window_start - WEEK;
-        // shortcut: a ts is 32 bits of milliseconds from 7 days before the window, so the window
-        // can be at most 42 days (the generator's is always 14); widen `ts` if that ever changes.
-        if window_end <= window_start || window_end - origin > i64::from(u32::MAX) {
-            return Err(format!("unsupported window: {window_start} to {window_end} ms"));
-        }
-        let ts_end = (window_end - origin) as u32;
-        let day0 = window_start.div_euclid(DAY);
-
         // The distinct names in order of first appearance, and each product's place among
         // them: a scan of the few names per product (the last match first, since any order
         // beats sorting one name per product, which took 4 of the lookup files' 6 ms).
@@ -72,12 +63,7 @@ impl Ctx {
             if names[last] != category {
                 last = match names.iter().position(|name| *name == category) {
                     Some(at) => at,
-                    // shortcut: a category index shares 8 bits with the price in `pay` and 0xFF
-                    // is null, so at most 255 categories (the generator has 21 with `unknown`);
-                    // widen `pay` beyond that.
-                    None if names.len() >= NO_CATEGORY as usize => {
-                        return Err(format!("more than {NO_CATEGORY} categories, at most {NO_CATEGORY} supported"));
-                    }
+                    None if names.len() >= NO_CATEGORY as usize => return Err(too_many_categories()),
                     None => {
                         names.push(category);
                         names.len() - 1
@@ -86,15 +72,46 @@ impl Ctx {
             }
             seen.push(last as u8);
         }
-        // Numbered in byte order, so a larger index is a larger name.
-        let mut categories = names.clone();
-        categories.sort_unstable();
-        let rank: Vec<u8> = names.iter().map(|name| categories.binary_search(name).unwrap() as u8).collect();
-        let category_of = |name: &[u8]| categories.binary_search(&name).unwrap() as u8;
-        let mut product_map = IdMap::new(products.len());
+        let (categories, rank) = Ctx::categories(&names)?;
+        let mut product_map = Products::new(products.len() + 1, products.len());
         for (&(product, _), &at) in products.iter().zip(&seen) {
             product_map.insert(product, rank[at as usize]);
         }
+        Ctx::with_products(window_start, window_end, categories, product_map, campaigns)
+    }
+
+    /// The category names in byte order (so a larger index is a larger name), and each given
+    /// name's index among them. `names` are distinct and begin with `unknown`.
+    pub fn categories(names: &[&[u8]]) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
+        // shortcut: a category index shares 8 bits with the price in `pay` and 0xFF is null, so
+        // at most 255 categories (the generator has 21 with `unknown`); widen `pay` beyond that.
+        if names.len() > NO_CATEGORY as usize {
+            return Err(too_many_categories());
+        }
+        let mut sorted = names.to_vec();
+        sorted.sort_unstable();
+        let rank = names.iter().map(|name| sorted.binary_search(name).unwrap() as u8).collect();
+        Ok((sorted.iter().map(|name| name.to_vec()).collect(), rank))
+    }
+
+    /// `new` with the products already in their table: `categories` in byte order, `unknown`
+    /// among them (`Ctx::categories`), and `products` holding indexes into them.
+    pub fn with_products(
+        window_start: i64,
+        window_end: i64,
+        categories: Vec<Vec<u8>>,
+        products: Products,
+        campaigns: &[(&[u8], &[u8])],
+    ) -> Result<Ctx, String> {
+        let origin = window_start - WEEK;
+        // shortcut: a ts is 32 bits of milliseconds from 7 days before the window, so the window
+        // can be at most 42 days (the generator's is always 14); widen `ts` if that ever changes.
+        if window_end <= window_start || window_end - origin > i64::from(u32::MAX) {
+            return Err(format!("unsupported window: {window_start} to {window_end} ms"));
+        }
+        let ts_end = (window_end - origin) as u32;
+        let day0 = window_start.div_euclid(DAY);
+        let unknown = categories.iter().position(|name| name == b"unknown").ok_or("the categories lack `unknown`")? as u8;
 
         let mut campaign_index = IdMap::new(campaigns.len());
         for (at, &(campaign, _)) in campaigns.iter().enumerate() {
@@ -116,9 +133,9 @@ impl Ctx {
             workers: env::number("NCPU", 8).max(1),
             part_bits: env::number("SS_PART_BITS", 10) as u32,
             bucket_bits: env::number("SS_BUCKET_BITS", 10) as u32,
-            unknown: category_of(b"unknown"),
-            categories: categories.iter().map(|name| name.to_vec()).collect(),
-            products: product_map,
+            unknown,
+            categories,
+            products,
             campaigns,
             campaign_index,
             origin_day: origin.div_euclid(DAY),
@@ -151,6 +168,10 @@ impl Ctx {
     pub fn ingest_rel(&self, seconds: i64) -> u32 {
         (seconds - self.ingest_base).clamp(0, i64::from(u32::MAX)) as u32
     }
+}
+
+fn too_many_categories() -> String {
+    format!("more than {NO_CATEGORY} categories, at most {NO_CATEGORY} supported")
 }
 
 #[cfg(test)]

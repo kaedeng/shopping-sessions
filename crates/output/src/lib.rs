@@ -24,7 +24,14 @@ pub fn user_daily(folder: &Path, worker: usize, ctx: &Ctx, rows: UserDaily) -> R
     arrow::user_daily(folder, worker, ctx, rows)
 }
 
-/// Writes the whole table to `folder/part-0.parquet`, also when it is empty. `folder` exists.
-pub fn campaign_daily(folder: &Path, ctx: &Ctx, rows: CampaignDaily) -> Result<(), String> {
-    arrow::campaign_daily(folder, ctx, rows)
+/// Writes `rows`, the whole table or a part of it, to `folder/part-{part}.parquet`, also when
+/// there are none. `folder` exists. Called concurrently, one call per part.
+///
+/// `SS_OUT=direct|arrow`, as `user_daily`.
+pub fn campaign_daily(folder: &Path, part: usize, ctx: &Ctx, rows: CampaignDaily) -> Result<(), String> {
+    #[cfg(feature = "out-direct")]
+    if types::env::pick("SS_OUT", &["direct", "arrow"]) == 0 {
+        return direct::campaign_daily(folder, part, ctx, &rows);
+    }
+    arrow::campaign_daily(folder, part, ctx, rows)
 }

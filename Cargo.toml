@@ -34,7 +34,7 @@ default = [
     "sess-partitioned", "sess-purchase-side", "sort-grouped", "sort-std", "attr-sweep", "agg-dense",
     "out-arrow", "out-direct",
     "fast-exit", "alloc-parallel", "free-early", "scatter-wc",
-    "pipe-positional",
+    "pipe-positional", "alloc-region",
 ]
 # types
 id-u64 = ["types/id-u64"]
@@ -82,6 +82,9 @@ free-early = ["types/free-early"]
 trace = ["types/trace"]
 # A process has one global allocator, so this one swaps at build time; no env var.
 alloc-mimalloc = ["dep:mimalloc"]
+# The process's allocator is `src/region.rs`: one reservation, blocks by moving a mark. Build
+# without it (and without `alloc-mimalloc`) for the system allocator.
+alloc-region = []
 
 [profile.release]
 lto = "fat"

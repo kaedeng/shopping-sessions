@@ -13,140 +13,238 @@ use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
 /// The workers kept between stages.
+///
+/// A round is published through atomics alone and the workers watch for it, spinning, for
+/// `SS_SPIN_US` microseconds (300) before they sleep: stages follow each other within that,
+/// so a round mostly starts on workers that are awake. (Behind a mutex and a condition
+/// variable, every round woke seven sleepers that then queued for the mutex: 60 to 90 µs
+/// from the first worker's start to the last's, a dozen times in a run of 20 ms at 1M events,
+/// and a millisecond for the first round.)
 mod pool {
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
-    use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+    use std::thread::Thread;
+    use std::time::{Duration, Instant};
 
     /// A round's job, called with the worker's number.
     type Job<'a> = dyn Fn(usize) + Sync + 'a;
 
-    struct State {
-        /// Counts the rounds; a worker takes part once in each round that includes it.
-        round: u64,
-        /// The round's job, its lifetime erased: `round` does not return before `left` is 0.
-        job: Option<&'static Job<'static>>,
-        /// Workers `1..count` take part in the round.
-        count: usize,
-        /// Of them, those that have not finished.
-        left: usize,
-        panicked: bool,
-        /// Threads so far: workers `1..=threads`.
-        threads: usize,
+    /// Workers the pool holds at most; a round of more spawns its threads.
+    const MOST: usize = 256;
+
+    /// A worker thread's place: its handle, to wake it, and whether it sleeps.
+    struct Seat {
+        thread: OnceLock<Thread>,
+        asleep: AtomicBool,
     }
 
     struct Pool {
-        state: Mutex<State>,
-        /// The workers wait here for a round, the caller there for its last worker.
-        start: Condvar,
-        done: Condvar,
-        /// `State::round` again, to read without the lock: a worker watches it for a moment
-        /// before it sleeps, since stages mostly follow each other within microseconds.
+        /// Counts the rounds, two a round: odd while the caller writes the round's `job`,
+        /// `count` and `left`, even once they stand. A worker takes part once in each round
+        /// that includes it.
         round: AtomicU64,
+        /// The round's job as its two pointer words, lifetime erased: `round` does not return
+        /// before `left` is 0.
+        job: [AtomicUsize; 2],
+        /// Workers `1..count` take part in the round.
+        count: AtomicUsize,
+        /// Of them, those that have not finished.
+        left: AtomicUsize,
+        panicked: AtomicBool,
         /// One round at a time. A caller that finds the pool taken (a job that itself asks
         /// for workers, or another thread's) gets `false` and spawns threads.
         taken: AtomicBool,
+        /// Threads so far, started or about to be: workers `1..=threads`.
+        threads: Mutex<usize>,
+        /// Of them, those that run.
+        up: AtomicUsize,
+        seats: Vec<Seat>,
+        /// The thread waiting for the round's last worker, when it sleeps.
+        caller: Mutex<Option<Thread>>,
+        caller_asleep: AtomicBool,
+        /// How long a thread watches before it sleeps.
+        spin: Duration,
     }
-
-    /// Looks at the round counter this many times before sleeping: some tens of microseconds.
-    const SPINS: usize = 2000;
 
     fn pool() -> &'static Pool {
         static POOL: OnceLock<Pool> = OnceLock::new();
         POOL.get_or_init(|| Pool {
-            state: Mutex::new(State { round: 0, job: None, count: 0, left: 0, panicked: false, threads: 0 }),
-            start: Condvar::new(),
-            done: Condvar::new(),
             round: AtomicU64::new(0),
+            job: [AtomicUsize::new(0), AtomicUsize::new(0)],
+            count: AtomicUsize::new(0),
+            left: AtomicUsize::new(0),
+            panicked: AtomicBool::new(false),
             taken: AtomicBool::new(false),
+            threads: Mutex::new(0),
+            up: AtomicUsize::new(0),
+            seats: (0..MOST).map(|_| Seat { thread: OnceLock::new(), asleep: AtomicBool::new(false) }).collect(),
+            caller: Mutex::new(None),
+            caller_asleep: AtomicBool::new(false),
+            spin: Duration::from_micros(crate::env::number("SS_SPIN_US", 300) as u64),
         })
     }
 
-    fn lock(pool: &Pool) -> MutexGuard<'_, State> {
-        // Jobs run outside the lock and their panics are caught, so it is never poisoned by one.
-        pool.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        // Nothing panics while holding these.
+        mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Worker `index`'s thread; `seen` is the round at its start, which it is not part of.
-    fn work(pool: &'static Pool, index: usize, mut seen: u64) {
+    /// Calls `done` until it returns `Some`: watching for `pool.spin`, then asleep between
+    /// looks. Before it sleeps it calls `settle` and sets `asleep`; whoever makes `done` come
+    /// true must then look at that flag and wake the thread if it is set (both sides `SeqCst`,
+    /// so one of the two sees the other).
+    fn until<T>(pool: &Pool, asleep: &AtomicBool, settle: impl FnOnce(), done: impl Fn() -> Option<T>) -> T {
+        let (mut looks, mut since) = (0u32, None::<Instant>);
         loop {
-            let mut spins = 0;
-            while pool.round.load(SeqCst) == seen && spins < SPINS {
-                std::hint::spin_loop();
-                spins += 1;
+            if let Some(value) = done() {
+                return value;
             }
-            let mut state = lock(pool);
-            while state.round == seen {
-                state = pool.start.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::hint::spin_loop();
+            looks += 1;
+            // The clock every 256 looks: reading it is 20 ns.
+            if looks & 255 == 0 && since.get_or_insert_with(Instant::now).elapsed() >= pool.spin {
+                break;
             }
-            seen = state.round;
-            if index >= state.count {
+        }
+        settle();
+        asleep.store(true, SeqCst);
+        let value = loop {
+            if let Some(value) = done() {
+                break value;
+            }
+            // Returns at once after an `unpark` since the last `park`, and now and then for
+            // no reason: the loop looks again.
+            std::thread::park();
+        };
+        asleep.store(false, SeqCst);
+        value
+    }
+
+    /// Worker `index`'s thread. With `tree`, it first starts workers `2 * index` and
+    /// `2 * index + 1` where those are below `tree`.
+    fn work(pool: &'static Pool, index: usize, tree: usize) {
+        let seat = &pool.seats[index];
+        let _ = seat.thread.set(std::thread::current());
+        for child in [2 * index, 2 * index + 1] {
+            if child < tree {
+                spawn(pool, child, tree);
+            }
+        }
+        pool.up.fetch_add(1, SeqCst);
+        crate::tl::mark("thread up");
+        // The last round this worker looked at. A thread starts between rounds or during
+        // one: a finished round did not include it (it would not have finished), and a
+        // running one that does is its first.
+        let mut seen = 0u64;
+        loop {
+            let round = until(pool, &seat.asleep, || (), || Some(pool.round.load(SeqCst)).filter(|&round| round != seen && round & 1 == 0));
+            let (count, words) = (pool.count.load(SeqCst), [pool.job[0].load(SeqCst), pool.job[1].load(SeqCst)]);
+            // Read while the next round was being written (so this one did not include this
+            // worker): look again.
+            if pool.round.load(SeqCst) != round {
                 continue;
             }
-            let job = state.job.expect("a round has a job");
-            drop(state);
-            let ok = catch_unwind(AssertUnwindSafe(|| job(index))).is_ok();
-            let mut state = lock(pool);
-            state.panicked |= !ok;
-            state.left -= 1;
-            if state.left == 0 {
-                pool.done.notify_all();
+            seen = round;
+            if index >= count {
+                continue;
+            }
+            // SAFETY: the words of this round's job, written before `round` took this value;
+            // the caller keeps the job alive until `left` is 0, which waits for this worker.
+            let job: &Job<'static> = unsafe { std::mem::transmute::<[usize; 2], &Job<'static>>(words) };
+            if catch_unwind(AssertUnwindSafe(|| job(index))).is_err() {
+                pool.panicked.store(true, SeqCst);
+            }
+            if pool.left.fetch_sub(1, SeqCst) == 1 && pool.caller_asleep.load(SeqCst) {
+                if let Some(caller) = lock(&pool.caller).as_ref() {
+                    caller.unpark();
+                }
             }
         }
     }
 
-    /// Makes sure workers `1..workers` exist. Called with the pool taken, or before any round.
-    fn grow(pool: &'static Pool, state: &mut State, workers: usize) {
-        while state.threads + 1 < workers {
-            state.threads += 1;
-            let (index, seen) = (state.threads, state.round);
-            std::thread::Builder::new().name(format!("worker-{index}")).spawn(move || work(pool, index, seen)).expect("a worker thread");
+    fn spawn(pool: &'static Pool, index: usize, tree: usize) {
+        std::thread::Builder::new().name(format!("worker-{index}")).spawn(move || work(pool, index, tree)).expect("a worker thread");
+    }
+
+    /// Makes sure workers `1..workers` exist or are on their way. The first threads are
+    /// started as a tree (the caller starts worker 1, a worker the two below it), so the
+    /// caller is back after one `clone` and the rest start side by side: started one after
+    /// another by the caller, seven threads took it 0.9 ms.
+    fn grow(pool: &'static Pool, workers: usize) {
+        let mut threads = lock(&pool.threads);
+        if *threads == 0 && workers > 1 {
+            *threads = workers - 1;
+            spawn(pool, 1, workers);
+        }
+        while *threads + 1 < workers {
+            *threads += 1;
+            spawn(pool, *threads, 0);
         }
     }
 
-    /// Starts the threads for `workers` workers now, so that no stage has to.
+    /// Starts the threads for `workers` workers now, so that no stage has to, and returns
+    /// when they all run. Waiting is the point: a thread's start takes the address-space lock
+    /// for writing (its stack is a `mmap` and an `mprotect`), and behind a page fault on fresh
+    /// memory, which holds that lock while 2 MB are zeroed, it waits. With the first stage
+    /// already running, each of seven threads took 0.35 ms to appear, one after another;
+    /// with nothing else running, all of them are up in a fraction of that.
     pub fn start(workers: usize) {
         let pool = pool();
-        grow(pool, &mut lock(pool), workers);
+        let workers = workers.min(MOST);
+        grow(pool, workers);
+        while pool.up.load(SeqCst) + 1 < workers {
+            std::hint::spin_loop();
+        }
     }
 
     /// Runs `job(w)` for every `w` in `0..workers`, `job(0)` on the calling thread, and
     /// returns `true` once all have returned; or returns `false` at once, nothing run, when
-    /// the pool is in use. Panics if a job panicked.
+    /// the pool is in use (or `workers` is more than it holds). Panics if a job panicked.
     pub fn round(workers: usize, job: &Job<'_>) -> bool {
         let pool = pool();
-        if pool.taken.swap(true, SeqCst) {
+        if workers > MOST || pool.taken.swap(true, SeqCst) {
             return false;
         }
-        // SAFETY: only the lifetime changes. The reference is dropped from the state before
-        // this function returns or unwinds (`Wait`), and by then no worker is inside the job.
-        let erased: &'static Job<'static> = unsafe { std::mem::transmute::<&Job<'_>, &'static Job<'static>>(job) };
-        {
-            let mut state = lock(pool);
-            grow(pool, &mut state, workers);
-            (state.job, state.count, state.left, state.panicked) = (Some(erased), workers, workers - 1, false);
-            state.round += 1;
-            pool.round.store(state.round, SeqCst);
+        grow(pool, workers);
+        // SAFETY: a reference to a trait object is two words; they are read back as the same
+        // type (`work`), and no worker is inside the job once `left` is 0 (`Wait`).
+        let words = unsafe { std::mem::transmute::<&Job<'_>, [usize; 2]>(job) };
+        pool.round.fetch_add(1, SeqCst);
+        pool.job[0].store(words[0], SeqCst);
+        pool.job[1].store(words[1], SeqCst);
+        pool.count.store(workers, SeqCst);
+        pool.left.store(workers - 1, SeqCst);
+        pool.panicked.store(false, SeqCst);
+        pool.round.fetch_add(1, SeqCst);
+        for seat in &pool.seats[1..workers] {
+            if seat.asleep.load(SeqCst) && let Some(thread) = seat.thread.get() {
+                thread.unpark();
+            }
         }
-        pool.start.notify_all();
-        /// Waits for the round's workers, also when the caller's own job unwinds.
+        /// Waits for the round's workers, also when the caller's own job unwinds, and gives
+        /// the pool back.
         struct Wait(&'static Pool);
+        impl Wait {
+            /// Whether a worker's job panicked.
+            fn finish(&self) -> bool {
+                let pool = self.0;
+                until(pool, &pool.caller_asleep, || *lock(&pool.caller) = Some(std::thread::current()), || (pool.left.load(SeqCst) == 0).then_some(()));
+                let panicked = pool.panicked.load(SeqCst);
+                pool.taken.store(false, SeqCst);
+                panicked
+            }
+        }
         impl Drop for Wait {
             fn drop(&mut self) {
-                let mut state = lock(self.0);
-                while state.left > 0 {
-                    state = self.0.done.wait(state).unwrap_or_else(|poisoned| poisoned.into_inner());
-                }
-                state.job = None;
-                drop(state);
-                self.0.taken.store(false, SeqCst);
+                self.finish();
             }
         }
         let wait = Wait(pool);
         job(0);
-        drop(wait);
-        // `panicked` is this round's: the next round resets it, and only after taking the pool.
-        assert!(!lock(pool).panicked, "worker panicked");
+        let panicked = wait.finish();
+        std::mem::forget(wait);
+        assert!(!panicked, "worker panicked");
         true
     }
 }
@@ -187,6 +285,7 @@ pub fn run<S: Send>(states: &mut [S], tasks: usize, task: impl Fn(usize, &mut S,
     let next = AtomicUsize::new(0);
     let stage = trace::next_stage();
     each(states, |worker, state| {
+        crate::tl::mark("worker in");
         loop {
             let index = next.fetch_add(1, Relaxed);
             if index >= tasks {
@@ -196,6 +295,7 @@ pub fn run<S: Send>(states: &mut [S], tasks: usize, task: impl Fn(usize, &mut S,
             task(worker, state, index);
             trace::span(stage, worker, index, start);
         }
+        crate::tl::mark("worker out");
     });
 }
 
@@ -217,7 +317,9 @@ pub fn init<S: Send>(workers: usize, parallel: bool, make: impl Fn(usize) -> S +
     }
     let make = |worker| {
         let start = trace::now();
+        crate::tl::mark("init in");
         let state = make(worker);
+        crate::tl::mark("init out");
         trace::span(stage, worker, trace::WHOLE, start);
         state
     };

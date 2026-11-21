@@ -161,3 +161,9 @@ pub fn bucket_stretch<'a>(
 pub fn campaign_daily(ctx: &Ctx, aggs: &[Agg]) -> CampaignDaily {
     agg_dense::campaign_daily(ctx, aggs.iter().map(|agg| &agg.counters))
 }
+
+/// Part `part` of `parts` of `campaign_daily`: the parts together are the table, and each
+/// reads every worker's counters, so they may be made side by side.
+pub fn campaign_daily_part(ctx: &Ctx, aggs: &[Agg], part: usize, parts: usize) -> CampaignDaily {
+    agg_dense::campaign_daily_part(ctx, aggs.iter().map(|agg| &agg.counters), part, parts)
+}

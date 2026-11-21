@@ -472,14 +472,27 @@ impl Work {
 const STAGES: &[&str] = &["fused", "split"];
 
 /// Runs the whole pipeline after the inputs stage. `lap` marks a stage for `SS_TIMING`.
-pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_alloc: bool, lap: &mut dyn FnMut(&str)) -> Result<(), String> {
+pub fn run(
+    ctx: &Ctx,
+    ingest: &Ingest,
+    plan: &PosPlan,
+    mut parsed: Vec<PosOut>,
+    out: &Path,
+    parallel_alloc: bool,
+    lap: &mut dyn FnMut(&'static str),
+) -> Result<(), String> {
     let free_early = types::mem::free_early();
 
-    // Stage 1. Task 0 reads the links; the others parse.
-    let mut parsed: Vec<PosOut> = par::init(ctx.workers, parallel_alloc, |_| ingest.pos_out(ctx, plan));
+    // Stage 1. Task 0 reads the links; the others parse, each worker into the lists the
+    // inputs stage built for it (`ingest::open`).
     let links = OnceLock::new();
     par::run(&mut parsed, ingest.tasks() + 1, |_, out, task| match task {
-        0 => drop(links.set(Links::build(&ingest.pos_links(), plan))),
+        0 => {
+            let pairs = ingest.pos_links();
+            types::tl::mark("links read");
+            drop(links.set(Links::build(&pairs, plan)));
+            types::tl::mark("links built");
+        }
         _ => ingest.pos_parse(ctx, plan, task - 1, out),
     });
     let links = links.get().expect("task 0 ran");
@@ -506,6 +519,7 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
         }
     }
     extras.sort_unstable_by_key(|extra| extra.person);
+    types::tl::mark("extras");
 
     // Stage 2. Each click range grouped by person: a person's sessions need its clicks.
     let persons = plan.persons as usize;
@@ -519,7 +533,9 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
     let ends_at = grouped.ends;
     // A person-day with a session is a row: at 20M one for 9 events. Room for one per 5.
     let rows = plan.events() / ctx.workers / 5 + 1024;
+    types::tl::mark("grouped new");
     let mut works: Vec<Work> = par::init(ctx.workers, parallel_alloc, |_| Work::new(ctx, rows));
+    types::tl::mark("works");
     // Persons are numbered largest first, so the first range holds a large share of all the
     // clicks (the whales are in it): as one task it kept one worker busy long after the others
     // had finished (the stage was 28 ms on 8 threads for 66 ms of work at 20M, and 100 to 140
@@ -607,24 +623,26 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
     for folder in [&user_folder, &campaign_folder] {
         std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
     }
-    // `campaign_daily` is summed and written by a thread of its own while the workers write
-    // their `user_daily` files (after them, on this thread, it was 2 ms at the end of the run).
+    types::tl::mark("folders");
+    // Each worker writes its `user_daily` file, then a part of `campaign_daily`: an even share
+    // of the cells, summed over every worker's counters. (Summed and written whole by a thread
+    // of its own, through arrow-rs, that table was 2 ms of a run of 21 at 1M events: a thread
+    // to start, 4.5 MB of counters read cold, a megabyte of sums on fresh pages.)
     let mut tables: Vec<UserDaily> = works.iter_mut().map(|work| std::mem::take(&mut work.agg.user_daily)).collect();
     let aggs: Vec<Agg> = works.into_iter().map(|work| work.agg).collect();
     let failure = OnceLock::new();
-    let campaigns = std::thread::scope(|scope| {
-        let campaigns = scope.spawn(|| output::campaign_daily(&campaign_folder, ctx, sessions::campaign_daily(ctx, &aggs)));
-        par::each(&mut tables, |worker, table| {
-            if let Err(error) = output::user_daily(&user_folder, worker, ctx, std::mem::take(table)) {
-                drop(failure.set(error));
-            }
-        });
-        campaigns.join().expect("the campaign_daily thread panicked")
+    let parts = tables.len();
+    par::each(&mut tables, |worker, table| {
+        let written = output::user_daily(&user_folder, worker, ctx, std::mem::take(table))
+            .and_then(|()| output::campaign_daily(&campaign_folder, worker, ctx, sessions::campaign_daily_part(ctx, &aggs, worker, parts)));
+        if let Err(error) = written {
+            drop(failure.set(error));
+        }
+        types::tl::mark("worker wrote");
     });
     if let Some(error) = failure.into_inner() {
         return Err(error);
     }
-    campaigns?;
     lap("output");
     if timing && let Some((runs, unfit, why)) = stats {
         // Why, in slots: flagged (split, out of order, wide alias, outside the numbering),
@@ -1058,7 +1076,7 @@ fn with_extras(table: impl Iterator<Item = (u32, u32)>, extras: &[Extra], room: 
 /// first is in a worker's counters by then, so this returns `false` with nothing of the
 /// caller's changed but `works` and the laps, and the split stages run instead. On generated
 /// data a person is one stretch: no seed tried has taken that way out.
-fn fused_stages(shared: &Fused, works: &mut Vec<Work>, slow_events: &mut Vec<PersonEvent>, lap: &mut dyn FnMut(&str)) -> bool {
+fn fused_stages(shared: &Fused, works: &mut Vec<Work>, slow_events: &mut Vec<PersonEvent>, lap: &mut dyn FnMut(&'static str)) -> bool {
     let plan = shared.plan;
     let over = || shared.conflict.load(Relaxed);
     let edges: Vec<OnceLock<Vec<Edge>>> = (0..plan.parts).map(|_| OnceLock::new()).collect();
@@ -1144,7 +1162,7 @@ fn split_stages(
     slow_events: &mut Vec<PersonEvent>,
     free_early: bool,
     timing: bool,
-    lap: &mut dyn FnMut(&str),
+    lap: &mut dyn FnMut(&'static str),
 ) -> (usize, usize, [u64; 4]) {
     let (events, persons) = (plan.events(), plan.persons as usize);
     // Zeroed lazily by the kernel: a slot nobody writes reads 0, "no event" (a valid `ts` is

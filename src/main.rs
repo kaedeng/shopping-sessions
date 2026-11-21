@@ -8,6 +8,8 @@
 
 #[cfg(feature = "pipe-positional")]
 mod positional;
+#[cfg(feature = "alloc-region")]
+mod region;
 
 use std::path::PathBuf;
 use std::sync::OnceLock;
@@ -23,6 +25,12 @@ use types::record::{ClickRec, PersonEvent};
 #[cfg(feature = "alloc-mimalloc")]
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Slot `alloc-region`, the pick: one reserved stretch of address space, no system call after
+// the first allocation (`region`). Without either feature the allocator is the system's.
+#[cfg(all(feature = "alloc-region", not(feature = "alloc-mimalloc")))]
+#[global_allocator]
+static ALLOCATOR: region::Region = region::Region;
 
 /// Clicks per person-lookup task.
 const CLICK_TASK: usize = 1 << 16;
@@ -43,6 +51,49 @@ fn dir(var: &str, default: &str) -> PathBuf {
     std::env::var_os(var).map_or_else(|| default.into(), PathBuf::from)
 }
 
+/// Keeps glibc's own `malloc` to its first arena. This program allocates through `region`,
+/// but the C library still calls `malloc` for itself, once in every thread's start
+/// (`pthread_getattr_np`, for the stack's guard page): and for a thread's first `malloc` glibc
+/// makes the thread an arena, 128 MB mapped, both ends unmapped, the rest unprotected, and the
+/// first page of it, 2 MB with huge pages, zeroed. That was 0.3 ms a thread, the threads one
+/// after another behind the address-space lock.
+fn one_arena() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        unsafe extern "C" {
+            fn mallopt(param: i32, value: i32) -> i32;
+        }
+        const M_ARENA_MAX: i32 = -8;
+        // SAFETY: a setting of the C library's allocator, made before any thread is started.
+        unsafe { mallopt(M_ARENA_MAX, 1) };
+    }
+}
+
+/// Makes room in the process's descriptor table for the input files, and says whether there
+/// is room. The table starts with 64 places and grows when a descriptor past its end is
+/// used; in a process with threads each growth waits for every CPU to pass a quiet point (an
+/// RCU grace period: tens of milliseconds when a few hundred files were opened while the
+/// workers ran). One descriptor at 1,000 while the process is a single thread grows the
+/// table once, at no such cost.
+fn descriptors() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn dup2(from: i32, to: i32) -> i32;
+            fn close(descriptor: i32) -> i32;
+        }
+        // SAFETY: descriptor 2 is duplicated onto one nothing uses this early, which is
+        // closed at once; a failure (a limit below 1,001 descriptors) changes nothing.
+        unsafe {
+            if dup2(2, 1000) == 1000 {
+                close(1000);
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("shopping-sessions: {error}");
@@ -53,8 +104,11 @@ fn main() {
 fn run() -> Result<(), String> {
     let started = Instant::now();
     let timing = std::env::var_os("SS_TIMING").is_some();
+    types::tl::start(std::env::var_os("SS_TIMING").is_some_and(|value| value == "2"));
+    types::tl::mark("main");
     let mut last = started;
-    let mut lap = |stage: &str| {
+    let mut lap = |stage: &'static str| {
+        types::tl::mark(stage);
         if timing {
             let now = Instant::now();
             eprintln!("{stage:<9}{:>8.1} ms", (now - last).as_secs_f64() * 1e3);
@@ -63,31 +117,41 @@ fn run() -> Result<(), String> {
     };
 
     let (data, out) = (dir("DATA_DIR", "/data"), dir("OUTPUT_DIR", "/output"));
-    let (ctx, ingest) = ingest::open(&data)?;
-    // The workers' threads (`types::par`), once the inputs are mapped: a new thread's first
-    // allocation makes its heap and takes a page fault on it, and started before, the seven
-    // of them held up the hundreds of mappings `open` makes (with two copies running the
-    // whole run was 15 ms longer at the median, 40 runs each in alternation).
-    par::start(ctx.workers);
+    one_arena();
+    // Room in the descriptor table for every input file, made while the process is one
+    // thread: the files then stay open for the run (`ingest::open`).
+    let keep_open = descriptors();
+    // The workers' threads (`types::par`) first, while the process has touched next to
+    // nothing: a thread's start needs the address-space lock for writing, and waits behind
+    // every page fault on fresh memory. The inputs stage is their first round.
+    let workers = types::env::number("NCPU", 8).max(1);
+    par::start(workers);
+    // Slot `pipe-positional`: when the rows carry the generator's numbering, the positional
+    // pipeline runs instead of the three stages below. `SS_PIPE=classic` never tries it, and
+    // `positional` runs it whatever the sample says (exact either way; for tests).
+    #[cfg(feature = "pipe-positional")]
+    let positional = {
+        const PIPES: &[&str] = &["auto", "classic", "positional"];
+        let pipe = PIPES[types::env::pick("SS_PIPE", PIPES)];
+        (pipe != "classic").then_some(pipe == "positional")
+    };
+    #[cfg(not(feature = "pipe-positional"))]
+    let positional = None;
+    let opened = ingest::open(&data, workers, positional, keep_open)?;
+    let (ctx, ingest) = (opened.ctx, opened.ingest);
     let parallel_alloc = ALLOC[types::env::pick("SS_ALLOC", ALLOC)] == "parallel";
     // Slot `scatter-wc`: how the person buckets are written (the parse partitions: `Ingest`).
     let scatter = types::parts::bucket_mode_from_env();
     lap("inputs");
 
-    // Slot `pipe-positional`: when the rows carry the generator's numbering, the positional
-    // pipeline runs instead of the three stages below. `SS_PIPE=classic` never tries it, and
-    // `positional` runs it whatever the sample says (exact either way; for tests).
     #[cfg(feature = "pipe-positional")]
     {
-        const PIPES: &[&str] = &["auto", "classic", "positional"];
-        let pipe = PIPES[types::env::pick("SS_PIPE", PIPES)];
-        if pipe != "classic"
-            && let Some(plan) = ingest.pos_plan(&ctx, pipe == "positional")
-        {
-            positional::run(&ctx, &ingest, &plan, &out, parallel_alloc, &mut lap)?;
+        if let Some((plan, parsed)) = opened.pos {
+            positional::run(&ctx, &ingest, &plan, parsed, &out, parallel_alloc, &mut lap)?;
             if timing {
                 eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
             }
+            types::tl::report();
             if cfg!(feature = "fast-exit") {
                 std::process::exit(0);
             }
@@ -181,7 +245,7 @@ fn run() -> Result<(), String> {
     if let Some(error) = failure.into_inner() {
         return Err(error);
     }
-    output::campaign_daily(&campaign_folder, &ctx, sessions::campaign_daily(&ctx, &aggs))?;
+    output::campaign_daily(&campaign_folder, 0, &ctx, sessions::campaign_daily(&ctx, &aggs))?;
     lap("output");
     if timing {
         eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);

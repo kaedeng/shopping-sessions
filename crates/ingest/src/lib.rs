@@ -14,10 +14,13 @@ mod tests;
 use std::cmp::Reverse;
 use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 
 use memchr::{memchr, memrchr};
 use types::hash::hash;
 use types::id::{pack, pack_at};
+use types::table::Products;
 use types::parts::{Combine, Mode, Parts, Plain};
 use types::record::{ClickRec, EventRec, MAX_PRICE, PAY_CATEGORY_SHIFT, VALID};
 use types::time::{DAY, SECOND, parse_f1};
@@ -37,29 +40,12 @@ compile_error!("ingest needs a tokenizer: enable `tok-mask` or `tok-scalar`");
 /// widest read (27 bytes for a `ts`, 16 for `pack_at`) at its last field.
 const PAD: usize = 64;
 
-/// Reads `manifest.json`, `products.csv` and `campaigns.csv` under `data` into a `Ctx`.
+/// Reads `manifest.json`, `products.csv` and `campaigns.csv` under `data` into a `Ctx`, on the
+/// calling thread. The binary reads them beside the inputs' opening (`open`).
 pub fn load_ctx(data: &Path) -> Result<Ctx, String> {
-    let read = |name: &str| {
-        let path = data.join(name);
-        std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))
-    };
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&read("manifest.json")?).map_err(|error| format!("manifest.json: {error}"))?;
-    let instant = |key: &str| {
-        manifest[key]
-            .as_str()
-            .and_then(|text| parse_f1(text.as_bytes()))
-            .ok_or_else(|| format!("manifest.json: {key} is not a YYYY-MM-DDTHH:MM:SSZ string"))
-    };
-    let (start, end) = (instant("window_start")?, instant("window_end")?);
-    let (products, campaigns) = (rows_of(&read("products.csv")?), rows_of(&read("campaigns.csv")?));
-    let products: Vec<(Id, &[u8])> = pairs(&products).into_iter().map(|(id, category)| (pack(id), category)).collect();
-    Ctx::new(start, end, &products, &pairs(&campaigns))
-}
-
-/// A file's lines after the header, padded like a segment (see `padded`).
-fn rows_of(file: &[u8]) -> Vec<u8> {
-    padded(memchr(b'\n', file).map_or(&[][..], |header| &file[header + 1..]))
+    let products = Lookup::read(data, "products.csv")?;
+    let rows = products.products(0, 1);
+    ctx_of(window(data)?, &[&rows], &Lookup::read(data, "campaigns.csv")?)
 }
 
 /// `\n`, the bytes, a `\n` if they lack a final one, then `PAD` zeros: segment `1..len - PAD`.
@@ -74,36 +60,308 @@ fn padded(bytes: &[u8]) -> Vec<u8> {
     own
 }
 
-/// The `(key, value)` rows with a non-empty key of a padded two-column file.
-fn pairs(buf: &[u8]) -> Vec<(&[u8], &[u8])> {
-    let mut rows = Vec::new();
-    let bytes = |field: Field| {
-        let at = field.p as usize - buf.as_ptr() as usize;
-        &buf[at..at + field.len]
+/// `window_start` and `window_end` of `manifest.json`, in epoch milliseconds.
+fn window(data: &Path) -> Result<(i64, i64), String> {
+    let path = data.join("manifest.json");
+    let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    let manifest: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| format!("manifest.json: {error}"))?;
+    let instant = |key: &str| {
+        manifest[key]
+            .as_str()
+            .and_then(|text| parse_f1(text.as_bytes()))
+            .ok_or_else(|| format!("manifest.json: {key} is not a YYYY-MM-DDTHH:MM:SSZ string"))
     };
-    // SAFETY: `padded` made the buffer a segment.
-    unsafe {
-        tok::Quick::lines::<2>(buf.as_ptr().add(1), buf.len() - 1 - PAD, &mut Scratch::new(), |&[key, value]| {
-            if key.len > 0 {
-                rows.push((bytes(key), bytes(value)));
-            }
-        })
-    };
-    rows
+    Ok((instant("window_start")?, instant("window_end")?))
 }
 
-/// The whole inputs stage: `load_ctx` on the calling thread while another maps the files and
-/// plans the chunks (`Ingest::open`'s other half), since neither needs the other until the end.
-/// One after the other they took 6 and 8 ms at 20M events on the x86 box, with every worker idle.
-pub fn open(data: &Path) -> Result<(Ctx, Ingest), String> {
+/// A lookup file read whole, once: its lines after the header are `bytes[from..to]`, the last
+/// ending in `\n`, with the header's `\n` before them and `PAD` zeros after: a segment.
+struct Lookup {
+    bytes: Vec<u8>,
+    from: usize,
+    to: usize,
+}
+
+/// One piece of `products.csv`: its rows with a non-empty ID, in file order, each with its
+/// category's index into `names` (the piece's categories in order of first appearance).
+#[derive(Default)]
+struct ProductRows {
+    /// IDs that are a plain number (`Products::number_at`).
+    numbers: Vec<(u32, u8)>,
+    others: Vec<(Id, u8)>,
+    names: Vec<Vec<u8>>,
+}
+
+impl Lookup {
+    fn read(data: &Path, name: &str) -> Result<Lookup, String> {
+        use std::io::Read;
+        let path = data.join(name);
+        let error = |error: std::io::Error| format!("{}: {error}", path.display());
+        let mut file = File::open(&path).map_err(error)?;
+        let len = file.metadata().map_err(error)?.len() as usize;
+        // Room for the final `\n` a file may lack and for the zeros, so nothing is copied.
+        let mut bytes = Vec::with_capacity(len + PAD + 2);
+        file.read_to_end(&mut bytes).map_err(error)?;
+        let from = memchr(b'\n', &bytes).map_or(bytes.len(), |header| header + 1);
+        if from == bytes.len() {
+            // No line after the header (or no header's end at all): a segment of no lines
+            // still wants a readable byte before it.
+            bytes.push(b'\n');
+            let from = bytes.len();
+            bytes.resize(from + PAD, 0);
+            return Ok(Lookup { bytes, from, to: from });
+        }
+        if bytes.last() != Some(&b'\n') {
+            bytes.push(b'\n');
+        }
+        let to = bytes.len();
+        bytes.resize(to + PAD, 0);
+        Ok(Lookup { bytes, from, to })
+    }
+
+    /// The lines that begin in piece `piece` of `pieces` equal cuts of the lines' bytes.
+    fn piece(&self, piece: usize, pieces: usize) -> (usize, usize) {
+        let len = self.to - self.from;
+        // A cut falls after the first `\n` at or after the byte before it, as `Ingest::seg`'s.
+        let after = |at: usize| if at == 0 { 0 } else { memchr(b'\n', &self.bytes[self.from + at - 1..self.to]).map_or(len, |found| at + found) };
+        (self.from + after(len * piece / pieces), self.from + after(len * (piece + 1) / pieces))
+    }
+
+    /// The `(key, value)` rows with a non-empty key among the lines `from..to`, in order.
+    fn pairs<'a>(&'a self, from: usize, to: usize, mut row: impl FnMut(Field, &'a [u8])) {
+        let value_of = |field: Field| -> &'a [u8] {
+            let at = field.p as usize - self.bytes.as_ptr() as usize;
+            &self.bytes[at..at + field.len]
+        };
+        // SAFETY: whole lines of a segment (`Lookup`).
+        unsafe {
+            tok::Quick::lines::<2>(self.bytes.as_ptr().add(from), to - from, &mut Scratch::new(), |&[key, value]| {
+                if key.len > 0 {
+                    row(key, value_of(value));
+                }
+            })
+        };
+    }
+
+    /// Every `(key, value)` row with a non-empty key.
+    fn rows(&self) -> Vec<(&[u8], &[u8])> {
+        let mut rows = Vec::new();
+        self.pairs(self.from, self.to, |key, value| {
+            let at = key.p as usize - self.bytes.as_ptr() as usize;
+            rows.push((&self.bytes[at..at + key.len], value));
+        });
+        rows
+    }
+
+    /// Piece `piece` of `pieces` of `products.csv`.
+    fn products(&self, piece: usize, pieces: usize) -> ProductRows {
+        let (from, to) = self.piece(piece, pieces);
+        let mut rows = ProductRows::default();
+        rows.numbers.reserve((to - from) / 8);
+        // The name of the row before, most often not this row's: a scan of the few names.
+        let mut last = usize::MAX;
+        self.pairs(from, to, |key, category| {
+            if rows.names.get(last).is_none_or(|name| name != category) {
+                last = rows.names.iter().position(|name| name == category).unwrap_or_else(|| {
+                    rows.names.push(category.to_vec());
+                    rows.names.len() - 1
+                });
+            }
+            // More names than a `u8` holds are too many anyway (`Ctx::categories`); the
+            // count is checked when the pieces are put together.
+            let category = last.min(255) as u8;
+            // SAFETY: a field of a segment has 16 readable bytes.
+            match unsafe { Products::number_at(key.p, key.len) } {
+                Some(number) => rows.numbers.push((number, category)),
+                None => rows.others.push((unsafe { pack_at(key.p, key.len) }, category)),
+            }
+        });
+        rows
+    }
+}
+
+/// The `Ctx` of a window, the pieces of `products.csv` in file order, and `campaigns.csv`.
+fn ctx_of(window: (i64, i64), pieces: &[&ProductRows], campaigns: &Lookup) -> Result<Ctx, String> {
+    // The categories in order of first appearance, as one pass over the rows would list them.
+    let mut names: Vec<&[u8]> = vec![b"unknown"];
+    let mut global: Vec<Vec<usize>> = Vec::with_capacity(pieces.len());
+    for piece in pieces {
+        if piece.names.len() > 255 {
+            return Err("more than 255 categories, at most 255 supported".into());
+        }
+        global.push(
+            piece
+                .names
+                .iter()
+                .map(|name| {
+                    names.iter().position(|known| known == name).unwrap_or_else(|| {
+                        names.push(name);
+                        names.len() - 1
+                    })
+                })
+                .collect(),
+        );
+    }
+    let (categories, rank) = Ctx::categories(&names)?;
+    let numbers = pieces.iter().flat_map(|piece| &piece.numbers).map(|&(number, _)| number as usize + 1).max().unwrap_or(0);
+    let mut products = Products::new(numbers, pieces.iter().map(|piece| piece.others.len()).sum());
+    // In file order: the first row of an ID is the one kept.
+    for (piece, global) in pieces.iter().zip(&global) {
+        for &(number, category) in &piece.numbers {
+            let category = rank[global[category as usize]];
+            if !products.insert_number(number, category) {
+                products.insert(pack(format!("p{number}").as_bytes()), category);
+            }
+        }
+        for &(id, category) in &piece.others {
+            products.insert(id, rank[global[category as usize]]);
+        }
+    }
+    Ctx::with_products(window.0, window.1, categories, products, &campaigns.rows())
+}
+
+/// What `open` leaves: the lookups, the inputs, and when the positional pipeline is to run,
+/// its plan and every worker's lists.
+pub struct Opened {
+    pub ctx: Ctx,
+    pub ingest: Ingest,
+    #[cfg(feature = "pipe-positional")]
+    pub pos: Option<(pos::PosPlan, Vec<pos::PosOut>)>,
+}
+
+/// Pieces `products.csv` is read in.
+const PRODUCT_PIECES: usize = 8;
+
+/// A result a setup task leaves for the others. Every task sets its cells whatever happens,
+/// so a thread that waits for one always gets it.
+struct Cell<T>(OnceLock<T>);
+
+impl<T> Cell<T> {
+    fn new() -> Cell<T> {
+        Cell(OnceLock::new())
+    }
+
+    fn set(&self, value: T) {
+        let _ = self.0.set(value);
+    }
+
+    /// Waits, watching: these are set within a millisecond.
+    fn wait(&self) -> &T {
+        loop {
+            if let Some(value) = self.0.get() {
+                return value;
+            }
+            std::hint::spin_loop();
+        }
+    }
+
+    fn take(self) -> T {
+        self.0.into_inner().expect("its task ran")
+    }
+}
+
+/// The whole inputs stage as one round of `workers` workers. Nothing in it waits for another
+/// part longer than it must:
+///
+/// - one thread lists and opens the input files (`Files::open`), estimates the rows, and
+///   finds the keys of the positional pipeline from a sample (`pos`);
+/// - the others read the manifest and `campaigns.csv`, and `products.csv` in
+///   `PRODUCT_PIECES` pieces;
+/// - each worker builds its own lists for the positional parse as soon as the row estimate
+///   says how large (`pos::out`).
+///
+/// One after another on the calling thread, with only the mapping of the files on a second
+/// one, these were 6 ms of a 21 ms run at 1M events: 3.3 ms for the lookup files, then the
+/// workers' threads, the keys and the lists, each with every other thread idle.
+///
+/// `positional`: whether to prepare the positional pipeline, and if so whether to run it
+/// whatever the sample says (`force`: missing keys are zeros). `keep_open`: whether the input
+/// files may stay open for the run (`Input`).
+pub fn open(data: &Path, workers: usize, positional: Option<bool>, keep_open: bool) -> Result<Opened, String> {
+    #[cfg(not(feature = "pipe-positional"))]
+    let _ = positional;
     let chunk = chunk_bytes();
-    std::thread::scope(|scope| {
-        let files = scope.spawn(|| Files::map(data, chunk));
-        let ctx = load_ctx(data);
-        let files = files.join().expect("the mapping thread panicked");
-        let ctx = ctx?;
-        let ingest = Ingest::with_files(files?, &ctx)?;
-        Ok((ctx, ingest))
+    let files: Cell<Result<Files, String>> = Cell::new();
+    let products: Cell<Result<Lookup, String>> = Cell::new();
+    let pieces: Vec<Cell<Option<ProductRows>>> = (0..PRODUCT_PIECES).map(|_| Cell::new()).collect();
+    let lookups: Cell<Result<((i64, i64), Lookup), String>> = Cell::new();
+    let ctx: Cell<Result<Ctx, String>> = Cell::new();
+    #[cfg(feature = "pipe-positional")]
+    let (shape, keys): (Cell<Option<(pos::PosShape, [usize; 3])>>, Cell<Option<(u64, u64)>>) = (Cell::new(), Cell::new());
+    #[cfg(feature = "pipe-positional")]
+    let scatter = types::parts::mode_from_env();
+    #[cfg(feature = "pipe-positional")]
+    let mut outs: Vec<Option<pos::PosOut>> = (0..workers).map(|_| None).collect();
+    #[cfg(not(feature = "pipe-positional"))]
+    let mut outs: Vec<()> = vec![(); workers];
+    let next = AtomicUsize::new(0);
+    types::par::each(&mut outs, |_worker, _out| {
+        loop {
+            match next.fetch_add(1, Relaxed) {
+                0 => {
+                    let opened = Files::open(data, chunk, keep_open);
+                    types::tl::mark("files open");
+                    #[cfg(feature = "pipe-positional")]
+                    match (&opened, positional) {
+                        (Ok(opened), Some(force)) => {
+                            shape.set(Some((pos::PosShape::of(opened.rows[0]), opened.rows)));
+                            types::tl::mark("shape");
+                            keys.set(pos::keys(&opened.sample, opened.rows[0], force));
+                            types::tl::mark("keys");
+                        }
+                        _ => {
+                            shape.set(None);
+                            keys.set(None);
+                        }
+                    }
+                    files.set(opened);
+                }
+                1 => {
+                    products.set(Lookup::read(data, "products.csv"));
+                    types::tl::mark("products read");
+                }
+                2 => {
+                    lookups.set(window(data).and_then(|window| Ok((window, Lookup::read(data, "campaigns.csv")?))));
+                    types::tl::mark("campaigns read");
+                }
+                task if task < 3 + PRODUCT_PIECES => {
+                    pieces[task - 3].set(products.wait().as_ref().ok().map(|lookup| lookup.products(task - 3, PRODUCT_PIECES)));
+                    types::tl::mark("products piece");
+                }
+                task if task == 3 + PRODUCT_PIECES => {
+                    // The lookups together, once their parts are read.
+                    let rows: Option<Vec<&ProductRows>> = pieces.iter().map(|piece| piece.wait().as_ref()).collect();
+                    ctx.set(match (products.wait(), lookups.wait(), rows) {
+                        (Ok(_), Ok((window, campaigns)), Some(rows)) => ctx_of(*window, &rows, campaigns),
+                        (Err(error), _, _) | (_, Err(error), _) => Err(error.clone()),
+                        (Ok(_), Ok(_), None) => unreachable!("products.csv was read, so its pieces are"),
+                    });
+                    types::tl::mark("ctx");
+                }
+                _ => break,
+            }
+        }
+        #[cfg(feature = "pipe-positional")]
+        if let Some((shape, rows)) = shape.wait() {
+            *_out = Some(pos::out(workers, shape, rows[0], rows[1], scatter));
+            types::tl::mark("lists");
+        }
+    });
+    types::tl::mark("setup round");
+    let files = files.take()?;
+    let ctx = ctx.take()?;
+    let ingest = Ingest::with_files(files, &ctx)?;
+    #[cfg(feature = "pipe-positional")]
+    let pos = match (shape.take(), keys.take()) {
+        (Some((shape, _)), Some(keys)) => Some((ingest.pos_plan(shape, keys), outs.into_iter().map(|out| out.expect("every worker built its lists")).collect())),
+        _ => None,
+    };
+    types::tl::mark("ingest");
+    Ok(Opened {
+        ctx,
+        ingest,
+        #[cfg(feature = "pipe-positional")]
+        pos,
     })
 }
 
@@ -137,10 +395,65 @@ impl ParseOut {
     }
 }
 
-/// A file mapped (and its path, for `Ingest::read`), or a padded copy of a file's last lines.
+/// An input file, or a padded copy of a file's last lines.
 enum Buf {
-    Map(memmap2::Mmap, PathBuf),
+    File(Input),
     Own(Vec<u8>),
+}
+
+/// An input file. It is read with `pread` (`Ingest::read`, `Input::read_at`) and mapped only
+/// if something asks for its bytes as a slice (`buf_bytes`: the classic parse, a line too
+/// long for a read): mapping every file up front was a `mmap` and two page faults a file
+/// before the parse, on the address-space lock the workers' first page faults need.
+struct Input {
+    path: PathBuf,
+    /// Kept open for the run when the files are few (`KEEP_OPEN`): a read is then one system
+    /// call, and no worker opens a file while others parse.
+    file: Option<File>,
+    map: OnceLock<memmap2::Mmap>,
+}
+
+/// Input files kept open at most. More would pass the usual limit of 1,024 descriptors.
+const KEEP_OPEN: usize = 768;
+
+impl Input {
+    /// The file mapped, on first use.
+    fn map(&self) -> &memmap2::Mmap {
+        self.map.get_or_init(|| {
+            let mapped = File::open(&self.path).and_then(|file| {
+                // SAFETY: the inputs are read-only and nothing writes them during the run.
+                unsafe { memmap2::Mmap::map(&file) }
+            });
+            mapped.unwrap_or_else(|error| panic!("{}: {error}", self.path.display()))
+        })
+    }
+
+    /// Bytes `at..at + buf.len()` of the file, which holds them.
+    fn read_at(&self, buf: &mut [u8], at: usize) -> std::io::Result<()> {
+        match &self.file {
+            Some(file) => read_at(file, buf, at),
+            None => read_at(&File::open(&self.path)?, buf, at),
+        }
+    }
+}
+
+/// Bytes `at..at + buf.len()` of `file`, which holds them.
+fn read_at(file: &File, buf: &mut [u8], at: usize) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(file, buf, at as u64)
+    }
+    #[cfg(windows)]
+    {
+        let mut done = 0;
+        while done < buf.len() {
+            match std::os::windows::fs::FileExt::seek_read(file, &mut buf[done..], (at + done) as u64)? {
+                0 => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                read => done += read,
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Bytes `Ingest::read` takes past a segment's cut for its last line; a longer line sends the
@@ -149,11 +462,10 @@ enum Buf {
 const READ_SLACK: usize = 4096;
 
 /// The lines of a buffer that begin in bytes `start..end`: a cut by bytes, so planning reads
-/// (and faults in) none of the file. `Ingest::seg` finds the lines when the segment is parsed,
-/// by the worker that then reads those pages anyway; planned line by line, the cuts cost one
-/// page fault each on the main thread, 5 of the 14 ms the inputs stage took at 20M events on
-/// the x86 box. Byte `start - 1` is readable, byte `limit - 1` is a `\n` no line of the segment
-/// passes, and `PAD` bytes after `limit` are readable.
+/// none of the file but its ends. `Ingest::seg` finds the lines when the segment is parsed, by
+/// the worker that then reads those bytes anyway. Byte `start - 1` is readable, byte
+/// `limit - 1` is a `\n` no line of the segment passes, and `PAD` bytes after `limit` are
+/// readable.
 struct Seg {
     buf: usize,
     start: usize,
@@ -164,24 +476,83 @@ struct Seg {
 type ParseFn = fn(&Ingest, &Ctx, usize, &mut ParseOut);
 type LinksFn = fn(&Ingest) -> Vec<[Id; 2]>;
 
-/// Every input file mapped and cut into segments: what `Ingest` holds that needs no `Ctx`.
+/// Every input file opened and cut into segments: what `Ingest` holds that needs no `Ctx`.
 struct Files {
     bufs: Vec<Buf>,
     events: Vec<Seg>,
     clicks: Vec<Seg>,
     links: Vec<Seg>,
+    /// Estimated lines of the events, the clicks and the links, to size the buffers.
+    rows: [usize; 3],
+    /// The first lines of the largest event segment, as `pos::sample` wants them.
+    #[cfg(feature = "pipe-positional")]
+    sample: Vec<(u64, u64)>,
 }
 
+/// Bytes of a kind's largest segment read to estimate its lines.
+const ROWS_SAMPLE: usize = 64 << 10;
+
 impl Files {
-    fn map(data: &Path, chunk: usize) -> Result<Files, String> {
+    fn open(data: &Path, chunk: usize, keep_open: bool) -> Result<Files, String> {
         let (mut bufs, mut segs) = (Vec::new(), [Vec::new(), Vec::new(), Vec::new()]);
         for (folder, segs) in ["events", "clicks", "links"].into_iter().zip(&mut segs) {
             for path in csv_files(&data.join(folder))? {
-                plan(&path, chunk, &mut bufs, segs)?;
+                let keep = keep_open && bufs.len() < KEEP_OPEN;
+                plan(path, chunk, keep, &mut bufs, segs)?;
             }
         }
         let [events, clicks, links] = segs;
-        Ok(Files { bufs, events, clicks, links })
+        let mut files = Files {
+            bufs,
+            events,
+            clicks,
+            links,
+            rows: [0; 3],
+            #[cfg(feature = "pipe-positional")]
+            sample: Vec::new(),
+        };
+        // The events' sample is also the positional pipeline's, which wants more lines.
+        #[cfg(feature = "pipe-positional")]
+        let event_bytes = pos::SAMPLE_BYTES;
+        #[cfg(not(feature = "pipe-positional"))]
+        let event_bytes = ROWS_SAMPLE;
+        let lines = files.head(&files.events, event_bytes);
+        files.rows[0] = Files::rows(&files.events, &lines);
+        #[cfg(feature = "pipe-positional")]
+        {
+            files.sample = pos::sample(&lines);
+        }
+        files.rows[1] = Files::rows(&files.clicks, &files.head(&files.clicks, ROWS_SAMPLE));
+        files.rows[2] = Files::rows(&files.links, &files.head(&files.links, ROWS_SAMPLE));
+        Ok(files)
+    }
+
+    /// The first whole lines in at most `most` bytes of the largest of `segs`, padded like
+    /// `padded`: a `\n`, the lines, `PAD` zeros. No lines for no segments or a failed read.
+    fn head(&self, segs: &[Seg], most: usize) -> Vec<u8> {
+        let Some(seg) = segs.iter().max_by_key(|seg| seg.end - seg.start) else { return padded(&[]) };
+        // From the byte before the segment, as `Ingest::seg` looks for the first line.
+        let (from, to) = (seg.start - 1, seg.limit.min(seg.start + most));
+        let mut bytes = vec![0u8; to - from];
+        match &self.bufs[seg.buf] {
+            Buf::Own(own) => bytes.copy_from_slice(&own[from..to]),
+            Buf::File(input) => {
+                if input.read_at(&mut bytes, from).is_err() {
+                    return padded(&[]);
+                }
+            }
+        }
+        match (memchr(b'\n', &bytes), memrchr(b'\n', &bytes)) {
+            (Some(first), Some(last)) if first < last => padded(&bytes[first + 1..=last]),
+            _ => padded(&[]),
+        }
+    }
+
+    /// The lines `segs` hold, from the lines in a sample of them (`head`).
+    fn rows(segs: &[Seg], lines: &[u8]) -> usize {
+        let bytes: usize = segs.iter().map(|seg| seg.end - seg.start).sum();
+        let sample = &lines[1..lines.len() - PAD];
+        if sample.is_empty() { 0 } else { bytes * memchr::memchr_iter(b'\n', sample).count() / sample.len() }
     }
 }
 
@@ -216,10 +587,10 @@ pub struct Ingest {
 }
 
 impl Ingest {
-    /// Maps every `*.csv` in `events/`, `clicks/` and `links/` and plans the chunk tasks.
-    /// `crate::open` does this beside `load_ctx`.
+    /// Opens every `*.csv` in `events/`, `clicks/` and `links/` and plans the chunk tasks.
+    /// `crate::open` does this beside the lookups.
     pub fn open(data: &Path, ctx: &Ctx) -> Result<Ingest, String> {
-        Ingest::with_files(Files::map(data, chunk_bytes())?, ctx)
+        Ingest::with_files(Files::open(data, chunk_bytes(), false)?, ctx)
     }
 
     /// The tokenizer `SS_TOK` picks, and the reader `SS_READER` picks.
@@ -261,22 +632,14 @@ impl Ingest {
 
     #[cfg(test)]
     fn open_with(data: &Path, ctx: &Ctx, chunk: usize, parse_fn: ParseFn, links_fn: LinksFn) -> Result<Ingest, String> {
-        Ingest::with(Files::map(data, chunk)?, ctx, parse_fn, links_fn)
+        Ingest::with(Files::open(data, chunk, false)?, ctx, parse_fn, links_fn)
     }
 
     fn with(files: Files, ctx: &Ctx, parse_fn: ParseFn, links_fn: LinksFn) -> Result<Ingest, String> {
         if !(1..=20).contains(&ctx.part_bits) {
             return Err(format!("SS_PART_BITS={}: 1 to 20 supported", ctx.part_bits));
         }
-        let Files { bufs, events, clicks, links } = files;
-        let rows = |segs: &[Seg]| {
-            let bytes: usize = segs.iter().map(|seg| seg.end - seg.start).sum();
-            segs.iter().max_by_key(|seg| seg.end - seg.start).map_or(0, |seg| {
-                let sample = &buf_bytes(&bufs[seg.buf])[seg.start..seg.end.min(seg.start + (256 << 10))];
-                bytes * memchr::memchr_iter(b'\n', sample).count() / sample.len()
-            })
-        };
-        let (event_rows, click_rows, link_rows) = (rows(&events), rows(&clicks), rows(&links));
+        let Files { bufs, events, clicks, links, rows: [event_rows, click_rows, link_rows], .. } = files;
         let mut tasks: Vec<(Seg, bool)> =
             events.into_iter().map(|seg| (seg, false)).chain(clicks.into_iter().map(|seg| (seg, true))).collect();
         tasks.sort_by_key(|(seg, _)| Reverse(seg.end - seg.start));
@@ -351,50 +714,46 @@ impl Ingest {
     /// that passes `READ_SLACK`: the caller takes the mapping (`seg`, then `release`).
     #[cfg(feature = "pipe-positional")]
     fn read(&self, seg: &Seg, buf: &mut Vec<u8>, open: &mut Option<(usize, File)>) -> Option<(*const u8, usize)> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::FileExt;
-            let Buf::Map(_, path) = &self.bufs[seg.buf] else { return None };
-            if !self.pread {
-                return None;
-            }
-            // A worker keeps one file open, the one it read last: chunks come file by file,
-            // so most reads find theirs. Every file kept open would grow the descriptor
-            // table while the workers run, and each growth waits out an RCU grace period (40
-            // ms each for a few hundred files at 20M on the x86 box); thousands would pass
-            // the usual limit.
-            if open.as_ref().is_none_or(|&(buf, _)| buf != seg.buf) {
-                *open = Some((seg.buf, File::open(path).ok()?));
-            }
-            let (_, file) = open.as_ref()?;
-            // From the byte before the segment's first to a little past its cut.
-            let (from, to) = (seg.start - 1, (seg.end + READ_SLACK).min(seg.limit));
-            let bytes = to - from;
-            // The bytes past the read are an earlier read's or zeros: readable, like a
-            // mapping's bytes past a segment.
-            if buf.len() < bytes + PAD {
-                buf.resize(bytes + PAD, 0);
-            }
-            file.read_exact_at(&mut buf[..bytes], from as u64).ok()?;
-            // As `seg`: after the first `\n` at or after byte `start - 1`, to after the first
-            // at or after byte `end - 1`.
-            let start = memchr(b'\n', &buf[..bytes])? + 1;
-            let cut = seg.end - seg.start;
-            let end = cut + memchr(b'\n', &buf[cut..bytes])? + 1;
-            Some((buf.as_ptr().wrapping_add(start), end.saturating_sub(start)))
+        let Buf::File(input) = &self.bufs[seg.buf] else { return None };
+        if !self.pread {
+            return None;
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (seg, buf, open);
-            None
+        let file = match &input.file {
+            Some(file) => file,
+            None => {
+                // The files are too many to keep open (`KEEP_OPEN`), or the process's
+                // descriptor table had no room made for them: growing it while the workers
+                // run waits out an RCU grace period each time (40 ms each for a few hundred
+                // files at 20M on the x86 box). A worker then keeps one file open, the one it
+                // read last: chunks come file by file, so most reads find theirs.
+                if open.as_ref().is_none_or(|&(buf, _)| buf != seg.buf) {
+                    *open = Some((seg.buf, File::open(&input.path).ok()?));
+                }
+                &open.as_ref()?.1
+            }
+        };
+        // From the byte before the segment's first to a little past its cut.
+        let (from, to) = (seg.start - 1, (seg.end + READ_SLACK).min(seg.limit));
+        let bytes = to - from;
+        // The bytes past the read are an earlier read's or zeros: readable, like a
+        // mapping's bytes past a segment.
+        if buf.len() < bytes + PAD {
+            buf.resize(bytes + PAD, 0);
         }
+        read_at(file, &mut buf[..bytes], from).ok()?;
+        // As `seg`: after the first `\n` at or after byte `start - 1`, to after the first
+        // at or after byte `end - 1`.
+        let start = memchr(b'\n', &buf[..bytes])? + 1;
+        let cut = seg.end - seg.start;
+        let end = cut + memchr(b'\n', &buf[cut..bytes])? + 1;
+        Some((buf.as_ptr().wrapping_add(start), end.saturating_sub(start)))
     }
 
     /// Slot `free-early`: a parsed segment's pages of the mapped file go back to the kernel on
     /// the worker that parsed it. Left mapped, the input is unmapped at exit by one thread, a
     /// page-table entry per 4 KB.
     fn release(&self, seg: &Seg) {
-        if types::mem::free_early() && let Buf::Map(map, _) = &self.bufs[seg.buf] {
+        if types::mem::free_early() && let Buf::File(input) = &self.bufs[seg.buf] && let Some(map) = input.map.get() {
             // SAFETY: a read-only file mapping. A neighbour still reading here (its last line,
             // which begins before `start`, or `PAD` bytes past its end) faults the page back
             // in from the page cache.
@@ -405,7 +764,7 @@ impl Ingest {
 
 fn buf_bytes(buf: &Buf) -> &[u8] {
     match buf {
-        Buf::Map(map, _) => map,
+        Buf::File(input) => input.map(),
         Buf::Own(own) => own,
     }
 }
@@ -415,9 +774,11 @@ fn csv_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let error = |error: std::io::Error| format!("{}: {error}", dir.display());
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir).map_err(error)? {
-        let path = entry.map_err(error)?.path();
+        let entry = entry.map_err(error)?;
+        let path = entry.path();
         let name = path.file_name().map_or(&[][..], |name| name.as_encoded_bytes());
-        if name.ends_with(b".csv") && !name.starts_with(b".") && path.is_file() {
+        // The entry's own type where the folder gives it (no system call); a link is followed.
+        if name.ends_with(b".csv") && !name.starts_with(b".") && (entry.file_type().is_ok_and(|kind| kind.is_file()) || path.is_file()) {
             files.push(path);
         }
     }
@@ -425,35 +786,75 @@ fn csv_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// Bytes read from each end of a file to find its header and its last lines.
+const ENDS: usize = 4096;
+
 /// Cuts one file's bytes after the header into segments of `chunk` bytes (`Seg`). The last
-/// lines, from at least `PAD` bytes before the end, go to a padded copy, so no read leaves the
-/// mapping.
-fn plan(path: &Path, chunk: usize, bufs: &mut Vec<Buf>, segs: &mut Vec<Seg>) -> Result<(), String> {
+/// lines, from at least `PAD` bytes before the end, go to a padded copy, so no read of a
+/// segment leaves the file. Only the file's two ends are read: the header's `\n` and the last
+/// lines. `keep`: whether the file stays open for the run.
+fn plan(path: PathBuf, chunk: usize, keep: bool, bufs: &mut Vec<Buf>, segs: &mut Vec<Seg>) -> Result<(), String> {
     let error = |error: std::io::Error| format!("{}: {error}", path.display());
-    let file = File::open(path).map_err(error)?;
-    if file.metadata().map_err(error)?.len() == 0 {
+    let file = File::open(&path).map_err(error)?;
+    let len = file.metadata().map_err(error)?.len() as usize;
+    if len == 0 {
         return Ok(());
     }
-    // SAFETY: the inputs are read-only and nothing writes them during the run.
-    let map = unsafe { memmap2::Mmap::map(&file) }.map_err(error)?;
-    let Some(header) = memchr(b'\n', &map) else { return Ok(()) };
-    let (data, len) = (header + 1, map.len());
-    let tail = if len - data <= PAD { data } else { memrchr(b'\n', &map[data..len - PAD]).map_or(data, |at| data + at + 1) };
+    // The header ends at the first `\n`: in the first read, or the file is read on for it.
+    let mut window = vec![0u8; len.min(ENDS)];
+    read_at(&file, &mut window, 0).map_err(error)?;
+    let (mut header, mut scanned) = (memchr(b'\n', &window), window.len());
+    while header.is_none() && scanned < len {
+        let mut more = vec![0u8; (len - scanned).min(64 << 10)];
+        read_at(&file, &mut more, scanned).map_err(error)?;
+        header = memchr(b'\n', &more).map(|at| scanned + at);
+        scanned += more.len();
+    }
+    let Some(header) = header else { return Ok(()) };
+    let data = header + 1;
+    // `window` holds the file's bytes `from..len`: the whole of a short file, else nothing yet.
+    let mut from = if len <= ENDS { 0 } else { len };
+    // The last lines begin after the last `\n` before the final `PAD` bytes: looked for in a
+    // window of the file's end that grows until it holds one, or reaches the first line.
+    let tail = if len - data <= PAD {
+        data
+    } else {
+        let mut size = ENDS;
+        loop {
+            let start = len.saturating_sub(size).max(data);
+            if start < from {
+                window = vec![0u8; len - start];
+                read_at(&file, &mut window, start).map_err(error)?;
+                from = start;
+            }
+            let first = data.max(from);
+            match memrchr(b'\n', &window[first - from..len - PAD - from]) {
+                Some(at) => break first + at + 1,
+                None if from <= data => break data,
+                None => size *= 8,
+            }
+        }
+    };
     if tail < len {
-        let own = padded(&map[tail..]);
+        if from > tail {
+            window = vec![0u8; len - tail];
+            read_at(&file, &mut window, tail).map_err(error)?;
+            from = tail;
+        }
+        let own = padded(&window[tail - from..]);
         let end = own.len() - PAD;
         segs.push(Seg { buf: bufs.len(), start: 1, end, limit: end });
         bufs.push(Buf::Own(own));
     }
     if data < tail {
-        // `map[data - 1]` and `map[tail - 1]` are `\n`.
+        // Bytes `data - 1` and `tail - 1` of the file are `\n`.
         let mut start = data;
         while start < tail {
             let end = start.saturating_add(chunk).min(tail);
             segs.push(Seg { buf: bufs.len(), start, end, limit: tail });
             start = end;
         }
-        bufs.push(Buf::Map(map, path.to_path_buf()));
+        bufs.push(Buf::File(Input { path, file: keep.then_some(file), map: OnceLock::new() }));
     }
     Ok(())
 }
@@ -462,10 +863,10 @@ fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, task: usize, out: &mut ParseOu
     let (seg, click) = &ingest.tasks[task];
     let (p, len) = ingest.seg(seg);
     #[cfg(all(feature = "reader-populate", target_os = "linux"))]
-    if ingest.populate && let Buf::Map(map, _) = &ingest.bufs[seg.buf] {
+    if ingest.populate && let Buf::File(input) = &ingest.bufs[seg.buf] {
         // One call faults the chunk in, instead of a fault per 64 KB while parsing. A kernel
         // before 5.14 answers EINVAL and the pages fault in as before.
-        let _ = map.advise_range(memmap2::Advice::PopulateRead, seg.start, len);
+        let _ = input.map().advise_range(memmap2::Advice::PopulateRead, seg.start, len);
     }
     let dates = &ingest.dates;
     // SAFETY: `plan` made every task a segment.

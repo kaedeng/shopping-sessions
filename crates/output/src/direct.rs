@@ -1,6 +1,6 @@
-//! Slot `out-direct`: `user_daily` as Parquet written by hand, one row group, one page a
-//! column, uncompressed, no statistics. The file says the same as `out-arrow`'s; it is
-//! shorter and takes far less work:
+//! Slot `out-direct`: both tables as Parquet written by hand, one row group, one page a
+//! column, uncompressed, no statistics. A `user_daily` file says the same as `out-arrow`'s; it
+//! is shorter and takes far less work:
 //!
 //! - `user_id` is a dictionary column. A worker's rows come person by person, so a name goes
 //!   into the dictionary once, when it changes, and the column's values are one run a person:
@@ -14,6 +14,10 @@
 //! Through arrow-rs every value passed through an Arrow array, then a page buffer, then the
 //! file: about 200 MB of buffers for 100 MB of file at 20M events, most of it fresh memory.
 //!
+//! `campaign_daily` is a few thousand rows a part, all PLAIN: the two names with their lengths,
+//! the day, the four counters as they lie. Through arrow-rs the table was a millisecond of a
+//! run of twenty at 1M events, for 28,000 rows.
+//!
 //! The headers and the footer are Thrift's compact protocol (`Compact`), field numbers from
 //! `parquet.thrift`. `tests` reads the files back with arrow-rs and compares them with the
 //! rows and with `out-arrow`'s file; `scripts/check_parquet.py` does it with pyarrow, DuckDB
@@ -25,7 +29,7 @@ use std::path::Path;
 
 use types::Ctx;
 use types::id::{self, Id, SLOW};
-use types::rows::{NO_CATEGORY, UserDaily};
+use types::rows::{CampaignDaily, NO_CATEGORY, UserDaily};
 
 #[cfg(not(target_endian = "little"))]
 compile_error!("out-direct writes the integer columns as the vectors' bytes: little-endian only");
@@ -179,8 +183,11 @@ struct Chunk {
     size: u64,
 }
 
-/// `(name, physical type, repetition, converted type)` of the columns, in file order.
-const COLUMNS: [(&str, i32, i32, Option<i32>); 6] = [
+/// `(name, physical type, repetition, converted type)` of a column.
+type Column = (&'static str, i32, i32, Option<i32>);
+
+/// The columns of `user_daily`, in file order.
+const COLUMNS: [Column; 6] = [
     ("user_id", BYTE_ARRAY, REQUIRED, Some(UTF8)),
     ("day", INT32, REQUIRED, Some(DATE)),
     ("sessions", INT64, REQUIRED, None),
@@ -189,18 +196,30 @@ const COLUMNS: [(&str, i32, i32, Option<i32>); 6] = [
     ("top_category", BYTE_ARRAY, OPTIONAL, Some(UTF8)),
 ];
 
-/// The `FileMetaData` for `rows` rows in `chunks` (none for an empty file: the schema alone).
-fn footer(rows: usize, chunks: &[Chunk]) -> Vec<u8> {
+/// The columns of `campaign_daily`, in file order.
+const CAMPAIGN_COLUMNS: [Column; 7] = [
+    ("campaign_id", BYTE_ARRAY, REQUIRED, Some(UTF8)),
+    ("channel", BYTE_ARRAY, REQUIRED, Some(UTF8)),
+    ("day", INT32, REQUIRED, Some(DATE)),
+    ("sessions", INT64, REQUIRED, None),
+    ("purchasing_sessions", INT64, REQUIRED, None),
+    ("revenue_cents", INT64, REQUIRED, None),
+    ("assisted_sessions", INT64, REQUIRED, None),
+];
+
+/// The `FileMetaData` for `rows` rows of `columns` in `chunks` (none for an empty file: the
+/// schema alone).
+fn footer(columns: &[Column], rows: usize, chunks: &[Chunk]) -> Vec<u8> {
     let mut t = Compact::new();
     t.i32(1, 1);
     // The schema: the root, then a leaf a column.
-    t.list(2, STRUCT, COLUMNS.len() + 1);
+    t.list(2, STRUCT, columns.len() + 1);
     t.element();
     t.i32(3, REQUIRED);
     t.string(4, b"arrow_schema");
-    t.i32(5, COLUMNS.len() as i32);
+    t.i32(5, columns.len() as i32);
     t.close();
-    for (name, kind, repetition, converted) in COLUMNS {
+    for &(name, kind, repetition, converted) in columns {
         t.element();
         t.i32(1, kind);
         t.i32(3, repetition);
@@ -253,8 +272,8 @@ fn footer(rows: usize, chunks: &[Chunk]) -> Vec<u8> {
     }
     t.string(6, b"shopping-sessions out-direct");
     // ColumnOrder, a union whose field 1 is TypeDefinedOrder, an empty struct.
-    t.list(7, STRUCT, COLUMNS.len());
-    for _ in COLUMNS {
+    t.list(7, STRUCT, columns.len());
+    for _ in columns {
         t.element();
         t.open(1);
         t.close();
@@ -387,11 +406,60 @@ fn write(path: &Path, ctx: &Ctx, table: &UserDaily) -> Result<(), String> {
         pending.extend_from_slice(&header);
         pending.extend_from_slice(&body);
     }
-    let footer = footer(rows, &chunks);
+    let footer = footer(&COLUMNS, rows, &chunks);
     pending.extend_from_slice(&footer);
     pending.extend_from_slice(&(footer.len() as u32).to_le_bytes());
     pending.extend_from_slice(b"PAR1");
     file.write_all(&pending).map_err(io)
+}
+
+/// Writes `rows` to `folder/part-{part}.parquet`: the whole file built in one buffer and
+/// written with one `write`.
+pub fn campaign_daily(folder: &Path, part: usize, ctx: &Ctx, rows: &CampaignDaily) -> Result<(), String> {
+    let path = folder.join(format!("part-{part}.parquet"));
+    let file = campaign_file(ctx, rows).map_err(|error| format!("{}: {error}", path.display()))?;
+    File::create(&path).and_then(|mut to| to.write_all(&file)).map_err(|error| format!("{}: {error}", path.display()))
+}
+
+/// A `campaign_daily` file's bytes.
+fn campaign_file(ctx: &Ctx, table: &CampaignDaily) -> Result<Vec<u8>, String> {
+    let CampaignDaily { campaign, day, sessions, purchasing_sessions, revenue_cents, assisted_sessions } = table;
+    let rows = campaign.len();
+    // A name is its length and its bytes; the longest sizes the two name pages.
+    let longest = ctx.campaigns.iter().map(|(id, channel)| id.len().max(channel.len())).max().unwrap_or(0);
+    let mut file: Vec<u8> = Vec::with_capacity(rows * (2 * (4 + longest) + 4 + 4 * 8) + 1024);
+    file.extend_from_slice(b"PAR1");
+    let mut chunks: Vec<Chunk> = Vec::new();
+    if rows > 0 {
+        let mut page = |file: &mut Vec<u8>, name: &'static str, kind: i32, body: &[u8]| -> Result<(), String> {
+            let header = page_header(DATA_PAGE, body.len(), rows, PLAIN)?;
+            chunks.push(Chunk { name, kind, encodings: &[PLAIN, RLE], dictionary: None, data: file.len() as u64, size: (header.len() + body.len()) as u64 });
+            file.extend_from_slice(&header);
+            file.extend_from_slice(body);
+            Ok(())
+        };
+        let mut names: Vec<u8> = Vec::with_capacity(rows * (4 + longest));
+        for (column, which) in [("campaign_id", 0), ("channel", 1)] {
+            names.clear();
+            for &at in campaign {
+                let (id, channel) = &ctx.campaigns[at as usize];
+                let name = if which == 0 { id } else { channel };
+                names.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                names.extend_from_slice(name);
+            }
+            page(&mut file, column, BYTE_ARRAY, &names)?;
+        }
+        page(&mut file, "day", INT32, bytes_of(day))?;
+        page(&mut file, "sessions", INT64, bytes_of(sessions))?;
+        page(&mut file, "purchasing_sessions", INT64, bytes_of(purchasing_sessions))?;
+        page(&mut file, "revenue_cents", INT64, bytes_of(revenue_cents))?;
+        page(&mut file, "assisted_sessions", INT64, bytes_of(assisted_sessions))?;
+    }
+    let footer = footer(&CAMPAIGN_COLUMNS, rows, &chunks);
+    file.extend_from_slice(&footer);
+    file.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+    file.extend_from_slice(b"PAR1");
+    Ok(file)
 }
 
 #[cfg(all(test, feature = "out-arrow"))]

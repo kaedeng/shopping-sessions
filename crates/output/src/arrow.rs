@@ -3,7 +3,7 @@
 //!
 //! SLOT CONTRACT (every writer in this crate has exactly these two functions):
 //!   pub fn user_daily(folder: &Path, worker: usize, ctx: &Ctx, rows: UserDaily) -> Result<(), String>
-//!   pub fn campaign_daily(folder: &Path, ctx: &Ctx, rows: CampaignDaily) -> Result<(), String>
+//!   pub fn campaign_daily(folder: &Path, part: usize, ctx: &Ctx, rows: CampaignDaily) -> Result<(), String>
 
 use std::fs::File;
 use std::io::Write;
@@ -41,11 +41,11 @@ pub fn user_daily(folder: &Path, worker: usize, ctx: &Ctx, rows: UserDaily) -> R
     )
 }
 
-pub fn campaign_daily(folder: &Path, ctx: &Ctx, rows: CampaignDaily) -> Result<(), String> {
+pub fn campaign_daily(folder: &Path, part: usize, ctx: &Ctx, rows: CampaignDaily) -> Result<(), String> {
     let CampaignDaily { campaign, day, sessions, purchasing_sessions, revenue_cents, assisted_sessions } = rows;
     let campaign = PrimitiveArray::<UInt32Type>::new(campaign.into(), None);
     write(
-        &folder.join("part-0.parquet"),
+        &folder.join(format!("part-{part}.parquet")),
         vec![
             ("campaign_id", names(campaign.clone(), ctx.campaigns.iter().map(|(id, _)| id.as_slice()))?),
             ("channel", names(campaign, ctx.campaigns.iter().map(|(_, channel)| channel.as_slice()))?),

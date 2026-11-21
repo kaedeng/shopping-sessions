@@ -23,6 +23,7 @@ pub mod scramble;
 #[cfg(feature = "table-linear")]
 pub mod table;
 pub mod time;
+pub mod tl;
 
 pub use ctx::Ctx;
 pub use id::Id;

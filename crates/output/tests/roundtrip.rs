@@ -119,8 +119,8 @@ fn both_tables_read_back_exactly() {
     };
     let full = expected(&rows, &["organic", "c_1", "c_2", "c_1"], &["organic", "search", "social", "search"]);
     let empty = expected(&CampaignDaily::default(), &[], &[]);
-    output::campaign_daily(&campaigns, &ctx, rows).unwrap();
-    output::campaign_daily(&no_campaigns, &ctx, CampaignDaily::default()).unwrap();
+    output::campaign_daily(&campaigns, 0, &ctx, rows).unwrap();
+    output::campaign_daily(&no_campaigns, 0, &ctx, CampaignDaily::default()).unwrap();
     for (folder, expected) in [(&campaigns, full), (&no_campaigns, empty)] {
         let (actual, logical) = read(&folder.join("part-0.parquet"));
         assert_eq!(actual, expected);

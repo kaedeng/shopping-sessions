@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 
-use memchr::memrchr;
 use types::id::pack_at;
 use types::parts::{Combine, Mode, Parts, Plain};
 use types::pos::{POS_ODD_USER, POS_VALID, PosClick, PosEvent, PosPay};
@@ -50,7 +49,7 @@ const DECODES: &[&str] = &["wide", "row"];
 const DECODES: &[&str] = &["row"];
 
 /// Bytes of the first event chunk the key search reads, and the rows it takes from them.
-const SAMPLE_BYTES: usize = 512 << 10;
+pub(crate) const SAMPLE_BYTES: usize = 512 << 10;
 const SAMPLE_ROWS: usize = 5000;
 /// Fewer sampled rows than this say nothing about a numbering: the classic pipeline runs.
 const MIN_ROWS: usize = 256;
@@ -58,6 +57,85 @@ const MIN_ROWS: usize = 256;
 const WHALES: u64 = 8;
 /// A user number's person must be below this to fit `u32` with its alias.
 const PERSON_LIMIT: u64 = 1 << 22;
+
+/// The shape of the dense arrays: what the row estimate alone decides, so the workers' lists
+/// can be built while the keys are still being found (`crate::open`).
+#[derive(Clone, Copy)]
+pub struct PosShape {
+    pub shift: u32,
+    pub parts: usize,
+    pub persons: u32,
+    pub click_shift: u32,
+    pub click_parts: usize,
+}
+
+impl PosShape {
+    /// For about `event_rows` event lines.
+    pub(crate) fn of(event_rows: usize) -> PosShape {
+        let rows = event_rows.max(1);
+        // Event numbers are below the number of distinct events, so below the lines.
+        let room = rows + rows / 8 + 4096;
+        let shift = (room / 1024).next_power_of_two().trailing_zeros().clamp(12, 16);
+        // `SS_POS_SHIFT`: the numbers per partition as a power of two, for measurements.
+        let shift = (types::env::number("SS_POS_SHIFT", shift as usize) as u32).clamp(10, 16);
+        let persons = (rows / 8).clamp(4096, PERSON_LIMIT as usize);
+        let click_shift = (persons / 1024).next_power_of_two().trailing_zeros().max(6);
+        PosShape { shift, parts: room.div_ceil(1 << shift), persons: persons as u32, click_shift, click_parts: persons.div_ceil(1 << click_shift) }
+    }
+}
+
+/// A worker's buffers for the positional parse, for `workers` workers and about `event_rows`
+/// event lines and `click_rows` click lines; `scatter` as `types::parts::mode_from_env`.
+pub(crate) fn out(workers: usize, shape: &PosShape, event_rows: usize, click_rows: usize, scatter: Option<usize>) -> PosOut {
+    // A partition holds `1 << shift` event numbers and a few percent more lines; a quarter
+    // to spare, as workers pull chunks unevenly.
+    let room = (1usize << shape.shift) * 9 / 8 / workers * 5 / 4 + 64;
+    // The persons in use are about a 30th of the events, far fewer than the lists allow.
+    let lists_in_use = ((event_rows / 30) >> shape.click_shift).max(1);
+    let click_room = click_rows / workers / lists_in_use * 5 / 4 + 64;
+    PosOut {
+        events: Parts::new(shape.parts, room, scatter),
+        pays: Parts::new(shape.parts, room / 16 + 32, scatter),
+        clicks: Parts::new(shape.click_parts, click_room, scatter),
+        odd_events: Vec::new(),
+        odd_users: Vec::new(),
+        odd_clicks: Vec::new(),
+        scratch: Scratch::new(),
+        input: Vec::new(),
+        file: None,
+    }
+}
+
+/// (event half, user half) of up to `SAMPLE_ROWS` of `lines` whose two IDs are spelled the
+/// generator's way (`types::scramble::half`). `lines` is a padded buffer (`crate::padded`):
+/// whole event lines from its second byte to `PAD` bytes before its end.
+pub(crate) fn sample(lines: &[u8]) -> Vec<(u64, u64)> {
+    let mut rows = Vec::new();
+    // SAFETY: whole lines of a padded buffer; the fields are inside it.
+    unsafe {
+        crate::tok::Quick::lines::<7>(lines.as_ptr().add(1), lines.len() - 1 - crate::PAD, &mut Scratch::new(), |fields| {
+            let (id, user) = (fields[0], fields[1]);
+            if rows.len() < SAMPLE_ROWS
+                && let Some(event) = scramble::canonical_at(id.p, id.len, b'e')
+                && let Some(user) = scramble::canonical_at(user.p, user.len, b'u')
+            {
+                rows.push((scramble::half(event), scramble::half(user)));
+            }
+        })
+    };
+    rows
+}
+
+/// The keys `sample` gives (`find_keys`), or `None` when the rows do not carry the
+/// generator's numbering: then the classic pipeline runs. With `force`, any sample will do
+/// and missing keys are zeros: every result is still exact, since nothing downstream trusts a
+/// key (tests run the fixtures this way).
+pub(crate) fn keys(sample: &[(u64, u64)], event_rows: usize, force: bool) -> Option<(u64, u64)> {
+    if sample.len() < MIN_ROWS && !force {
+        return None;
+    }
+    find_keys(sample, event_rows).or(force.then_some((0, 0)))
+}
 
 /// The keys and the shape of the dense arrays.
 pub struct PosPlan {
@@ -135,8 +213,11 @@ impl Link {
 fn links_with<T: Tok>(ingest: &Ingest) -> Vec<Link> {
     let mut links = Vec::with_capacity(ingest.link_rows + 16);
     let mut scratch = Scratch::new();
+    // Read like the parse's chunks (`Ingest::read`), the mapping only where that cannot be.
+    let (mut input, mut file) = (Vec::new(), None);
     for seg in &ingest.links {
-        let (p, len) = ingest.seg(seg);
+        let read = ingest.read(seg, &mut input, &mut file);
+        let (p, len) = read.unwrap_or_else(|| ingest.seg(seg));
         // SAFETY: `plan` made it a segment, and a segment's fields have 16 bytes after them.
         unsafe {
             T::lines::<2>(p, len, &mut scratch, |&[a, b]| {
@@ -147,7 +228,9 @@ fn links_with<T: Tok>(ingest: &Ingest) -> Vec<Link> {
                 }
             })
         };
-        ingest.release(seg);
+        if read.is_none() {
+            ingest.release(seg);
+        }
     }
     links
 }
@@ -286,65 +369,20 @@ impl<T: Copy + Default> Pending<T> {
 }
 
 impl Ingest {
-    /// The keys, found from the first rows of the largest event chunk, and the arrays' shape;
-    /// `None` when the rows do not carry the generator's numbering (then the classic pipeline
-    /// runs). With `force`, any sample will do and missing keys are zeros: every result is
-    /// still exact, since nothing downstream trusts a key (tests run the fixtures this way).
-    pub fn pos_plan(&self, ctx: &Ctx, force: bool) -> Option<PosPlan> {
-        let sample = self.pos_sample();
-        if sample.len() < MIN_ROWS && !force {
-            return None;
-        }
-        let keys = find_keys(&sample, self.event_rows);
-        if keys.is_none() && !force {
-            return None;
-        }
-        let (user_key, event_key) = keys.unwrap_or((0, 0));
-        let rows = self.event_rows.max(1);
-        // Event numbers are below the number of distinct events, so below the lines.
-        let room = rows + rows / 8 + 4096;
-        let shift = (room / 1024).next_power_of_two().trailing_zeros().clamp(12, 16);
-        // `SS_POS_SHIFT`: the numbers per partition as a power of two, for measurements.
-        let shift = (types::env::number("SS_POS_SHIFT", shift as usize) as u32).clamp(10, 16);
-        let persons = (rows / 8).clamp(4096, PERSON_LIMIT as usize);
-        let click_shift = (persons / 1024).next_power_of_two().trailing_zeros().max(6);
-        let _ = ctx;
-        Some(PosPlan {
+    /// The plan for `shape` and the keys `keys` found (`crate::open`).
+    pub(crate) fn pos_plan(&self, shape: PosShape, (user_key, event_key): (u64, u64)) -> PosPlan {
+        PosPlan {
             user_key,
             event_key,
-            shift,
-            parts: room.div_ceil(1 << shift),
-            persons: persons as u32,
-            click_shift,
-            click_parts: persons.div_ceil(1 << click_shift),
+            shift: shape.shift,
+            parts: shape.parts,
+            persons: shape.persons,
+            click_shift: shape.click_shift,
+            click_parts: shape.click_parts,
             wide: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "wide",
             // The fused decode finds a date among the table's months, one step each.
             fused: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "fused" && self.few_months(),
-        })
-    }
-
-    /// (event half, user half) of up to `SAMPLE_ROWS` lines whose two IDs are spelled the
-    /// generator's way (`types::scramble::half`).
-    fn pos_sample(&self) -> Vec<(u64, u64)> {
-        let mut rows = Vec::new();
-        let Some((seg, _)) = self.tasks.iter().find(|(_, click)| !click) else { return rows };
-        let (p, len) = self.seg(seg);
-        // SAFETY: `seg` returned whole lines of a mapped or owned buffer.
-        let bytes = unsafe { std::slice::from_raw_parts(p, len) };
-        let len = if len > SAMPLE_BYTES { memrchr(b'\n', &bytes[..SAMPLE_BYTES]).map_or(0, |at| at + 1) } else { len };
-        // SAFETY: whole lines of a segment; the fields are inside it.
-        unsafe {
-            crate::tok::Quick::lines::<7>(p, len, &mut Scratch::new(), |fields| {
-                let (id, user) = (fields[0], fields[1]);
-                if rows.len() < SAMPLE_ROWS
-                    && let Some(event) = scramble::canonical_at(id.p, id.len, b'e')
-                    && let Some(user) = scramble::canonical_at(user.p, user.len, b'u')
-                {
-                    rows.push((scramble::half(event), scramble::half(user)));
-                }
-            })
-        };
-        rows
+        }
     }
 
     /// Whether the date table spans few enough calendar months for the fused decode.
@@ -363,27 +401,6 @@ impl Ingest {
         return links_with::<crate::tok::Fused>(self);
         #[cfg(not(all(feature = "tok-shape", target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2")))]
         links_with::<Scalar>(self)
-    }
-
-    /// A worker's buffers for the positional parse.
-    pub fn pos_out(&self, ctx: &Ctx, plan: &PosPlan) -> PosOut {
-        // A partition holds `1 << shift` event numbers and a few percent more lines; a quarter
-        // to spare, as workers pull chunks unevenly.
-        let room = (1usize << plan.shift) * 9 / 8 / ctx.workers * 5 / 4 + 64;
-        // The persons in use are about a 30th of the events, far fewer than the lists allow.
-        let lists_in_use = ((self.event_rows / 30) >> plan.click_shift).max(1);
-        let click_room = self.click_rows / ctx.workers / lists_in_use * 5 / 4 + 64;
-        PosOut {
-            events: Parts::new(plan.parts, room, self.scatter),
-            pays: Parts::new(plan.parts, room / 16 + 32, self.scatter),
-            clicks: Parts::new(plan.click_parts, click_room, self.scatter),
-            odd_events: Vec::new(),
-            odd_users: Vec::new(),
-            odd_clicks: Vec::new(),
-            scratch: Scratch::new(),
-            input: Vec::new(),
-            file: None,
-        }
     }
 
     /// Parses chunk `task` (`0..tasks()`) into `out`. Called concurrently, one `out` per worker.
