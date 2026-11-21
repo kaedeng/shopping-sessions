@@ -116,6 +116,40 @@ impl PosOut {
 
 pub(crate) type PosFn = fn(&Ingest, &Ctx, &PosPlan, usize, &mut PosOut);
 
+/// One line of the links files with both sides non-empty.
+#[derive(Clone, Copy)]
+pub struct Link {
+    pub ids: [Id; 2],
+    /// Each ID's scrambled value when it is spelled the generator's way
+    /// (`types::scramble::canonical_at`), `Link::ODD` otherwise: read from the text, where
+    /// `canonical_packed` would unpack the ID again.
+    pub scrambled: [u64; 2],
+}
+
+impl Link {
+    pub const ODD: u64 = u64::MAX;
+}
+
+fn links_with<T: Tok>(ingest: &Ingest) -> Vec<Link> {
+    let mut links = Vec::with_capacity(ingest.link_rows + 16);
+    let mut scratch = Scratch::new();
+    for seg in &ingest.links {
+        let (p, len) = ingest.seg(seg);
+        // SAFETY: `plan` made it a segment, and a segment's fields have 16 bytes after them.
+        unsafe {
+            T::lines::<2>(p, len, &mut scratch, |&[a, b]| {
+                let ids = [pack_at(a.p, a.len), pack_at(b.p, b.len)];
+                if (ids[0] != 0) & (ids[1] != 0) {
+                    let value = |field: Field| scramble::canonical_at(field.p, field.len, b'u').unwrap_or(Link::ODD);
+                    links.push(Link { ids, scrambled: [value(a), value(b)] });
+                }
+            })
+        };
+        ingest.release(seg);
+    }
+    links
+}
+
 /// The campaign IDs of at most 8 bytes by their bytes, for the fused click parse: a multiply
 /// and a probe, where the row code packs the ID (`pack_at`) and hashes it. An ID's bytes are a
 /// word with zeros after them and its length, so equal entries are equal IDs whatever the
@@ -317,6 +351,16 @@ impl Ingest {
         return self.dates.few_months();
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq")))]
         false
+    }
+
+    /// `links` for the positional pipeline: every well-formed line of every links file with
+    /// both sides non-empty, each ID with its scrambled value. The lines are read by shape
+    /// where the build has it (`tok::fused::pair_shape`).
+    pub fn pos_links(&self) -> Vec<Link> {
+        #[cfg(all(feature = "tok-shape", target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2"))]
+        return links_with::<crate::tok::Fused>(self);
+        #[cfg(not(all(feature = "tok-shape", target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2")))]
+        links_with::<Scalar>(self)
     }
 
     /// A worker's buffers for the positional parse.

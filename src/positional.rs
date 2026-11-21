@@ -24,7 +24,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use ingest::Ingest;
-use ingest::pos::{PosOut, PosPlan};
+use ingest::pos::{Link, PosOut, PosPlan};
 use sessions::{Agg, Click};
 use types::hash::person_hash;
 use types::par;
@@ -96,11 +96,11 @@ struct Inner {
 }
 
 impl Links {
-    fn build(pairs: &[[Id; 2]], plan: &PosPlan) -> Links {
+    fn build(pairs: &[Link], plan: &PosPlan) -> Links {
         let persons = plan.persons as usize;
-        let number = |id: Id| {
-            scramble::canonical_packed(id, b'u')
-                .map(|scrambled| scramble::number(scrambled, plan.user_key))
+        let number = |scrambled: u64| {
+            (scrambled != Link::ODD)
+                .then(|| scramble::number(scrambled, plan.user_key))
                 .filter(|&number| number >> ALIAS_BITS < persons as u64)
                 .map(|number| number as u32)
         };
@@ -111,11 +111,9 @@ impl Links {
         // A person's mask grows from its first link by every link that touches it. A link that
         // touches none of it yet is set apart: a later one may join the two.
         let mut apart: Vec<u32> = Vec::new();
-        for &pair in pairs {
-            if pair.contains(&0) {
-                continue;
-            }
-            let [x, y] = pair.map(number);
+        for link in pairs {
+            let pair = link.ids;
+            let [x, y] = link.scrambled.map(number);
             match (x, y) {
                 (Some(x), Some(y))
                     if x >> ALIAS_BITS == y >> ALIAS_BITS && (x & ALIAS_MASK) < MASK_ALIASES && (y & ALIAS_MASK) < MASK_ALIASES =>
@@ -316,7 +314,7 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
     let mut parsed: Vec<PosOut> = par::init(ctx.workers, parallel_alloc, |_| ingest.pos_out(ctx, plan));
     let links = OnceLock::new();
     par::run(&mut parsed, ingest.tasks() + 1, |_, out, task| match task {
-        0 => drop(links.set(Links::build(&ingest.links(), plan))),
+        0 => drop(links.set(Links::build(&ingest.pos_links(), plan))),
         _ => ingest.pos_parse(ctx, plan, task - 1, out),
     });
     let links = links.get().expect("task 0 ran");

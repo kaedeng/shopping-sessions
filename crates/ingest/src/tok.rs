@@ -558,8 +558,29 @@ pub(crate) mod fused {
         })
     }
 
-    /// The shapes as a tokenizer, for the tests to compare with `Scalar`.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// The line of two fields at `line` (a links line), when it ends within 64 bytes, its
+    /// first field is not empty and the quotes are wrapping pairs.
+    ///
+    /// # Safety
+    /// 64 bytes readable at `line`.
+    #[inline(always)]
+    pub(crate) unsafe fn pair_shape(line: *const u8) -> Option<Line<2>> {
+        let (commas, newlines, quotes) = unsafe { masks(line) };
+        let stops = commas | newlines;
+        let (p1, rest) = next(stops);
+        let end = rest & rest.wrapping_neg();
+        let p2 = rest.trailing_zeros() as usize;
+        let before = end.wrapping_sub(1);
+        let (w, pairs) = wrapped(quotes & before, stops & (before | end));
+        if !((newlines & end != 0) & (newlines & before == 0) & pairs) {
+            return None;
+        }
+        let (q0, q1) = ((w & 1) as usize, (w >> 1 & 1) as usize);
+        Some(Line { start: [q0, p1 + 1 + q1], len: [p1 - 2 * q0, p2 - p1 - 1 - 2 * q1], next: p2 + 1 })
+    }
+
+    /// The shapes as a tokenizer: for the links (`pos::Ingest::pos_links`), and for the tests
+    /// to compare every shape with `Scalar`.
     pub(crate) struct Fused;
 
     impl Tok for Fused {
@@ -567,7 +588,7 @@ pub(crate) mod fused {
             let mut at = 0;
             while at < len {
                 // SAFETY: the windows are readable where the shapes are asked for, and a
-                // `[Field; N]` is a `[Field; 7]` or a `[Field; 4]` in the arm that says so.
+                // `[Field; N]` is the array of the arm's size in the arm that says so.
                 let next = unsafe {
                     let line = p.add(at);
                     match N {
@@ -577,6 +598,10 @@ pub(crate) mod fused {
                         }),
                         4 => click_shape(line).map(|shape| {
                             row(&*(&shape.fields(line) as *const [Field; 4]).cast::<[Field; N]>());
+                            shape.next
+                        }),
+                        2 => pair_shape(line).map(|shape| {
+                            row(&*(&shape.fields(line) as *const [Field; 2]).cast::<[Field; N]>());
                             shape.next
                         }),
                         _ => None,
