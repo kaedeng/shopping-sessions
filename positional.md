@@ -1,6 +1,6 @@
 # The positional pipeline
 
-On generated data the binary now runs a second pipeline, `src/positional.rs`, and keeps the earlier one ("classic": parse, dedup and person scatter, sessions) as the fallback for any dataset the new one does not recognise. This file says why it exists, how it works, why its output cannot differ from the classic pipeline's, what was measured, and what was tried and dropped. `decisions.md` has the one-line picks; the slots are `pipe-positional`, `pos-fused` (with `tok-shape` and `pos-wide` behind it) and `attr-interval`.
+On generated data the binary now runs a second pipeline, `src/positional.rs`, and keeps the earlier one ("classic": parse, dedup and person scatter, sessions) as the fallback for any dataset the new one does not recognise. This file says why it exists, how it works, why its output cannot differ from the classic pipeline's, what was measured, and what was tried and dropped. `decisions.md` has the one-line picks; the slots are `pipe-positional`, `pos-fused` (with `tok-shape` and `pos-wide` behind it), `attr-interval` and `out-direct`.
 
 ## Why
 
@@ -19,8 +19,13 @@ So with the event key, an `event_id` is the row's index in a table that is dedup
 2. **Parse** (`ingest::pos`). One 16-byte `PosEvent` per event line into the list of its number's partition, a range of 2^12 to 2^16 numbers; a valid purchase's `pay` beside it; a click into the list of its person's range. The links are read beside the parse. A worker reads each chunk with one `pread` into a buffer it keeps (`Ingest::read`); the mapping is the fallback.
    - `pos-fused`, the pick (`pos::wide::fused`): no tokenizer and no fields. Per line, scalar code finds the separators (two 64-byte windows for an event line: the first three commas, then three commas and the newline; one window for a click line), checks nothing else, and copies what the decode needs: each window's separator and quote bits, and the raw bytes at the fields as words. That is 88 instructions a line. Per 8 rows the decode does the rest in registers: the quote rules (`pairs`: one subtraction shows every quote is one of a wrapping pair), where each field starts and how long it is, the fields' words with a wrapping quote shifted off (`cut`), the dates found among the table's calendar months (`Dates::date_wide`, no lookup), both IDs, `ts` in all three forms, `ingest_ts`, and for clicks the `click_id` packed (`types::id::wide::pack`). A row that is plainly ordinary becomes a record straight from the registers. A purchase keeps that record and has only its price and product read row by row. Every other row (dirty, odd, not of the usual shape) is tokenized again from its line's offset and goes through the row function `event_row`.
    - `pos-wide` and `tok-shape`, kept as `SS_POS_DECODE=wide`: the same kernels fed by a tokenizer (`Shape`: the two windows, as fields) and a collector that copies each field's words.
-3. **Place** (`place`). Each partition writes its rows into a 16-byte slot per event number, keeping the copy with the smallest `ingest`; an invalid kept copy leaves no event. Then it lists the kept purchases and the runs: stretches of the table whose events are one person's, read 4 slots a step (a step whose slots all continue the open run is taken from the registers). Each click range is grouped by person with a counting scatter. The links are read by shape, each ID with its scrambled value (`Ingest::pos_links`), and become alias masks grown in one pass (`Links::build`): a person's mask starts with its first link and takes every link that touches it; what stays apart after a fixpoint is a second component, and that person goes to the classic lane.
-4. **Sessions**, partition by partition: a run goes straight through `sessions::positional::person`: the gaps, the purchases, the credit and the counters of the classic code, with the assists counted per stretch of sessions (`attr-interval`) instead of once per session. A run that crosses partitions belongs to the one it starts in.
+3. **Clicks and links.** Each click range (the persons `r << click_shift ..`) is grouped by person with a counting scatter into its stretch of one array that holds every click, with one end position per person (`Grouped`, `group_clicks`). Persons are numbered largest first, so the first range holds a fifth of all the clicks: a range with more than a 16th of them is grouped by all workers together, each counting and scattering its own list to the positions the serial order would give (`group_clicks_wide`). The links are read by shape, each ID with its scrambled value (`Ingest::pos_links`), and become alias masks grown in one pass (`Links::build`): a person's mask starts with its first link and takes every link that touches it; what stays apart after a fixpoint is a second component, and that person goes to the classic lane.
+4. **Place and sessions, one task per partition** (`fused_stages`, `Fused::partition`). The task writes the partition's rows into a 16-byte slot per event number in the worker's own 256 KB of slots, keeping the copy with the smallest `ingest` (`place_rows`; an invalid kept copy leaves no event, and the kept purchases are listed in slot order through a bit per slot). It reads the slots 4 a step into two columns and the runs, the stretches whose events are one person's (`scan`). Then, while the slots are in cache, every run but the partition's first and last goes straight through `sessions::positional::person`: the gaps, the purchases, the credit and the counters of the classic code, with the assists counted per stretch of sessions (`attr-interval`). There is no table of all event numbers.
+   - A run that crosses into the next partition is its partition's last and the next one's first: those two runs of every partition are set aside with their events (`Edge`) and joined afterwards, a task per person (`Fused::joined`; the whales are all of this kind).
+   - A person whose events are two stretches with other persons' between is found when its second run is taken (a byte per person, set atomically). Its first run is in a worker's counters by then, so the fused stages return with nothing kept and the three stages they replaced run from the same lists (`split_stages`: one table of all event numbers, the runs joined and judged on one thread, then the sessions). On generated data that never happens; the spoiled datasets of `pos_check.sh` all take that path.
+5. **Classic lane, then output.** The rows of everyone not in the fast lane go by person hash into 64 buckets, each worker filling its own, and through `sessions::bucket_stretch`. Each worker writes its `user_daily` rows as one Parquet file by hand (`output::direct`): the rows are already columns, so the file is the page and column headers and the footer around them, with `user_id` written once per run of equal ids (a dictionary page and RLE runs) and the integer columns copied as they lie. `campaign_daily` (28K rows) stays with arrow-rs, summed and written by a thread of its own meanwhile.
+
+The workers are threads kept for the whole run (`types::par`, the pool), started once the inputs are mapped. Nothing in a parallel stage allocates from the system, spawns a thread or unmaps: see "What cost time and was not work" below.
 
 ## Why the output is the classic pipeline's
 
@@ -50,8 +55,12 @@ Checked by:
 | `SS_POS_TOK` | `shape`, `mask`, `scalar` | The tokenizer of `wide` and `row`. The classic pipeline keeps `SS_TOK`'s, so comparing the two pipelines also compares two tokenizers |
 | `SS_POS_READER` | `pread`, `mmap` | How the positional parse gets a chunk's bytes: read into the worker's buffer, or through the mapping |
 | `SS_POS_SHIFT` | 10 to 16 | Event numbers per partition as a power of two, for measurements; the default follows the row count |
+| `SS_POS_STAGES` | `fused`, `split` | A partition placed and its sessions cut in one task, or the table placed whole and then read (also what `fused` falls back to) |
+| `SS_POS_CLICK_WIDE` | a number of clicks, default 65,536 | A click range is grouped by all workers together when it holds more than this and more than a 16th of the clicks; 1 sends every range that way (tests) |
+| `SS_OUT` | `direct`, `arrow` | Who writes `user_daily`: the writer in `output::direct`, or arrow-rs |
+| `SS_PAR` | `pool`, `spawn` | Workers kept for the run, or seven threads spawned for every stage |
 
-`SS_TIMING=1` prints the stages (`parse`, `place`, `runs`, `sessions`, `classic`, `output`), the runs sent to the classic lane and why.
+`SS_TIMING=1` prints the stages (`inputs`, `parse`, `clicks`, `sessions`, `edges`, `classic`, `output`; `place`, `runs` and `sessions` under `split`), the runs sent to the classic lane and why.
 
 ## Measured
 
@@ -74,6 +83,27 @@ Where an event row's instructions are now, about 200 (it was 670 before `pos-wid
 
 With 8 workers the kernel takes 19% of the cycles: 7% zeroing the fresh pages of the lists, the table and the output (about 1.2 GB), the rest copying the input and mapping pages.
 
+### After the stages were rebuilt (2026-11-21, later the same day)
+
+| 20M, 8 workers | Before (`ca1cf70`) | Now |
+| --- | --- | --- |
+| One core, instructions | 9.7 G | 8.9 G |
+| Whole process, a core per worker (median of 40) | about 300 ms | 247 ms |
+| Whole process, a second copy looping on the sibling threads (median of 40) | | 341 ms |
+
+Stages with a core per worker: inputs 6.7, parse 150, clicks 13.9, sessions 65.9, edges 6.7, classic lane 3.3, output 8.4 ms. At 60M the click stage went from 104-140 ms to 36.
+
+**What cost time and was not work.** Most of the gain above did not come from fewer instructions:
+
+- *Allocating inside a parallel stage.* Every click range's task allocated its own arrays. glibc grows a thread's heap with `mprotect`, which takes the address-space lock for writing, while the other tasks take page faults on fresh memory, which hold it for reading through the zeroing of a 2 MB page. A click cost 50 ns with 8 workers against 12 ns on one, and the stage took 28 ms for 66 ms of work. One array allocated before the tasks: 13 ms.
+- *Spawning threads per stage.* A spawn is an `mmap`, an `mprotect` and a `clone`, the same lock for writing. The later workers of a stage started 2 to 5 ms after the first with two copies running. Kept for the run, the workers are 2% of the whole process alone and about 5% with a second copy (352 against 373 ms). Started before the inputs were mapped they held up `open`'s few hundred mappings instead: 15 ms with a second copy.
+- *Leaving memory to the exit.* With `SS_FREE=exit` the process ended 100 ms after its last output with two copies running: one thread unmaps what eight could have released.
+- *Serial ends.* One thread filling the classic lane's buckets (2 ms), `campaign_daily` after the `user_daily` files (2 ms), the `user_daily` columns doubling a row at a time on the workers' threads (some 800 reallocations).
+
+`perf stat -e 'syscalls:sys_enter_mprotect,syscalls:sys_enter_mmap,syscalls:sys_enter_munmap,syscalls:sys_enter_clone3'` on a run (tracefs mounted in a privileged container) shows the first two at a glance: 107 `mprotect` and 85 `clone3` before, 32 and 9 after, almost all of them before the parse.
+
+**How these were measured.** Single runs of a process move by 15% here, and two fresh containers started together by more. What separates 2%: one container that runs the two variants in alternation, 40 times each, each run timed whole from outside the process, with the same binary looping in a second container on the sibling threads, and the quartiles compared (A against A is within 3% that way, within 1% without the second copy). `perf stat`'s own duration is wrong for a process that spawns many short-lived threads: it waits for their counters. A run that writes over an earlier run's files in a tmpfs pays for truncating them.
+
 ## Tried and dropped
 
 - **Profile-guided build.** An instrumented build trained on 2M generated events through both pipelines: 686 ms against 628 with two workers per core, and three times the image's build time.
@@ -92,12 +122,17 @@ With 8 workers the kernel takes 19% of the cycles: 7% zeroing the fresh pages of
 - **The whole row code for a purchase**: 600 instructions each for 3% of the rows, 4% of the run. The decode's record is right for a purchase but for the price and the product.
 - **A counting sort of the links and a union-find per person**: replaced by the alias masks, 0.2 G instructions less, the same classification.
 - **A row's raw bytes copied as vectors** (16 or 32 bytes a field, a row's together) and taken apart 8 rows at a time in the decode, instead of a word at a time into one array per word: 9.69 G to 9.67 G instructions for 80 lines more. Not kept.
+- **A whole click range put in `ts` order by radix while it is grouped** (a counting scatter per 11-bit digit of the `ts`, then the scatter by person, so that no person's clicks need sorting later): the same output and the same instruction count, but 68 ms of click stage against 33 with two copies running, for 11 ms less in the sessions. A person's few clicks sort inside L1; 2,048 write positions do not fit it.
+- **The mapping with a prefetch 4 KB ahead of the tokenizer**: better than the mapping without (363 against 376 ms with a second copy), still behind `pread` (345 ms).
+- **The links' persons numbered a batch ahead and their entries prefetched** in `Links::build`: no change on this box, whose 96 MB cache holds those arrays.
+- **Sizes of chunk and of the scatter's staging** again, with the steadier harness: 256 KB and 512 KB chunks and 1 or 2 staged lines are all within its noise of the defaults.
 
 ## Not done yet
 
-- The place and sessions stages are scalar passes over a table of all event numbers (`times` and `users`, 8 bytes a number, zeroed by the kernel and written once). Doing a partition's sessions while its slots are still in cache would save the table and one pass, but a person's second run elsewhere could then only be answered by starting over with the classic pipeline.
+- The click lists of the parse are sized alike, and persons are numbered largest first: about 30% of the clicks overflow their list's room into a `Vec` each (`Parts::spill`, 0.8% of the cycles, and those vectors grow on the workers' threads). The event lists are sized for an uneven share of the chunks, 450 MB for 345 MB of rows, and with 2 MB pages the kernel zeroes all of it. Lists made of fixed chunks from one reserved block per worker would fix both.
+- With 8 workers the kernel still takes about a fifth of the cycles: 7% copying the input, 6% zeroing fresh pages (about 1.1 GB).
 - The decode still reloads about 60 constants and spills about 40 vectors per 8 rows.
-- `sessions` sorts every person's clicks (0.4 G instructions at 20M); the attribution of persons with hundreds of clicks is about 0.4 G more.
-- `user_daily` writes `sessions` and `events` as 64-bit integers and every `user_id` as a plain string; the rules allow any width and encoding.
-- The Parquet writer is arrow-rs.
+- `sessions` sorts every person's clicks by comparing them (2.7% of the cycles with two copies running); a person's sessions are cut one slot at a time; `Day::flush` is 90 instructions a `user_daily` row.
+- Three persons at 20M use 64 or more user IDs, which the alias masks cannot hold, and take the classic lane with about 30,000 events each.
+- `user_daily` writes `sessions`, `events` and `revenue_cents` as plain 64-bit integers; the rules allow any width.
 - `pos-wide` scored 0.73 s against the classic pipeline's 0.83 s; `pos-fused` has not run on the scorer. Its CPU is unknown beyond "Intel Xeon with AVX-512". On Skylake and Cascade Lake Xeons a core that runs 512-bit instructions lowers its clock (more for multiplies), and its sibling thread with it. The ratio of the scorer's time to the paired time here was 1.12 for the classic pipeline (no 512-bit code) and 1.15 to 1.19 for `pos-wide`: a small penalty at most, within what these measurements can tell. So the parse keeps its 512-bit decode, which is far cheaper than any 256-bit version of it, and nothing else uses a 512-bit register: the place stage's scan and its fill are written for 256-bit ones (the compiler made 512-bit code of both until told otherwise; `objdump` shows none in the place and sessions stages now). If the scorer does lower the clock, the next thing to try is the decode's 27 multiplies per 8 rows in two 256-bit halves each, which is the lighter of the two clock levels for about 2% more instructions.
