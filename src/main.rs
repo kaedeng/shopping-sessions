@@ -63,6 +63,8 @@ fn run() -> Result<(), String> {
     };
 
     let (data, out) = (dir("DATA_DIR", "/data"), dir("OUTPUT_DIR", "/output"));
+    // The workers' threads, before anything is mapped or allocated beside them (`types::par`).
+    par::start(types::env::number("NCPU", 8).max(1));
     let (ctx, ingest) = ingest::open(&data)?;
     let parallel_alloc = ALLOC[types::env::pick("SS_ALLOC", ALLOC)] == "parallel";
     // Slot `scatter-wc`: how the person buckets are written (the parse partitions: `Ingest`).
