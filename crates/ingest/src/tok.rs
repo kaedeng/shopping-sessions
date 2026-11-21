@@ -303,7 +303,7 @@ mod shape {
     /// As `Tok::lines`, with `at < len`.
     #[cold]
     #[inline(never)]
-    unsafe fn general<const N: usize>(p: *const u8, len: usize, at: usize, s: &mut Scratch, row: &mut impl FnMut(&[Field; N])) -> usize {
+    pub(super) unsafe fn general<const N: usize>(p: *const u8, len: usize, at: usize, s: &mut Scratch, row: &mut impl FnMut(&[Field; N])) -> usize {
         // SAFETY: `at..len` is inside the segment, which ends with a newline.
         let rest = unsafe { std::slice::from_raw_parts(p.add(at), len - at) };
         let line = memchr(b'\n', rest).map_or(rest.len(), |newline| newline + 1);
@@ -404,6 +404,187 @@ mod shape {
                 at += p4 + 1;
             } else {
                 at = unsafe { general(p, len, at, s, &mut row) };
+            }
+        }
+    }
+}
+
+#[cfg(all(feature = "tok-shape", target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2"))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use fused::Fused;
+
+/// Slot `pos-fused`: a line's shape as numbers (where each field starts and how long it is),
+/// for a caller that reads the fields' bytes itself (`pos::wide::fused`) instead of taking
+/// `Field`s from a callback. The windows are `Shape`'s: an event line's first three fields
+/// within 64 bytes, the other four within the 64 after the third comma; a click line in 64.
+/// A window's three masks are one 64-byte compare each (AVX-512), and the quote rules are two
+/// bit extractions: the quote bits at the fields' first bytes and at their last bytes must be
+/// the same fields' (`wrapped`). `None` for any line that is not of this shape, which then
+/// goes to `Scalar`; so the fields are `Scalar`'s for any input (`tests::both`).
+#[cfg(all(feature = "tok-shape", target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2"))]
+pub(crate) mod fused {
+    use core::arch::x86_64::*;
+
+    use super::shape::general;
+    use super::{Field, Scratch, Tok};
+
+    /// Bytes `event_shape` may read from the line's first byte; `click_shape` reads 64.
+    pub(crate) const EVENT_WINDOW: usize = 128;
+
+    /// A well-formed line of `N` fields: each field's first byte (from the line's) and length,
+    /// wrapping quotes stripped, and the line's length with its newline.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Line<const N: usize> {
+        pub start: [usize; N],
+        pub len: [usize; N],
+        pub next: usize,
+    }
+
+    impl<const N: usize> Line<N> {
+        #[inline(always)]
+        pub(crate) fn fields(&self, line: *const u8) -> [Field; N] {
+            std::array::from_fn(|field| Field { p: line.wrapping_add(self.start[field]), len: self.len[field] })
+        }
+    }
+
+    /// The `,`, `\n` and `"` bits of the 64 bytes at `p`.
+    #[inline(always)]
+    unsafe fn masks(p: *const u8) -> (u64, u64, u64) {
+        // SAFETY: the caller guarantees 64 readable bytes; AVX-512BW is compiled in (cfg above).
+        unsafe {
+            let bytes = _mm512_loadu_si512(p.cast());
+            let bits = |byte: u8| _mm512_cmpeq_epi8_mask(bytes, _mm512_set1_epi8(byte as i8));
+            (bits(b','), bits(b'\n'), bits(b'"'))
+        }
+    }
+
+    /// For fields that start at bit 0 and end at the separators `stops`, and the quote bits
+    /// below the last of them: which fields are wrapped (bit i for field i), and whether every
+    /// quote is one of a wrapping pair.
+    ///
+    /// `starts` and `ends` are the fields' first and last bytes, in field order, so the two
+    /// extractions line up field by field: a field has a quote at its first byte exactly when
+    /// it has one at its last. With no quote anywhere else, and none on a byte that is both (a
+    /// field that is one quote), each field has no quote or is wrapped in one pair. The first
+    /// field must not be empty, or its last byte would be before bit 0 and the extractions
+    /// would not line up; the caller leaves such a line to `Scalar`.
+    #[inline(always)]
+    fn wrapped(quotes: u64, stops: u64) -> (u64, bool) {
+        let (starts, ends) = (stops << 1 | 1, stops >> 1);
+        // SAFETY: BMI2 is compiled in (cfg above).
+        #[allow(unused_unsafe)]
+        let (first, last) = unsafe { (_pext_u64(quotes, starts), _pext_u64(quotes, ends)) };
+        (first, (stops & 1 == 0) & (quotes & !(starts | ends) == 0) & (quotes & starts & ends == 0) & (first == last))
+    }
+
+    /// The lowest set bit's position, and `bits` without it.
+    #[inline(always)]
+    fn next(bits: u64) -> (usize, u64) {
+        (bits.trailing_zeros() as usize, bits & bits.wrapping_sub(1))
+    }
+
+    /// The event line at `line`, when its first three fields end within 64 bytes and the
+    /// other four within the next 64, the first and the fourth are not empty and the quotes
+    /// are wrapping pairs.
+    ///
+    /// # Safety
+    /// `EVENT_WINDOW` bytes readable at `line`.
+    #[inline(always)]
+    pub(crate) unsafe fn event_shape(line: *const u8) -> Option<Line<7>> {
+        // SAFETY: 64 bytes at `line`, then 64 from at most 64 further.
+        let (commas, newlines, quotes) = unsafe { masks(line) };
+        let (p1, rest) = next(commas);
+        let (p2, rest) = next(rest);
+        let third = rest & rest.wrapping_neg();
+        let p3 = rest.trailing_zeros() as usize & 63;
+        let before = third.wrapping_sub(1);
+        let (wa, pairs_a) = wrapped(quotes & before, commas & (before | third));
+        // Each window leaves by its own branch: with both checks in one block the compiler
+        // pairs the two windows' bit operations in vector registers, about 40 instructions
+        // of moves a line.
+        if !((third != 0) & (newlines & before == 0) & pairs_a) {
+            return None;
+        }
+
+        let second = p3 + 1;
+        let (commas, newlines, quotes) = unsafe { masks(line.add(second)) };
+        let stops = commas | newlines;
+        let (p4, rest) = next(stops);
+        let (p5, rest) = next(rest);
+        let (p6, rest) = next(rest);
+        let end = rest & rest.wrapping_neg();
+        let p7 = rest.trailing_zeros() as usize;
+        let before = end.wrapping_sub(1);
+        let (wb, pairs_b) = wrapped(quotes & before, stops & (before | end));
+        if !((newlines & end != 0) & (newlines & before == 0) & pairs_b) {
+            return None;
+        }
+        let q = |bits: u64, field: u32| (bits >> field & 1) as usize;
+        let (q0, q1, q2) = (q(wa, 0), q(wa, 1), q(wa, 2));
+        let (q3, q4, q5, q6) = (q(wb, 0), q(wb, 1), q(wb, 2), q(wb, 3));
+        Some(Line {
+            start: [q0, p1 + 1 + q1, p2 + 1 + q2, second + q3, second + p4 + 1 + q4, second + p5 + 1 + q5, second + p6 + 1 + q6],
+            len: [p1 - 2 * q0, p2 - p1 - 1 - 2 * q1, p3 - p2 - 1 - 2 * q2, p4 - 2 * q3, p5 - p4 - 1 - 2 * q4, p6 - p5 - 1 - 2 * q5, p7 - p6 - 1 - 2 * q6],
+            next: second + p7 + 1,
+        })
+    }
+
+    /// The click line at `line`, when it ends within 64 bytes, its first field is not empty
+    /// and the quotes are wrapping pairs.
+    ///
+    /// # Safety
+    /// 64 bytes readable at `line`.
+    #[inline(always)]
+    pub(crate) unsafe fn click_shape(line: *const u8) -> Option<Line<4>> {
+        let (commas, newlines, quotes) = unsafe { masks(line) };
+        let stops = commas | newlines;
+        let (p1, rest) = next(stops);
+        let (p2, rest) = next(rest);
+        let (p3, rest) = next(rest);
+        let end = rest & rest.wrapping_neg();
+        let p4 = rest.trailing_zeros() as usize;
+        let before = end.wrapping_sub(1);
+        let (w, pairs) = wrapped(quotes & before, stops & (before | end));
+        if !((newlines & end != 0) & (newlines & before == 0) & pairs) {
+            return None;
+        }
+        let q = |field: u32| (w >> field & 1) as usize;
+        let (q0, q1, q2, q3) = (q(0), q(1), q(2), q(3));
+        Some(Line {
+            start: [q0, p1 + 1 + q1, p2 + 1 + q2, p3 + 1 + q3],
+            len: [p1 - 2 * q0, p2 - p1 - 1 - 2 * q1, p3 - p2 - 1 - 2 * q2, p4 - p3 - 1 - 2 * q3],
+            next: p4 + 1,
+        })
+    }
+
+    /// The shapes as a tokenizer, for the tests to compare with `Scalar`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) struct Fused;
+
+    impl Tok for Fused {
+        unsafe fn lines<const N: usize>(p: *const u8, len: usize, s: &mut Scratch, mut row: impl FnMut(&[Field; N])) {
+            let mut at = 0;
+            while at < len {
+                // SAFETY: the windows are readable where the shapes are asked for, and a
+                // `[Field; N]` is a `[Field; 7]` or a `[Field; 4]` in the arm that says so.
+                let next = unsafe {
+                    let line = p.add(at);
+                    match N {
+                        7 if at + EVENT_WINDOW <= len + crate::PAD => event_shape(line).map(|shape| {
+                            row(&*(&shape.fields(line) as *const [Field; 7]).cast::<[Field; N]>());
+                            shape.next
+                        }),
+                        4 => click_shape(line).map(|shape| {
+                            row(&*(&shape.fields(line) as *const [Field; 4]).cast::<[Field; N]>());
+                            shape.next
+                        }),
+                        _ => None,
+                    }
+                };
+                at = match next {
+                    Some(next) => at + next,
+                    None => unsafe { general(p, len, at, s, &mut row) },
+                };
             }
         }
     }

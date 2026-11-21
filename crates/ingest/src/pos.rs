@@ -28,7 +28,22 @@ use crate::ts::{Dates, rd};
 use crate::{Ingest, ingest_slow, price_cents};
 
 /// How event rows are decoded, the pick first (`SS_POS_DECODE`).
-#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq"))]
+#[cfg(all(
+    feature = "tok-shape",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "bmi2"
+))]
+const DECODES: &[&str] = &["fused", "wide", "row"];
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    not(all(feature = "tok-shape", target_feature = "bmi2"))
+))]
 const DECODES: &[&str] = &["wide", "row"];
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq")))]
 const DECODES: &[&str] = &["row"];
@@ -57,6 +72,9 @@ pub struct PosPlan {
     pub click_parts: usize,
     /// Event rows decoded eight at a time (`wide`), where the build has AVX-512; `SS_POS_DECODE`.
     pub wide: bool,
+    /// Event lines read by their shape straight into the wide decode (`fused`), no tokenizer
+    /// between; `SS_POS_DECODE`.
+    pub fused: bool,
 }
 
 impl PosPlan {
@@ -94,6 +112,80 @@ impl PosOut {
 }
 
 pub(crate) type PosFn = fn(&Ingest, &Ctx, &PosPlan, usize, &mut PosOut);
+
+/// The campaign IDs of at most 8 bytes by their bytes, for the fused click parse: a multiply
+/// and a probe, where the row code packs the ID (`pack_at`) and hashes it. An ID's bytes are a
+/// word with zeros after them and its length, so equal entries are equal IDs whatever the
+/// bytes are.
+pub(crate) struct Campaigns {
+    /// (the ID's bytes, `len << 32 | index`); `NONE` as the second in a free slot.
+    slots: Box<[(u64, u64)]>,
+    shift: u32,
+}
+
+#[cfg_attr(
+    not(all(
+        feature = "tok-shape",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512dq",
+        target_feature = "bmi2"
+    )),
+    allow(dead_code)
+)]
+impl Campaigns {
+    pub(crate) const NONE: u64 = u64::MAX;
+
+    pub(crate) fn new(ctx: &Ctx) -> Campaigns {
+        let real = &ctx.campaigns[..ctx.organic() as usize];
+        let size = (4 * real.len()).next_power_of_two().max(16);
+        let mut table = Campaigns { slots: vec![(0, Self::NONE); size].into(), shift: 64 - size.trailing_zeros() };
+        for (name, _) in real {
+            // The index the row code gives this ID: its first row's.
+            if let (1..=8, Some(index)) = (name.len(), ctx.campaign_index.get(types::id::pack(name))) {
+                let mut bytes = [0u8; 8];
+                bytes[..name.len()].copy_from_slice(name);
+                let entry = (u64::from_le_bytes(bytes), (name.len() as u64) << 32 | u64::from(index));
+                let mut at = table.home(entry.0);
+                while table.slots[at].1 != Self::NONE && table.slots[at] != entry {
+                    at = (at + 1) & (size - 1);
+                }
+                table.slots[at] = entry;
+            }
+        }
+        table
+    }
+
+    #[inline(always)]
+    fn home(&self, word: u64) -> usize {
+        (word.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
+    }
+
+    /// The index of the campaign whose ID is the `len` bytes at `p`, or `NONE`: for an ID no
+    /// campaign has, and for any ID over 8 bytes, which the row code then looks up its way.
+    ///
+    /// # Safety
+    /// 8 bytes readable at `p`.
+    #[inline(always)]
+    pub(crate) unsafe fn get(&self, p: *const u8, len: usize) -> u64 {
+        let word = unsafe { rd(p) };
+        let word = if len >= 8 { word } else { word & ((1u64 << (8 * len)) - 1) };
+        let mut at = self.home(word);
+        loop {
+            // SAFETY: `at` is below the table's size, a power of two. The table is at most a
+            // quarter full, so a free slot ends the walk.
+            let (key, value) = unsafe { *self.slots.get_unchecked(at) };
+            if (key == word) & (value >> 32 == len as u64) {
+                return value & 0xFFFF_FFFF;
+            }
+            if value == Self::NONE {
+                return Self::NONE;
+            }
+            at = (at + 1) & (self.slots.len() - 1);
+        }
+    }
+}
 
 /// Rows parsed before they are scattered.
 const PENDING: usize = 64;
@@ -184,6 +276,7 @@ impl Ingest {
             click_shift,
             click_parts: persons.div_ceil(1 << click_shift),
             wide: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "wide",
+            fused: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "fused",
         })
     }
 
@@ -293,9 +386,9 @@ pub(crate) fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, plan: &PosPlan, tas
     unsafe {
         if *click {
             if out.clicks.combining() {
-                clicks::<T, Combine>(p, len, ctx, dates, plan, out);
+                clicks::<T, Combine>(p, len, ctx, dates, &ingest.campaigns, plan, out);
             } else {
-                clicks::<T, Plain>(p, len, ctx, dates, plan, out);
+                clicks::<T, Plain>(p, len, ctx, dates, &ingest.campaigns, plan, out);
             }
         } else if out.events.combining() {
             events::<T, Combine>(p, len, ctx, dates, plan, out);
@@ -310,6 +403,17 @@ pub(crate) fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, plan: &PosPlan, tas
 /// `p, len` is a segment.
 #[inline(always)]
 unsafe fn events<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &PosPlan, out: &mut PosOut) {
+    #[cfg(all(
+        feature = "tok-shape",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512dq",
+        target_feature = "bmi2"
+    ))]
+    if plan.fused {
+        return unsafe { wide::fused::<M>(p, len, ctx, dates, plan, out) };
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq"))]
     if plan.wide {
         return unsafe { wide::events::<T, M>(p, len, ctx, dates, plan, out) };
@@ -329,7 +433,19 @@ unsafe fn events<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &D
 /// # Safety
 /// `p, len` is a segment.
 #[inline(always)]
-unsafe fn clicks<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &PosPlan, out: &mut PosOut) {
+unsafe fn clicks<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, campaigns: &Campaigns, plan: &PosPlan, out: &mut PosOut) {
+    #[cfg(all(
+        feature = "tok-shape",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512dq",
+        target_feature = "bmi2"
+    ))]
+    if plan.fused {
+        return unsafe { wide::fused_clicks::<M>(p, len, ctx, dates, campaigns, plan, out) };
+    }
+    let _ = campaigns;
     let PosOut { clicks, odd_clicks, scratch, .. } = out;
     let mut pending = Pending::new();
     unsafe { T::lines::<4>(p, len, scratch, |fields| click_row::<M>(ctx, dates, plan, fields, &mut pending, clicks, odd_clicks)) };
@@ -559,22 +675,35 @@ pub(crate) mod wide {
                     *self.len.get_unchecked_mut(field).get_unchecked_mut(row) = value.len as u64;
                 }
                 let [id, user, ts, ingest, kind, ..] = *fields;
-                let mut set = |word: usize, value: u64| *self.words.get_unchecked_mut(word).get_unchecked_mut(row) = value;
-                set(ID_FIRST, rd(id.p));
-                set(ID_DIGITS, rd(id.p.add(1)));
-                set(USER_FIRST, rd(user.p));
-                set(USER_DIGITS, rd(user.p.add(1)));
-                set(TS_0, rd(ts.p));
-                set(TS_8, rd(ts.p.add(8)));
-                set(TS_12, rd(ts.p.add(12)));
-                set(TS_19, rd(ts.p.add(19)));
-                set(TS_DATE, dates.date_s(ts.p) as u64);
-                set(INGEST_8, rd(ingest.p.add(8)));
-                set(INGEST_12, rd(ingest.p.add(12)));
-                set(INGEST_DATE, dates.date_s(ingest.p) as u64);
-                set(KIND, rd(kind.p));
+                self.read(dates, row, id.p, user.p, ts.p, ingest.p, kind.p);
             }
             self.rows = row + 1;
+        }
+
+        /// Row `row`'s words, read at the first bytes of its first five fields.
+        ///
+        /// # Safety
+        /// `row < ROWS`, and 27 bytes are readable at each pointer.
+        #[inline(always)]
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn read(&mut self, dates: &Dates, row: usize, id: *const u8, user: *const u8, ts: *const u8, ingest: *const u8, kind: *const u8) {
+            // SAFETY: the caller's.
+            unsafe {
+                let mut set = |word: usize, value: u64| *self.words.get_unchecked_mut(word).get_unchecked_mut(row) = value;
+                set(ID_FIRST, rd(id));
+                set(ID_DIGITS, rd(id.add(1)));
+                set(USER_FIRST, rd(user));
+                set(USER_DIGITS, rd(user.add(1)));
+                set(TS_0, rd(ts));
+                set(TS_8, rd(ts.add(8)));
+                set(TS_12, rd(ts.add(12)));
+                set(TS_19, rd(ts.add(19)));
+                set(TS_DATE, dates.date_s(ts) as u64);
+                set(INGEST_8, rd(ingest.add(8)));
+                set(INGEST_12, rd(ingest.add(12)));
+                set(INGEST_DATE, dates.date_s(ingest) as u64);
+                set(KIND, rd(kind));
+            }
         }
 
         #[inline(always)]
@@ -613,15 +742,340 @@ pub(crate) mod wide {
                 }
                 batch.take(dates, fields);
                 if batch.rows == ROWS {
-                    decode::<M>(&mut batch, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+                    decode::<M, false>(&mut batch, p, len, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
                 }
             });
-            decode::<M>(&mut batch, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+            decode::<M, false>(&mut batch, p, len, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
         }
         batch.flush::<M>(events);
         // Streamed lines become visible to the placing threads.
         events.fence();
         pays.fence();
+    }
+
+    /// Slot `pos-fused`: one event chunk, each line read by its shape (`tok::fused`) straight
+    /// into the batch. No tokenizer runs between and no `Field` is built: a line's separators
+    /// give the first bytes of its fields, and the words the kernels read are copied from
+    /// there. A row keeps its line's offset (`at[0]`) instead of its fields; a line that is
+    /// not of the usual shape is a row too, with an `event_id` of no length, so the decode
+    /// leaves it to the row code like any other row it does not recognise (`slow_line`).
+    ///
+    /// # Safety
+    /// `p, len` is a segment.
+    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
+    #[inline(never)]
+    pub(super) unsafe fn fused<M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &PosPlan, out: &mut PosOut) {
+        use crate::tok::fused::{EVENT_WINDOW, event_shape};
+        let PosOut { events, pays, odd_events, odd_users, .. } = out;
+        let limit = plan.events() as u64;
+        let mut batch = Batch::new();
+        let mut at = 0;
+        // SAFETY: `at < len` is a line's first byte; `batch.rows < ROWS` between decodes; a
+        // shape's fields are inside the segment, with `PAD` readable bytes after it.
+        unsafe {
+            while at < len {
+                let (line, row) = (p.add(at), batch.rows);
+                *batch.at.get_unchecked_mut(0).get_unchecked_mut(row) = at as u64;
+                if at + EVENT_WINDOW <= len + crate::PAD
+                    && let Some(shape) = event_shape(line)
+                {
+                    for field in 0..6 {
+                        *batch.len.get_unchecked_mut(field).get_unchecked_mut(row) = shape.len[field] as u64;
+                    }
+                    let first = |field: usize| line.add(shape.start[field]);
+                    batch.read(dates, row, first(0), first(1), first(2), first(3), first(4));
+                    at += shape.next;
+                } else {
+                    *batch.len.get_unchecked_mut(0).get_unchecked_mut(row) = 0;
+                    at = line_end(p, len, at);
+                }
+                batch.rows = row + 1;
+                if batch.rows == ROWS {
+                    decode::<M, true>(&mut batch, p, len, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+                }
+            }
+            decode::<M, true>(&mut batch, p, len, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+        }
+        batch.flush::<M>(events);
+        // Streamed lines become visible to the placing threads.
+        events.fence();
+        pays.fence();
+    }
+
+    /// The first byte after the line at `at`.
+    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
+    #[cold]
+    #[inline(never)]
+    unsafe fn line_end(p: *const u8, len: usize, at: usize) -> usize {
+        // SAFETY: `at..len` is inside the segment.
+        let rest = unsafe { std::slice::from_raw_parts(p.add(at), len - at) };
+        at + memchr::memchr(b'\n', rest).map_or(rest.len(), |newline| newline + 1)
+    }
+
+    /// A row of the fused parse through the row code: the line at `at` tokenized again (by its
+    /// shape where it has one, a purchase mostly; by `Scalar` otherwise), then `event_row`.
+    ///
+    /// # Safety
+    /// `p, len` is a segment and `at < len` a line's first byte in it.
+    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn slow_line<M: Mode>(
+        p: *const u8,
+        len: usize,
+        at: usize,
+        batch: &mut Batch,
+        ctx: &Ctx,
+        dates: &Dates,
+        plan: &PosPlan,
+        limit: u64,
+        events: &mut Parts<PosEvent>,
+        pays: &mut Parts<PosPay>,
+        odd_events: &mut Vec<EventRec>,
+        odd_users: &mut Vec<Id>,
+    ) {
+        // SAFETY: one line of the segment; the shape is asked for only where its window is
+        // readable, and its fields are inside the line.
+        unsafe {
+            let line = p.add(at);
+            if at + crate::tok::fused::EVENT_WINDOW <= len + crate::PAD
+                && let Some(shape) = crate::tok::fused::event_shape(line)
+            {
+                return event_row::<M, Batch>(ctx, dates, plan, limit, &shape.fields(line), batch, events, pays, odd_events, odd_users);
+            }
+            let bytes = line_end(p, len, at) - at;
+            Scalar::lines::<7>(line, bytes, &mut Scratch::new(), |fields| {
+                event_row::<M, Batch>(ctx, dates, plan, limit, fields, batch, events, pays, odd_events, odd_users)
+            });
+        }
+    }
+
+    /// The words of a click row the kernels read (`fused_clicks`).
+    const C_USER_FIRST: usize = 0;
+    const C_USER_DIGITS: usize = 1;
+    const C_USER_LEN: usize = 2;
+    const C_TS_0: usize = 3;
+    const C_TS_8: usize = 4;
+    const C_TS_12: usize = 5;
+    const C_TS_19: usize = 6;
+    const C_TS_LEN: usize = 7;
+    const C_TS_DATE: usize = 8;
+    /// The `click_id` packed (`types::id`): 0 for none.
+    const C_CLICK: usize = 9;
+    /// The campaign's index, or `Campaigns::NONE`.
+    const C_CAMPAIGN: usize = 10;
+    const C_WORDS: usize = 11;
+
+    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
+    struct ClickBatch {
+        /// Each row's line, from the segment's first byte.
+        at: [u64; ROWS],
+        words: [[u64; ROWS]; C_WORDS],
+        rows: usize,
+        /// The clicks decoded and not yet scattered: list, then the record's three words.
+        lists: [u64; HELD],
+        click: [u64; HELD],
+        low: [u64; HELD],
+        campaign: [u64; HELD],
+        held: usize,
+    }
+
+    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
+    impl ClickBatch {
+        fn new() -> ClickBatch {
+            ClickBatch { at: [0; ROWS], words: [[0; ROWS]; C_WORDS], rows: 0, lists: [0; HELD], click: [0; HELD], low: [0; HELD], campaign: [0; HELD], held: 0 }
+        }
+
+        #[inline(always)]
+        fn flush<M: Mode>(&mut self, clicks: &mut Parts<PosClick>) {
+            for at in 0..self.held {
+                // SAFETY: the decode put only lists of persons below `PosPlan::persons` here.
+                unsafe { clicks.push_as::<M>(self.lists[at] as usize, PosClick::from_words(self.click[at], self.low[at], self.campaign[at])) };
+            }
+            self.held = 0;
+        }
+    }
+
+    /// Slot `pos-fused`: one click chunk, each line read by its shape (`tok::fused`) into a
+    /// batch and decoded eight rows a step. Per row: the words of its `user_id` and `ts`, the
+    /// `ts`'s date, the `click_id` packed and the campaign looked up by its bytes
+    /// (`Campaigns`). A row the kernels recognise as an ordinary click (a `user_id` that is a
+    /// number inside the arrays, a `ts` in one of the usual forms, a campaign of the table)
+    /// becomes the record `click_row` makes, or nothing when its `ts` is outside the window or
+    /// it has no `click_id`, as there; every other row goes to `click_row` itself.
+    ///
+    /// # Safety
+    /// `p, len` is a segment.
+    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
+    #[inline(never)]
+    pub(super) unsafe fn fused_clicks<M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, campaigns: &Campaigns, plan: &PosPlan, out: &mut PosOut) {
+        use crate::tok::fused::click_shape;
+        let PosOut { clicks, odd_clicks, .. } = out;
+        let mut batch = ClickBatch::new();
+        // The clicks of the rows left to the row code.
+        let mut pending = Pending::new();
+        let mut at = 0;
+        // SAFETY: `at < len` is a line's first byte, with 64 readable bytes (`PAD`);
+        // `batch.rows < ROWS` between decodes; a shape's fields are inside the segment.
+        unsafe {
+            while at < len {
+                let (line, row) = (p.add(at), batch.rows);
+                *batch.at.get_unchecked_mut(row) = at as u64;
+                let mut set = |word: usize, value: u64| *batch.words.get_unchecked_mut(word).get_unchecked_mut(row) = value;
+                if let Some(shape) = click_shape(line) {
+                    let (click, user, campaign, ts) = (line.add(shape.start[0]), line.add(shape.start[1]), line.add(shape.start[2]), line.add(shape.start[3]));
+                    set(C_USER_FIRST, rd(user));
+                    set(C_USER_DIGITS, rd(user.add(1)));
+                    set(C_USER_LEN, shape.len[1] as u64);
+                    set(C_TS_0, rd(ts));
+                    set(C_TS_8, rd(ts.add(8)));
+                    set(C_TS_12, rd(ts.add(12)));
+                    set(C_TS_19, rd(ts.add(19)));
+                    set(C_TS_LEN, shape.len[3] as u64);
+                    set(C_TS_DATE, dates.date_s(ts) as u64);
+                    set(C_CLICK, pack_at(click, shape.len[0]));
+                    set(C_CAMPAIGN, campaigns.get(campaign, shape.len[2]));
+                    at += shape.next;
+                } else {
+                    // Left to the row code: a click of some ID with no user, time or campaign
+                    // the kernels would take (the row's other words are an older row's).
+                    set(C_USER_LEN, 0);
+                    set(C_TS_LEN, 0);
+                    set(C_CLICK, 1);
+                    set(C_CAMPAIGN, Campaigns::NONE);
+                    at = line_end(p, len, at);
+                }
+                batch.rows = row + 1;
+                if batch.rows == ROWS {
+                    decode_clicks::<M>(&mut batch, p, len, ctx, dates, plan, &mut pending, clicks, odd_clicks);
+                }
+            }
+            decode_clicks::<M>(&mut batch, p, len, ctx, dates, plan, &mut pending, clicks, odd_clicks);
+        }
+        batch.flush::<M>(clicks);
+        pending.flush::<M>(clicks);
+        clicks.fence();
+    }
+
+    /// Decodes the gathered click rows and leaves the batch empty of rows.
+    ///
+    /// # Safety
+    /// `base, bytes` is the segment the rows' lines are in.
+    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn decode_clicks<M: Mode>(
+        batch: &mut ClickBatch,
+        base: *const u8,
+        bytes: usize,
+        ctx: &Ctx,
+        dates: &Dates,
+        plan: &PosPlan,
+        pending: &mut Pending<PosClick>,
+        clicks: &mut Parts<PosClick>,
+        odd_clicks: &mut Vec<ClickRec>,
+    ) {
+        let rows = std::mem::take(&mut batch.rows);
+        let mut first = 0;
+        while first < rows {
+            if batch.held + 8 > HELD {
+                batch.flush::<M>(clicks);
+            }
+            let live: __mmask8 = if rows - first >= 8 { 0xFF } else { (1u8 << (rows - first)) - 1 };
+            // SAFETY: `first + 8 <= ROWS`. A lane past `rows` holds an older row's words or
+            // zeros, and `live` keeps it out of everything below.
+            unsafe {
+                let word = |word: usize| _mm512_loadu_si512(batch.words[word].as_ptr().add(first).cast());
+                let (user, user_ok) = numbers(word(C_USER_FIRST), word(C_USER_DIGITS), word(C_USER_LEN), b'u', plan.user_key);
+                let (ts_ok, ts) = dates.ts_wide(word(C_TS_0), word(C_TS_8), word(C_TS_12), word(C_TS_19), word(C_TS_LEN), word(C_TS_DATE));
+                let (click, campaign) = (word(C_CLICK), word(C_CAMPAIGN));
+                let has_click = _mm512_test_epi64_mask(click, click);
+                // `click_row`'s window, on a `ts` that is the one `Dates::ts` gives.
+                let inside = _mm512_cmpge_epi64_mask(ts, _mm512_setzero_si512()) & _mm512_cmplt_epi64_mask(ts, all(u64::from(ctx.ts_end)));
+                let person = _mm512_srli_epi64::<{ ALIAS_BITS }>(user);
+                let fast = live
+                    & has_click
+                    & user_ok
+                    & _mm512_cmplt_epu64_mask(person, all(u64::from(plan.persons)))
+                    & ts_ok
+                    & inside
+                    & _mm512_cmpneq_epi64_mask(campaign, all(Campaigns::NONE));
+                // No click whatever the rest says: no `click_id`, or a well-formed `ts`
+                // outside the window.
+                let dropped = !has_click | (ts_ok & !inside);
+
+                // `PosClick::new`: u | ts << 32.
+                let low = _mm512_or_si512(_mm512_and_si512(user, all(0xFFFF_FFFF)), _mm512_slli_epi64::<32>(ts));
+                let list = _mm512_srl_epi64(person, _mm_cvtsi32_si128(plan.click_shift as i32));
+                let held = batch.held;
+                _mm512_storeu_si512(batch.lists.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, list));
+                _mm512_storeu_si512(batch.click.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, click));
+                _mm512_storeu_si512(batch.low.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, low));
+                _mm512_storeu_si512(batch.campaign.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, campaign));
+                batch.held = held + fast.count_ones() as usize;
+
+                // Every other row, through the row code.
+                let mut rest = live & !fast & !dropped;
+                while rest != 0 {
+                    let row = first + rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    slow_click::<M>(base, bytes, batch.at[row] as usize, ctx, dates, plan, pending, clicks, odd_clicks);
+                }
+            }
+            first += 8;
+        }
+    }
+
+    /// A click row of the fused parse through the row code: the line at `at` tokenized again,
+    /// then `click_row`.
+    ///
+    /// # Safety
+    /// `p, len` is a segment and `at < len` a line's first byte in it.
+    #[cfg(all(feature = "tok-shape", target_feature = "bmi2"))]
+    #[cold]
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn slow_click<M: Mode>(
+        p: *const u8,
+        len: usize,
+        at: usize,
+        ctx: &Ctx,
+        dates: &Dates,
+        plan: &PosPlan,
+        pending: &mut Pending<PosClick>,
+        clicks: &mut Parts<PosClick>,
+        odd_clicks: &mut Vec<ClickRec>,
+    ) {
+        // SAFETY: one line of the segment, 64 bytes readable at its first; a shape's fields
+        // are inside the line.
+        unsafe {
+            let line = p.add(at);
+            if let Some(shape) = crate::tok::fused::click_shape(line) {
+                return click_row::<M>(ctx, dates, plan, &shape.fields(line), pending, clicks, odd_clicks);
+            }
+            let bytes = line_end(p, len, at) - at;
+            Scalar::lines::<4>(line, bytes, &mut Scratch::new(), |fields| click_row::<M>(ctx, dates, plan, fields, pending, clicks, odd_clicks));
+        }
+    }
+
+    #[cfg(not(all(feature = "tok-shape", target_feature = "bmi2")))]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn slow_line<M: Mode>(
+        _: *const u8,
+        _: usize,
+        _: usize,
+        _: &mut Batch,
+        _: &Ctx,
+        _: &Dates,
+        _: &PosPlan,
+        _: u64,
+        _: &mut Parts<PosEvent>,
+        _: &mut Parts<PosPay>,
+        _: &mut Vec<EventRec>,
+        _: &mut Vec<Id>,
+    ) {
+        unreachable!("the fused parse is not in this build")
     }
 
     /// Decodes the gathered rows and leaves the batch empty of rows.
@@ -630,8 +1084,10 @@ pub(crate) mod wide {
     /// Every gathered row's fields are from a segment still mapped.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
-    unsafe fn decode<M: Mode>(
+    unsafe fn decode<M: Mode, const LINES: bool>(
         batch: &mut Batch,
+        base: *const u8,
+        bytes: usize,
         ctx: &Ctx,
         dates: &Dates,
         plan: &PosPlan,
@@ -702,6 +1158,11 @@ pub(crate) mod wide {
                 while rest != 0 {
                     let row = first + rest.trailing_zeros() as usize;
                     rest &= rest - 1;
+                    if LINES {
+                        // The fused parse kept the line's offset, not its fields.
+                        slow_line::<M>(base, bytes, batch.at[0][row] as usize, batch, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+                        continue;
+                    }
                     let fields: [Field; 7] = std::array::from_fn(|field| Field { p: batch.at[field][row] as *const u8, len: batch.len[field][row] as usize });
                     event_row::<M, Batch>(ctx, dates, plan, limit, &fields, batch, events, pays, odd_events, odd_users);
                 }

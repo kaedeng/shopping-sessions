@@ -103,6 +103,12 @@ impl PosClick {
         PosClick { click, low: u64::from(u) | u64::from(ts) << 32, campaign: u64::from(campaign) }
     }
 
+    /// A click from its three words: `click`, `u | ts << 32`, the campaign's index.
+    #[inline(always)]
+    pub fn from_words(click: Id, low: u64, campaign: u64) -> PosClick {
+        PosClick { click, low, campaign }
+    }
+
     #[inline(always)]
     pub fn u(&self) -> u32 {
         self.low as u32

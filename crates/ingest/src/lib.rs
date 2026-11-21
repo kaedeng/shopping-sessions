@@ -197,6 +197,9 @@ pub struct Ingest {
     /// The positional parse with the same tokenizer (`pos`).
     #[cfg(feature = "pipe-positional")]
     pos_fn: pos::PosFn,
+    /// The campaigns by their bytes, for the fused click parse (`pos`).
+    #[cfg(feature = "pipe-positional")]
+    campaigns: pos::Campaigns,
     /// How the partitions are written: `types::parts::mode_from_env` (slot `scatter-wc`).
     scatter: Option<usize>,
     /// Slot `reader-populate`, picked by `SS_READER=populate`.
@@ -281,6 +284,8 @@ impl Ingest {
             links_fn,
             #[cfg(feature = "pipe-positional")]
             pos_fn: pos::parse_with::<Scalar>,
+            #[cfg(feature = "pipe-positional")]
+            campaigns: pos::Campaigns::new(ctx),
             scatter: types::parts::mode_from_env(),
             #[cfg(all(feature = "reader-populate", target_os = "linux"))]
             populate: false,

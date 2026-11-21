@@ -239,6 +239,8 @@ fn both<const N: usize>(text: &[u8]) -> Vec<Vec<Vec<u8>>> {
     }
     #[cfg(feature = "tok-shape")]
     assert_eq!(tokenize::<tok::Shape, N>(text, 1 << 14), scalar, "shape: {:?}", String::from_utf8_lossy(text));
+    #[cfg(all(feature = "tok-shape", target_arch = "x86_64", target_feature = "avx512bw", target_feature = "bmi2"))]
+    assert_eq!(tokenize::<tok::Fused, N>(text, 1 << 14), scalar, "fused: {:?}", String::from_utf8_lossy(text));
     scalar
 }
 
