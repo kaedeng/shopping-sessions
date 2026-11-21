@@ -201,6 +201,58 @@ struct Run {
     unfit: bool,
 }
 
+/// The run being read while a partition's slots are scanned: `Run` with the positions still
+/// slots of the partition, and `NO_PERSON` before the first event.
+struct Open {
+    person: u32,
+    first: u32,
+    end: u32,
+    first_ts: u32,
+    last_ts: u32,
+    aliases: u64,
+    unfit: bool,
+}
+
+/// No user number has this person: a person is below `PosPlan::persons`.
+const NO_PERSON: u32 = u32::MAX;
+
+impl Open {
+    fn none() -> Open {
+        Open { person: NO_PERSON, first: 0, end: 0, first_ts: 0, last_ts: 0, aliases: 0, unfit: false }
+    }
+
+    /// The next event in slot order: it continues the run, or ends it and starts its
+    /// person's.
+    #[inline(always)]
+    fn event(&mut self, slot: usize, ts: u32, u: u32, base: usize, runs: &mut Vec<Run>) {
+        let person = u >> ALIAS_BITS;
+        if person != self.person {
+            self.close(base, runs);
+            *self = Open { person, first: slot as u32, end: slot as u32, first_ts: ts, last_ts: ts, aliases: 0, unfit: false };
+        }
+        let alias = u & ALIAS_MASK;
+        self.unfit |= (ts < self.last_ts) | (alias >= MASK_ALIASES);
+        self.aliases |= 1 << (alias & (MASK_ALIASES - 1));
+        (self.last_ts, self.end) = (ts, slot as u32 + 1);
+    }
+
+    /// The run, if one is open, as event numbers.
+    #[inline(always)]
+    fn close(&self, base: usize, runs: &mut Vec<Run>) {
+        if self.person != NO_PERSON {
+            runs.push(Run {
+                person: self.person,
+                first: base as u32 + self.first,
+                end: base as u32 + self.end,
+                first_ts: self.first_ts,
+                last_ts: self.last_ts,
+                aliases: self.aliases,
+                unfit: self.unfit,
+            });
+        }
+    }
+}
+
 /// One event partition placed.
 #[derive(Default)]
 struct Placed {
@@ -645,39 +697,62 @@ unsafe fn place(
         }
         result.pays.retain(|&(number, _)| valid(&kept[number as usize - base]));
     }
-    // The table's two columns: the `ts` of a valid kept copy, 0 for anything else, and the user.
+    // The table's two columns (the `ts` of a valid kept copy, 0 for anything else, and the
+    // user) and the runs, in one pass over the slots: a person's first event opens a run.
+    let mut open = Open::none();
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq"))]
+    // Eight slots a step. When all eight are events of the open run, which is most steps, the
+    // run takes them from the registers: their order, their aliases, the last `ts`. Any other
+    // step (a slot without an event, another person) goes event by event. One slot at a time
+    // this pass was 18 instructions a slot, about 4% of a run at 20M.
+    //
+    // SAFETY: `kept`, `times` and `users` hold `slots` entries, a multiple of 8, and a
+    // `PosEvent` is two words (`repr(C)`).
+    unsafe {
+        use core::arch::x86_64::*;
+        debug_assert!(slots % 8 == 0 && kept.len() == slots);
+        let all = |value: u64| _mm512_set1_epi64(value as i64);
+        // The first and second word of 8 records, from two loads of 4.
+        let (first_words, second_words) = (_mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14), _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15));
+        for at in (0..slots).step_by(8) {
+            let rows = kept.as_ptr().add(at).cast::<__m512i>();
+            let (a, b) = (_mm512_loadu_si512(rows), _mm512_loadu_si512(rows.add(1)));
+            // `PosEvent`: u | ts << 32, then ingest | slot << 32 | flags << 48.
+            let (low, high) = (_mm512_permutex2var_epi64(a, first_words, b), _mm512_permutex2var_epi64(a, second_words, b));
+            let events = _mm512_test_epi64_mask(high, all(u64::from(POS_VALID) << 48));
+            let ts = _mm512_maskz_srli_epi64::<32>(events, low);
+            let u = _mm512_and_si512(low, all(0xFFFF_FFFF));
+            _mm256_storeu_si256(times.as_mut_ptr().add(at).cast(), _mm512_cvtepi64_epi32(ts));
+            _mm256_storeu_si256(users.as_mut_ptr().add(at).cast(), _mm512_cvtepi64_epi32(u));
+            let same = _mm512_cmpeq_epi64_mask(_mm512_srli_epi64::<{ ALIAS_BITS }>(u), all(u64::from(open.person)));
+            if events & same == 0xFF {
+                // Each `ts` against the one before it, the run's last before the first.
+                let before = _mm512_alignr_epi64::<7>(ts, all(u64::from(open.last_ts)));
+                let alias = _mm512_and_si512(u, all(u64::from(ALIAS_MASK)));
+                let unfit = _mm512_cmplt_epu64_mask(ts, before) | _mm512_cmpge_epu64_mask(alias, all(u64::from(MASK_ALIASES)));
+                let bits = _mm512_sllv_epi64(all(1), _mm512_and_si512(alias, all(u64::from(MASK_ALIASES - 1))));
+                open.unfit |= unfit != 0;
+                open.aliases |= _mm512_reduce_or_epi64(bits) as u64;
+                (open.last_ts, open.end) = (*times.get_unchecked(at + 7), at as u32 + 8);
+            } else {
+                let mut rest = events;
+                while rest != 0 {
+                    let slot = at + rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    open.event(slot, *times.get_unchecked(slot), *users.get_unchecked(slot), base, &mut result.runs);
+                }
+            }
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq")))]
     for (slot, row) in kept.iter().enumerate() {
         times[slot] = if valid(row) { row.ts() } else { 0 };
         users[slot] = row.u();
+        if times[slot] != 0 {
+            open.event(slot, times[slot], users[slot], base, &mut result.runs);
+        }
     }
-
-    // The runs: one pass with the run's state in registers; a person's first event opens one.
-    let mut slot = 0;
-    loop {
-        while slot < slots && times[slot] == 0 {
-            slot += 1;
-        }
-        if slot == slots {
-            break;
-        }
-        let (person, first, first_ts) = (users[slot] >> ALIAS_BITS, slot, times[slot]);
-        let (mut end, mut last_ts, mut aliases, mut unfit) = (slot, first_ts, 0u64, false);
-        while slot < slots {
-            // SAFETY: `slot < slots`, the length of both.
-            let (ts, u) = unsafe { (*times.get_unchecked(slot), *users.get_unchecked(slot)) };
-            if ts != 0 {
-                if u >> ALIAS_BITS != person {
-                    break;
-                }
-                let alias = u & ALIAS_MASK;
-                unfit |= (ts < last_ts) | (alias >= MASK_ALIASES);
-                aliases |= 1 << (alias & (MASK_ALIASES - 1));
-                (last_ts, end) = (ts, slot + 1);
-            }
-            slot += 1;
-        }
-        result.runs.push(Run { person, first: (base + first) as u32, end: (base + end) as u32, first_ts, last_ts, aliases, unfit });
-    }
+    open.close(base, &mut result.runs);
     Some(result)
 }
 
