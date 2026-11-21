@@ -4,6 +4,8 @@
 //!
 //! CONTRACT (the binary depends on exactly this; the bodies are the implementer's).
 
+#[cfg(feature = "pipe-positional")]
+pub mod pos;
 mod tok;
 mod ts;
 #[cfg(test)]
@@ -192,6 +194,9 @@ pub struct Ingest {
     /// The tokenizer's monomorphized loops, picked once.
     parse_fn: ParseFn,
     links_fn: LinksFn,
+    /// The positional parse with the same tokenizer (`pos`).
+    #[cfg(feature = "pipe-positional")]
+    pos_fn: pos::PosFn,
     /// How the partitions are written: `types::parts::mode_from_env` (slot `scatter-wc`).
     scatter: Option<usize>,
     /// Slot `reader-populate`, picked by `SS_READER=populate`.
@@ -215,9 +220,20 @@ impl Ingest {
             ("scalar", parse_with::<Scalar>, links_with::<Scalar>),
         ];
         let names: Vec<&str> = options.iter().map(|option| option.0).collect();
-        let (_, parse_fn, links_fn) = options[env::pick("SS_TOK", &names)];
+        let picked = env::pick("SS_TOK", &names);
+        let (_, parse_fn, links_fn) = options[picked];
         #[allow(unused_mut)]
         let mut ingest = Ingest::with(files, ctx, parse_fn, links_fn)?;
+        #[cfg(feature = "pipe-positional")]
+        {
+            let options: &[pos::PosFn] = &[
+                #[cfg(feature = "tok-mask")]
+                pos::parse_with::<tok::Mask>,
+                #[cfg(feature = "tok-scalar")]
+                pos::parse_with::<Scalar>,
+            ];
+            ingest.pos_fn = options[picked];
+        }
         #[cfg(all(feature = "reader-populate", target_os = "linux"))]
         {
             ingest.populate = env::pick("SS_READER", &["mmap", "populate"]) == 1;
@@ -256,6 +272,8 @@ impl Ingest {
             link_rows,
             parse_fn,
             links_fn,
+            #[cfg(feature = "pipe-positional")]
+            pos_fn: pos::parse_with::<Scalar>,
             scatter: types::parts::mode_from_env(),
             #[cfg(all(feature = "reader-populate", target_os = "linux"))]
             populate: false,

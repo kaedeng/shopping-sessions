@@ -15,6 +15,8 @@ mod agg_dense;
 mod attr_sweep;
 #[cfg(feature = "sess-partitioned")]
 mod partitioned;
+#[cfg(feature = "pipe-positional")]
+pub mod positional;
 #[cfg(feature = "sess-purchase-side")]
 mod purchase_side;
 #[cfg(feature = "sort-grouped")]
@@ -32,10 +34,10 @@ use types::{Ctx, Id};
 
 /// One click as the attribution reads it; a person's clicks sit together in the bucket.
 #[derive(Clone, Copy, Default)]
-struct Click {
-    ts: u32,
-    campaign: u32,
-    id: Id,
+pub struct Click {
+    pub ts: u32,
+    pub campaign: u32,
+    pub id: Id,
 }
 
 #[cfg(not(any(feature = "sort-radix", feature = "sort-grouped", feature = "sort-std")))]

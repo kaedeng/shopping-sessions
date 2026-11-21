@@ -8,7 +8,7 @@ publish.workspace = true
 types = { path = "../types" }
 
 [features]
-default = ["sess-partitioned", "sess-purchase-side", "sort-std", "sort-grouped", "attr-sweep", "agg-dense"]
+default = ["sess-partitioned", "sess-purchase-side", "sort-std", "sort-grouped", "attr-sweep", "agg-dense", "pipe-positional"]
 sess-partitioned = []
 sess-purchase-side = []
 sort-std = []
@@ -16,3 +16,5 @@ sort-grouped = []
 sort-radix = []
 attr-sweep = []
 agg-dense = []
+# `positional::person`: a person whose events are already in time order.
+pipe-positional = []

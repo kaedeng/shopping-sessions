@@ -13,9 +13,13 @@ pub mod mem;
 #[cfg(feature = "par-counter")]
 pub mod par;
 pub mod parts;
+#[cfg(feature = "pipe-positional")]
+pub mod pos;
 #[cfg(feature = "rec-32")]
 pub mod record;
 pub mod rows;
+#[cfg(feature = "pipe-positional")]
+pub mod scramble;
 #[cfg(feature = "table-linear")]
 pub mod table;
 pub mod time;

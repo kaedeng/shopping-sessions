@@ -6,6 +6,9 @@
 //! `SS_TIMING=1` prints each stage's wall time to stderr; implementation.md lists every knob.
 //! Built with `--features trace`, `SS_TRACE=FILE` saves every task as a span (`types::par::trace`).
 
+#[cfg(feature = "pipe-positional")]
+mod positional;
+
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -65,6 +68,27 @@ fn run() -> Result<(), String> {
     // Slot `scatter-wc`: how the person buckets are written (the parse partitions: `Ingest`).
     let scatter = types::parts::bucket_mode_from_env();
     lap("inputs");
+
+    // Slot `pipe-positional`: when the rows carry the generator's numbering, the positional
+    // pipeline runs instead of the three stages below. `SS_PIPE=classic` never tries it, and
+    // `positional` runs it whatever the sample says (exact either way; for tests).
+    #[cfg(feature = "pipe-positional")]
+    {
+        const PIPES: &[&str] = &["auto", "classic", "positional"];
+        let pipe = PIPES[types::env::pick("SS_PIPE", PIPES)];
+        if pipe != "classic"
+            && let Some(plan) = ingest.pos_plan(&ctx, pipe == "positional")
+        {
+            positional::run(&ctx, &ingest, &plan, &out, parallel_alloc, &mut lap)?;
+            if timing {
+                eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
+            }
+            if cfg!(feature = "fast-exit") {
+                std::process::exit(0);
+            }
+            return Ok(());
+        }
+    }
 
     // Stage 1. Task 0 is the union-find, the only serial job; its worker then joins the parse.
     let mut parsed: Vec<ParseOut> = par::init(ctx.workers, parallel_alloc, |_| ingest.new_out(&ctx));

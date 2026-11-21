@@ -34,6 +34,7 @@ default = [
     "sess-partitioned", "sess-purchase-side", "sort-grouped", "sort-std", "attr-sweep", "agg-dense",
     "out-arrow",
     "fast-exit", "alloc-parallel", "free-early", "scatter-wc",
+    "pipe-positional",
 ]
 # types
 id-u64 = ["types/id-u64"]
@@ -65,6 +66,9 @@ agg-dense = ["sessions/agg-dense"]
 # output
 out-arrow = ["output/out-arrow"]
 # process
+# The pipeline for data that carries the generator's numbering, with the classic one as the
+# fallback (`SS_PIPE=auto|classic|positional`).
+pipe-positional = ["types/pipe-positional", "ingest/pipe-positional", "sessions/pipe-positional"]
 fast-exit = []
 # Each stage's per-worker buffers built on the workers' own threads (`SS_ALLOC=serial|parallel`).
 alloc-parallel = []

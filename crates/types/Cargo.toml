@@ -5,7 +5,7 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-default = ["id-u64", "rec-32", "hash-mul", "table-linear", "par-counter", "scatter-wc", "free-early"]
+default = ["id-u64", "rec-32", "hash-mul", "table-linear", "par-counter", "scatter-wc", "free-early", "pipe-positional"]
 id-u64 = []
 rec-32 = []
 hash-mul = []
@@ -15,5 +15,7 @@ par-counter = []
 scatter-wc = []
 # Buffers go back to the kernel as soon as they are dead (`SS_FREE=early|exit`).
 free-early = []
+# The generator's ID numbering read back (`scramble`) and the positional records (`pos`).
+pipe-positional = []
 # Not a slot: records every task as a span for `par::trace::write` (`SS_TRACE`).
 trace = []

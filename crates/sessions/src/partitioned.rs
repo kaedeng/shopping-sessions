@@ -16,7 +16,7 @@ use types::Ctx;
 use crate::{Agg, Click};
 
 /// A gap over this starts a session; exactly this stays.
-const GAP: u64 = 1_800_000;
+pub(crate) const GAP: u64 = 1_800_000;
 /// No local number: a click whose person has no event in the bucket.
 const NONE: u32 = u32::MAX;
 /// Clicks of one person above this are sorted by index (`sort_clicks`).
@@ -208,6 +208,12 @@ fn sort_clicks<'s>(clicks: &'s mut [Click], order: &mut Vec<u64>, sorted: &'s mu
         }
     }
     sorted
+}
+
+/// One person's clicks in `click_order`, sorted in place or into the scratch (`sort_clicks`).
+#[cfg(feature = "pipe-positional")]
+pub(crate) fn sort_person_clicks<'s>(scratch: &'s mut Scratch, clicks: &'s mut [Click]) -> &'s [Click] {
+    sort_clicks(clicks, &mut scratch.order, &mut scratch.sorted)
 }
 
 pub fn bucket<'a>(
