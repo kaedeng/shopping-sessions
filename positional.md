@@ -61,12 +61,14 @@ x86 box (Ryzen 7 7800X3D, Docker Desktop on WSL2), `ss-p20`: seed 7, 20M events.
 | --- | --- | --- | --- |
 | One core (`NCPU=1`), instructions | 24.9 G | 16.4 G | 9.7 G |
 | 8 cores, a core per worker, 20M | about 470 ms | 396 ms | 304 ms |
-| Two workers per core, 20M | 747 ms | 578 ms | 477 ms |
+| Two workers per core, 20M (`bench_smt.py`) | 747 ms | 623 ms | 528 ms |
 | 8 cores, 60M (`ss-full`) | 2.70 s | 1.39 s | 0.84 s |
 
 The process's own total (`SS_TIMING=1`), medians; the last two columns were measured together on 2026-11-21. Wall times on this box move by about 5% between sessions, the instruction count by a fraction of a percent: steer by the count, by `perf stat`'s task clock and cycles over several rounds, and by paired runs. 60M with two processes at once is not a fair number here (the VM's 15.6 GB starts reclaiming the page cache).
 
-Stages with two workers per core at 20M: parse 267, place 82, runs 5, sessions 79, classic lane 6, output 24 ms. The image built from the tree, with the scorer's flags, against the same image of the tree before `pos-fused`: 860 ms against 952 ms of `docker run` wall time, of which about 350 ms is Docker's own on this box.
+Stages with two workers per core at 20M: parse 301, place 89, runs 6, sessions 74, classic lane 6, output 25 ms (before `pos-fused`: 411, 79, 10, 74, 6, 23). The image built from the tree, with the scorer's flags, against the same image of the tree before `pos-fused`: 935 ms against 1,024 ms of `docker run` wall time, of which roughly 400 ms is Docker's own on this box with two containers starting at once.
+
+The instructions fell by 41% and the time with a core per worker by 23%, but the time with two workers per core only by 15%: the fused parse takes almost exactly twice as long there (158 ms to 301), where the tokenizer path took 1.6 times as long. A thread that keeps the core's vector units busy leaves its sibling little. Which of the two the scorer resembles is not known: its two scores so far fit both (1.8 times the time with a core per worker, or 1.15 times the time with two per core).
 
 Where an event row's instructions are now, about 200 (it was 670 before `pos-wide` and 360 with it): the per-line loop 88, the decode 84 (640 per 8 rows), the scatter 25, and the rows that take the row code about 5 averaged over all. One core, 9.7 G in all: event lines 4.3 G, place 1.05 G, sessions 1.25 G with 0.6 G more in the day rows and the click sorts, click lines 0.8 G, links 0.4 G, output 0.4 G. At 20M about 1.4% of the events take the classic lane: 6,507 of 666,666 runs.
 
@@ -84,7 +86,9 @@ With 8 workers the kernel takes 19% of the cycles: 7% zeroing the fresh pages of
 - **All of a row's fields cut before the kernels run.** Twenty live vectors and the kernels' own did not fit the registers: 60 of the decode's 640 instructions a group were moves to and from the stack. Each kernel now asks for its field's words when it runs (`Fields`).
 - **Handing a parsed chunk's pages back while the others parse** (`free-early` on the input mapping): each `madvise` flushes the TLB of every other worker's CPU. The parse took 179 ms with it and 159 without (8 workers, 20M), but without it the process spent 60 ms unmapping at exit. Reading the chunk with `pread` has neither cost: about 3% less CPU time than the mapping.
 - **Keeping every input file open for those reads.** A few hundred open files grow the descriptor table while the workers run, and each growth waits out an RCU grace period: 40 ms each, 130 ms in the inputs stage. A worker keeps one file open, the one it read last: chunks come file by file, so at 60M that is 630 opens for 5,432 reads.
-- **Other partition sizes** (`SS_POS_SHIFT` 12 to 16) and **other chunk sizes** (128 KB to 1 MB): no difference beyond the noise with one process.
+- **Other partition sizes** (`SS_POS_SHIFT` 12 to 16) and **other chunk sizes** (128 KB to 1 MB): no difference beyond the noise, with one process or two.
+- **The mapping against `pread` with two workers per core.** With each measured in the state its own runs leave, the mapping released per chunk, the mapping released per file and `pread` are within 2% (493, 503 and 498 ms). With a fixed order of variants the mapping once looked 12% faster and once 8% slower: see `bench_smt.py`.
+- **Fewer workers than CPUs**, on the thought that a second thread adds nothing to a core whose first is in the decode: 8 workers a copy 515 ms, 6 the same, 5 slower, 4 572 ms.
 - **The whole row code for a purchase**: 600 instructions each for 3% of the rows, 4% of the run. The decode's record is right for a purchase but for the price and the product.
 - **A counting sort of the links and a union-find per person**: replaced by the alias masks, 0.2 G instructions less, the same classification.
 - **A row's raw bytes copied as vectors** (16 or 32 bytes a field, a row's together) and taken apart 8 rows at a time in the decode, instead of a word at a time into one array per word: 9.69 G to 9.67 G instructions for 80 lines more. Not kept.

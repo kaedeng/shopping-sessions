@@ -9,10 +9,20 @@ scorer took 0.83 s (positional.md).
 Usage: bench_smt.py ROUNDS VARIANT...      VOL=ss-full for another data volume (default ss-p20)
 A VARIANT is an image, optionally followed by VAR=value words:
   bench_smt.py 5 "shopping-sessions:latest SS_PIPE=classic" shopping-sessions:latest
-The variants take turns; the table is the median of every SS_TIMING stage over both copies.
-A cpuset alone does not do this on WSL2: Hyper-V does not keep sibling vCPUs on one core.
+The table is the median of every SS_TIMING stage, and of the docker run wall time, over both
+copies and all rounds. A cpuset alone does not do this on WSL2: Hyper-V does not keep sibling
+vCPUs on one core.
+
+What ran just before a variant moves its time by several percent (the state the run before
+leaves the page cache and the free memory in): with a fixed order the first variant of a round
+was the slowest whatever it was, and a 12% "win" came and went with the order. So the order is
+shuffled every round, and BLOCK=n (default 4) runs each variant n times back to back and drops
+the first, so each is timed in the state its own runs leave, as the scorer's repeated runs are.
+Differences under about 3% are still noise here; 60M with two copies is not a fair number in a
+16 GB VM.
 """
 import os
+import random
 import re
 import shlex
 import statistics
@@ -22,6 +32,7 @@ import time
 
 ROUNDS = int(sys.argv[1])
 VARIANTS = sys.argv[2:]
+BLOCK = int(os.environ.get("BLOCK", "4"))
 
 
 def command(cpuset, variant):
@@ -67,8 +78,13 @@ def paired(variant):
 results = {v: [] for v in VARIANTS}
 paired(VARIANTS[0])  # warm-up
 for _ in range(ROUNDS):
-    for v in VARIANTS:
-        results[v] += paired(v)
+    order = list(VARIANTS)
+    random.shuffle(order)
+    for v in order:
+        for again in range(BLOCK):
+            runs = paired(v)
+            if again > 0 or BLOCK == 1:
+                results[v] += runs
 for v, runs in results.items():
-    keys = [k for k in runs[0] if k != "docker"]
+    keys = [k for k in runs[0] if all(k in x for x in runs)]
     print(f"{v:<55}", "  ".join(f"{k} {statistics.median(x[k] for x in runs):.0f}" for k in keys))
