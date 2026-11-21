@@ -779,6 +779,65 @@ pub(crate) mod wide {
         product_len: __m512i,
     }
 
+    /// Where `records` gets a group's fields, one field at a time: each kernel asks for its
+    /// words just before it runs, so a source that has to compute them (`fused::RawLanes`)
+    /// does it then, and not all twenty vectors are alive at once. (Computed up front, they
+    /// left the decode with more live vectors than registers: 60 of its 640 instructions
+    /// a group were moves to and from the stack, and 78 reloaded constants.)
+    trait Fields {
+        /// The lanes that hold a row.
+        fn live(&self) -> __mmask8;
+        /// The live lanes whose words are a well-formed line's.
+        fn fit(&self) -> __mmask8;
+        /// The `event_id`: bytes 0..8, bytes 1..9, the length.
+        fn id(&self) -> [__m512i; 3];
+        /// The `user_id`, the same.
+        fn user(&self) -> [__m512i; 3];
+        /// The `ts`: bytes 0..8, 8..16, 12..20, 19..27, the length, the date (`Dates::date_s`).
+        fn ts(&self, dates: &Dates) -> [__m512i; 6];
+        /// The `ingest_ts`: bytes 8..16, 12..20, the length, the date.
+        fn ingest(&self, dates: &Dates) -> [__m512i; 4];
+        /// The type's first bytes and its length, then the product's length.
+        fn kind(&self) -> [__m512i; 3];
+    }
+
+    impl Fields for Lanes {
+        #[inline(always)]
+        fn live(&self) -> __mmask8 {
+            self.live
+        }
+
+        #[inline(always)]
+        fn fit(&self) -> __mmask8 {
+            self.fit
+        }
+
+        #[inline(always)]
+        fn id(&self) -> [__m512i; 3] {
+            [self.id_first, self.id_digits, self.id_len]
+        }
+
+        #[inline(always)]
+        fn user(&self) -> [__m512i; 3] {
+            [self.user_first, self.user_digits, self.user_len]
+        }
+
+        #[inline(always)]
+        fn ts(&self, _: &Dates) -> [__m512i; 6] {
+            [self.ts_0, self.ts_8, self.ts_12, self.ts_19, self.ts_len, self.ts_date]
+        }
+
+        #[inline(always)]
+        fn ingest(&self, _: &Dates) -> [__m512i; 4] {
+            [self.ingest_8, self.ingest_12, self.ingest_len, self.ingest_date]
+        }
+
+        #[inline(always)]
+        fn kind(&self) -> [__m512i; 3] {
+            [self.kind, self.kind_len, self.product_len]
+        }
+    }
+
     /// What `records` leaves to its caller.
     struct Records {
         /// The live lanes that are not records yet: the row code's, unless the caller makes
@@ -802,30 +861,32 @@ pub(crate) mod wide {
     /// # Safety
     /// `held.len + 8 <= HELD`.
     #[inline(always)]
-    unsafe fn records(lanes: &Lanes, held: &mut Held, ctx: &Ctx, dates: &Dates, plan: &PosPlan, limit: u64) -> Records {
+    unsafe fn records<F: Fields>(lanes: &F, held: &mut Held, ctx: &Ctx, dates: &Dates, plan: &PosPlan, limit: u64) -> Records {
         // SAFETY: register arithmetic, and stores of 8 words at `held.len <= HELD - 8`.
         unsafe {
-            let (number, id_ok) = numbers(lanes.id_first, lanes.id_digits, lanes.id_len, b'e', plan.event_key);
-            let (user, user_ok) = numbers(lanes.user_first, lanes.user_digits, lanes.user_len, b'u', plan.user_key);
-            let (ts_ok, ts) = dates.ts_wide(lanes.ts_0, lanes.ts_8, lanes.ts_12, lanes.ts_19, lanes.ts_len, lanes.ts_date);
-            let (ingest_ok, ingest_ms, ingest_s) = dates.f1_wide(lanes.ingest_8, lanes.ingest_12, lanes.ingest_len, lanes.ingest_date);
-            let kind = _mm512_and_si512(lanes.kind, all(0xFFFF_FFFF));
-            let view_or_cart = (_mm512_cmpeq_epi64_mask(kind, all(u64::from(u32::from_le_bytes(*b"view"))))
-                | _mm512_cmpeq_epi64_mask(kind, all(u64::from(u32::from_le_bytes(*b"cart")))))
-                & _mm512_cmpeq_epi64_mask(lanes.kind_len, all(4));
-            let ordinary = lanes.fit
-                & id_ok
-                & _mm512_cmplt_epu64_mask(number, all(limit))
-                & user_ok
-                & _mm512_cmplt_epu64_mask(_mm512_srli_epi64::<{ ALIAS_BITS }>(user), all(u64::from(plan.persons)))
-                & ts_ok
-                & ingest_ok
-                & _mm512_cmpneq_epi64_mask(lanes.product_len, all(0));
+            // Each field's words are asked for where its kernel runs, and each kernel's
+            // result is narrowed at once to what the record needs.
+            let [id_first, id_digits, id_len] = lanes.id();
+            let (number, id_ok) = numbers(id_first, id_digits, id_len, b'e', plan.event_key);
+            let id_ok = id_ok & _mm512_cmplt_epu64_mask(number, all(limit));
+            let [user_first, user_digits, user_len] = lanes.user();
+            let (user, user_ok) = numbers(user_first, user_digits, user_len, b'u', plan.user_key);
+            let user_ok = user_ok & _mm512_cmplt_epu64_mask(_mm512_srli_epi64::<{ ALIAS_BITS }>(user), all(u64::from(plan.persons)));
+            let [ts_0, ts_8, ts_12, ts_19, ts_len, ts_date] = lanes.ts(dates);
+            let (ts_ok, ts) = dates.ts_wide(ts_0, ts_8, ts_12, ts_19, ts_len, ts_date);
+            let [ingest_8, ingest_12, ingest_len, ingest_date] = lanes.ingest(dates);
+            let (ingest_ok, ingest_ms, ingest_s) = dates.f1_wide(ingest_8, ingest_12, ingest_len, ingest_date);
+            let [kind, kind_len, product_len] = lanes.kind();
+            let short = _mm512_and_si512(kind, all(0xFFFF_FFFF));
+            let view_or_cart = (_mm512_cmpeq_epi64_mask(short, all(u64::from(u32::from_le_bytes(*b"view"))))
+                | _mm512_cmpeq_epi64_mask(short, all(u64::from(u32::from_le_bytes(*b"cart")))))
+                & _mm512_cmpeq_epi64_mask(kind_len, all(4));
+            let ordinary = lanes.fit() & id_ok & user_ok & ts_ok & ingest_ok & _mm512_cmpneq_epi64_mask(product_len, all(0));
             let fast = ordinary & view_or_cart;
             // The type's first 7 bytes: all a word holds of a wrapped type's 8.
             let buys = ordinary
-                & _mm512_cmpeq_epi64_mask(lanes.kind_len, all(8))
-                & _mm512_cmpeq_epi64_mask(_mm512_and_si512(lanes.kind, all(0x00FF_FFFF_FFFF_FFFF)), all(u64::from_le_bytes(*b"purchas\0")));
+                & _mm512_cmpeq_epi64_mask(kind_len, all(8))
+                & _mm512_cmpeq_epi64_mask(_mm512_and_si512(kind, all(0x00FF_FFFF_FFFF_FFFF)), all(u64::from_le_bytes(*b"purchas\0")));
 
             // `event_row`'s `valid` for such a row: the window, and not late.
             let valid = _mm512_cmpge_epi64_mask(ts, all(u64::from(ctx.event_lo)))
@@ -849,7 +910,7 @@ pub(crate) mod wide {
             _mm512_storeu_si512(held.low.as_mut_ptr().add(at).cast(), _mm512_maskz_compress_epi64(fast, low));
             _mm512_storeu_si512(held.high.as_mut_ptr().add(at).cast(), _mm512_maskz_compress_epi64(fast, high));
             held.len = at + fast.count_ones() as usize;
-            Records { rest: lanes.live & !fast, buys, valid, list, low, plain }
+            Records { rest: lanes.live() & !fast, buys, valid, list, low, plain }
         }
     }
 
@@ -1143,65 +1204,180 @@ pub(crate) mod wide {
             }
         }
 
-        /// Rows `first..first + 8` of `words` as the kernels read them.
+        /// Rows `first..first + 8` of the raw words, as a source of fields for `records`: the
+        /// quote rules and the separators' positions at once (`new`), each field's words when
+        /// its kernel asks.
+        struct RawLanes<'a> {
+            words: &'a [[u64; ROWS]; R_WORDS],
+            first: usize,
+            live: __mmask8,
+            fit: __mmask8,
+            /// The six commas' positions: three from the line's first byte, three from the
+            /// byte after the third.
+            p: [__m512i; 6],
+            /// Whether each of the first six fields is wrapped: a quote at its first byte.
+            q: [__m512i; 6],
+        }
+
+        impl<'a> RawLanes<'a> {
+            /// # Safety
+            /// `first + 8 <= ROWS`.
+            #[inline(always)]
+            unsafe fn new(words: &'a [[u64; ROWS]; R_WORDS], first: usize, live: __mmask8) -> RawLanes<'a> {
+                // SAFETY: loads of 8 words at `first <= ROWS - 8`, then register arithmetic.
+                unsafe {
+                    let word = |word: usize| _mm512_loadu_si512(words.get_unchecked(word).as_ptr().add(first).cast());
+                    let (seps_a, quotes_a, seps_b, quotes_b) = (word(R_SEPS_A), word(R_QUOTES_A), word(R_SEPS_B), word(R_QUOTES_B));
+                    let fit = live & pairs(quotes_a, seps_a) & pairs(quotes_b, seps_b);
+                    // The separators' positions; a field starts one after the one before it.
+                    let (p1, rest) = lowest(seps_a);
+                    let (p2, rest) = lowest(rest);
+                    let (p3, _) = lowest(rest);
+                    let (p4, rest) = lowest(seps_b);
+                    let (p5, rest) = lowest(rest);
+                    let (p6, _) = lowest(rest);
+                    let one = all(1);
+                    let bit = |quotes: __m512i, comma: __m512i| _mm512_and_si512(_mm512_srlv_epi64(quotes, _mm512_add_epi64(comma, one)), one);
+                    let q = [_mm512_and_si512(quotes_a, one), bit(quotes_a, p1), bit(quotes_a, p2), _mm512_and_si512(quotes_b, one), bit(quotes_b, p4), bit(quotes_b, p5)];
+                    RawLanes { words, first, live, fit, p: [p1, p2, p3, p4, p5, p6], q }
+                }
+            }
+
+            /// Eight rows' word `word`.
+            #[inline(always)]
+            fn word(&self, word: usize) -> __m512i {
+                // SAFETY: `first + 8 <= ROWS` (`new`).
+                unsafe { _mm512_loadu_si512(self.words.get_unchecked(word).as_ptr().add(self.first).cast()) }
+            }
+
+            /// Field `field`'s length: from the comma before it (the window's first byte for
+            /// the first of a window) to its own, less its two quotes.
+            #[inline(always)]
+            fn len(&self, field: usize) -> __m512i {
+                // SAFETY: register arithmetic.
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let whole = if field == 0 || field == 3 {
+                        self.p[field]
+                    } else {
+                        _mm512_sub_epi64(_mm512_sub_epi64(self.p[field], self.p[field - 1]), all(1))
+                    };
+                    _mm512_sub_epi64(whole, _mm512_slli_epi64::<1>(self.q[field]))
+                }
+            }
+
+            /// The bits of field `field`'s wrapping quote, to shift off its words.
+            #[inline(always)]
+            fn quote(&self, field: usize) -> __m512i {
+                // SAFETY: register arithmetic.
+                #[allow(unused_unsafe)]
+                unsafe {
+                    _mm512_slli_epi64::<3>(self.q[field])
+                }
+            }
+        }
+
+        impl Fields for RawLanes<'_> {
+            #[inline(always)]
+            fn live(&self) -> __mmask8 {
+                self.live
+            }
+
+            #[inline(always)]
+            fn fit(&self) -> __mmask8 {
+                self.fit
+            }
+
+            #[inline(always)]
+            fn id(&self) -> [__m512i; 3] {
+                let (low, high, bits) = (self.word(R_ID), self.word(R_ID + 1), self.quote(0));
+                // SAFETY: register arithmetic.
+                #[allow(unused_unsafe)]
+                unsafe {
+                    [cut(low, high, bits), cut(low, high, _mm512_add_epi64(bits, all(8))), self.len(0)]
+                }
+            }
+
+            #[inline(always)]
+            fn user(&self) -> [__m512i; 3] {
+                let (low, high, bits) = (self.word(R_USER), self.word(R_USER + 1), self.quote(1));
+                // SAFETY: register arithmetic.
+                #[allow(unused_unsafe)]
+                unsafe {
+                    [cut(low, high, bits), cut(low, high, _mm512_add_epi64(bits, all(8))), self.len(1)]
+                }
+            }
+
+            #[inline(always)]
+            fn ts(&self, dates: &Dates) -> [__m512i; 6] {
+                let (w0, w1, w2, w3) = (self.word(R_TS), self.word(R_TS + 1), self.word(R_TS + 2), self.word(R_TS + 3));
+                let bits = self.quote(2);
+                // SAFETY: register arithmetic.
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let (ts_0, ts_8) = (cut(w0, w1, bits), cut(w1, w2, bits));
+                    let ts_12 = cut(w1, w2, _mm512_add_epi64(bits, all(32)));
+                    let ts_19 = cut(w2, w3, _mm512_add_epi64(bits, all(24)));
+                    [ts_0, ts_8, ts_12, ts_19, self.len(2), dates.date_wide(ts_0, ts_8)]
+                }
+            }
+
+            #[inline(always)]
+            fn ingest(&self, dates: &Dates) -> [__m512i; 4] {
+                let (w0, w1, w2) = (self.word(R_INGEST), self.word(R_INGEST + 1), self.word(R_INGEST + 2));
+                let bits = self.quote(3);
+                // SAFETY: register arithmetic.
+                #[allow(unused_unsafe)]
+                unsafe {
+                    let (ingest_0, ingest_8) = (cut(w0, w1, bits), cut(w1, w2, bits));
+                    [ingest_8, cut(w1, w2, _mm512_add_epi64(bits, all(32))), self.len(3), dates.date_wide(ingest_0, ingest_8)]
+                }
+            }
+
+            #[inline(always)]
+            fn kind(&self) -> [__m512i; 3] {
+                // SAFETY: register arithmetic.
+                #[allow(unused_unsafe)]
+                unsafe {
+                    [_mm512_srlv_epi64(self.word(R_KIND), self.quote(4)), self.len(4), self.len(5)]
+                }
+            }
+        }
+
+        /// Rows `first..first + 8` of `words` with every field cut: what `RawLanes` hands
+        /// `records`, all at once, for the tests to compare with the scalar tokenizer.
         ///
         /// # Safety
         /// `first + 8 <= ROWS`.
-        #[inline(always)]
+        #[cfg(test)]
         unsafe fn lanes_of(words: &[[u64; ROWS]; R_WORDS], first: usize, live: __mmask8, dates: &Dates) -> Lanes {
-            // SAFETY: loads of 8 words at `first <= ROWS - 8`, then register arithmetic.
-            unsafe {
-                let word = |word: usize| _mm512_loadu_si512(words.get_unchecked(word).as_ptr().add(first).cast());
-                let (seps_a, quotes_a, seps_b, quotes_b) = (word(R_SEPS_A), word(R_QUOTES_A), word(R_SEPS_B), word(R_QUOTES_B));
-                let fit = live & pairs(quotes_a, seps_a) & pairs(quotes_b, seps_b);
-                // The separators' positions; a field starts one after the one before it.
-                let (p1, rest) = lowest(seps_a);
-                let (p2, rest) = lowest(rest);
-                let (p3, _) = lowest(rest);
-                let (p4, rest) = lowest(seps_b);
-                let (p5, rest) = lowest(rest);
-                let (p6, _) = lowest(rest);
-                let one = all(1);
-                let (s1, s2, s4, s5) = (_mm512_add_epi64(p1, one), _mm512_add_epi64(p2, one), _mm512_add_epi64(p4, one), _mm512_add_epi64(p5, one));
-                // Whether each field is wrapped: a quote at its first byte.
-                let bit = |quotes: __m512i, at: __m512i| _mm512_and_si512(_mm512_srlv_epi64(quotes, at), one);
-                let (q0, q1, q2) = (_mm512_and_si512(quotes_a, one), bit(quotes_a, s1), bit(quotes_a, s2));
-                let (q3, q4, q5) = (_mm512_and_si512(quotes_b, one), bit(quotes_b, s4), bit(quotes_b, s5));
-                // A field's length: to its separator, less its two quotes.
-                let len = |end: __m512i, start: __m512i, q: __m512i| _mm512_sub_epi64(_mm512_sub_epi64(end, start), _mm512_slli_epi64::<1>(q));
-                let zero = _mm512_setzero_si512();
-                // The quote's 8 bits, to shift off a field's words.
-                let (b0, b1, b2, b3, b4) =
-                    (_mm512_slli_epi64::<3>(q0), _mm512_slli_epi64::<3>(q1), _mm512_slli_epi64::<3>(q2), _mm512_slli_epi64::<3>(q3), _mm512_slli_epi64::<3>(q4));
-                let more = |bits: __m512i, by: u64| _mm512_add_epi64(bits, all(by));
-                let (id0, id1, user0, user1) = (word(R_ID), word(R_ID + 1), word(R_USER), word(R_USER + 1));
-                let (ts0, ts1, ts2, ts3) = (word(R_TS), word(R_TS + 1), word(R_TS + 2), word(R_TS + 3));
-                let (in0, in1, in2) = (word(R_INGEST), word(R_INGEST + 1), word(R_INGEST + 2));
-                let (ts_0, ts_8) = (cut(ts0, ts1, b2), cut(ts1, ts2, b2));
-                let (ingest_0, ingest_8) = (cut(in0, in1, b3), cut(in1, in2, b3));
-                Lanes {
-                    live,
-                    fit,
-                    id_first: cut(id0, id1, b0),
-                    id_digits: cut(id0, id1, more(b0, 8)),
-                    id_len: len(p1, zero, q0),
-                    user_first: cut(user0, user1, b1),
-                    user_digits: cut(user0, user1, more(b1, 8)),
-                    user_len: len(p2, s1, q1),
-                    ts_0,
-                    ts_8,
-                    ts_12: cut(ts1, ts2, more(b2, 32)),
-                    ts_19: cut(ts2, ts3, more(b2, 24)),
-                    ts_len: len(p3, s2, q2),
-                    ts_date: dates.date_wide(ts_0, ts_8),
-                    ingest_8,
-                    ingest_12: cut(in1, in2, more(b3, 32)),
-                    ingest_len: len(p4, zero, q3),
-                    ingest_date: dates.date_wide(ingest_0, ingest_8),
-                    kind: _mm512_srlv_epi64(word(R_KIND), b4),
-                    kind_len: len(p5, s4, q4),
-                    product_len: len(p6, s5, q5),
-                }
+            let raw = unsafe { RawLanes::new(words, first, live) };
+            let ([id_first, id_digits, id_len], [user_first, user_digits, user_len]) = (raw.id(), raw.user());
+            let [ts_0, ts_8, ts_12, ts_19, ts_len, ts_date] = raw.ts(dates);
+            let [ingest_8, ingest_12, ingest_len, ingest_date] = raw.ingest(dates);
+            let [kind, kind_len, product_len] = raw.kind();
+            Lanes {
+                live: raw.live,
+                fit: raw.fit,
+                id_first,
+                id_digits,
+                id_len,
+                user_first,
+                user_digits,
+                user_len,
+                ts_0,
+                ts_8,
+                ts_12,
+                ts_19,
+                ts_len,
+                ts_date,
+                ingest_8,
+                ingest_12,
+                ingest_len,
+                ingest_date,
+                kind,
+                kind_len,
+                product_len,
             }
         }
 
@@ -1233,7 +1409,7 @@ pub(crate) mod wide {
                 // SAFETY: `first + 8 <= ROWS`. A lane past `rows` holds an older row's words
                 // or zeros, and `live` keeps it out of the records and the row code.
                 unsafe {
-                    let lanes = lanes_of(&raw.words, first, live(rows, first), dates);
+                    let lanes = RawLanes::new(&raw.words, first, live(rows, first));
                     let made = records(&lanes, &mut raw.held, ctx, dates, plan, limit);
                     let mut rest = made.rest;
                     // The purchases: the kernels' record, with the price and the product read
