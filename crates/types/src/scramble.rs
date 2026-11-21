@@ -161,19 +161,26 @@ pub fn canonical_packed(id: Id, letter: u8) -> Option<u64> {
 /// `canonical_at` maps back to `number`.
 pub fn id_of(number: u64, key: u64, letter: u8) -> Id {
     let mut rest = scrambled(number, key);
-    let mut bytes = [0u8; 9];
-    let mut at = bytes.len();
+    // The digits, the last first: at most 8, since the value is below 2^40.
+    let (mut digits, mut count) = ([0u8; 8], 0);
     loop {
-        at -= 1;
-        bytes[at] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(rest % 36) as usize];
+        digits[count] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(rest % 36) as usize];
         rest /= 36;
+        count += 1;
         if rest == 0 {
             break;
         }
     }
-    at -= 1;
-    bytes[at] = letter;
-    id::pack(&bytes[at..])
+    // Packed as `id::pack` packs the text: 7 bits a byte, the letter in bits 56..63, each
+    // digit 7 bits below the one before it, so the 8th lands in the low bits where a ninth
+    // byte goes. (Through the text and `pack` this was 350 instructions, and every person
+    // without links is named by it.)
+    let (mut packed, mut shift) = (u64::from(letter) << 56, 49);
+    for &digit in digits[..count].iter().rev() {
+        packed |= u64::from(digit) << shift;
+        shift -= 7;
+    }
+    packed
 }
 
 /// Eight IDs at once (AVX-512), for the positional parse's batches (`ingest::pos`).
@@ -296,6 +303,39 @@ mod tests {
             }
         }
         assert!(canonical > 4000, "only {canonical} canonical spellings tested");
+    }
+
+    #[test]
+    fn id_of_packs_the_text() {
+        let key = 0x7F_0123_4567;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        for round in 0..20_000u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Every length of the scrambled value, the ends of the range among them.
+            let value = match round % 4 {
+                0 => state & MASK,
+                1 => (state % 36u64.pow((round % 9) as u32)).min(MASK),
+                2 => MASK - state % 5,
+                _ => state % 3,
+            };
+            // The number that scrambles to `value`.
+            let number = number_of_half(half(value), key);
+            assert_eq!(scrambled(number, key), value);
+            let mut text = vec![b'u'];
+            let mut digits = Vec::new();
+            let mut rest = value;
+            loop {
+                digits.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(rest % 36) as usize]);
+                rest /= 36;
+                if rest == 0 {
+                    break;
+                }
+            }
+            text.extend(digits.iter().rev());
+            assert_eq!(id_of(number, key, b'u'), id::pack(&text), "{:?}", String::from_utf8_lossy(&text));
+        }
     }
 
     #[test]

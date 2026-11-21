@@ -679,7 +679,9 @@ unsafe fn place(
             }
         }
     }
-    result.pays.sort_unstable();
+    // By event number, then `pay`, as one word a pair: the pairs compared field by field
+    // were 135 instructions a purchase.
+    result.pays.sort_unstable_by_key(|&(number, pay)| u64::from(number) << 32 | u64::from(pay));
     result.pays.dedup_by_key(|&mut (number, _)| number);
     // A kept copy whose user is not a number leaves the table for the classic lane.
     if !odd.is_empty() {
