@@ -30,7 +30,8 @@ use sessions::{Agg, Click};
 use types::hash::person_hash;
 use types::par;
 use types::pos::{POS_ODD_USER, POS_VALID, PosEvent};
-use types::record::{ClickRec, PersonEvent, VALID};
+use types::record::{ClickRec, PAY_CATEGORY_SHIFT, PAY_PRICE_MASK, PersonEvent, VALID};
+use types::rows::NO_CATEGORY;
 use types::rows::UserDaily;
 use types::scramble::{self, ALIAS_BITS, ALIAS_MASK};
 use types::{Ctx, Id};
@@ -362,9 +363,71 @@ struct Share {
     over: Vec<u8>,
 }
 
+/// In `Cut::s_ord`: the session's first event is also its run's first.
+const RUN: u32 = 1 << 31;
+/// In `Cut::s_camp`: not a fast-lane session (its run is an edge's, the classic lane's, or
+/// has extras), so nothing here counts it.
+const SKIP: u32 = u32::MAX;
+
+/// A worker's arrays for a partition cut into sessions (`cut`, `Fused::partition_cut`): what
+/// the passes after the scan read instead of the events. Reused for every partition.
+#[derive(Default)]
+struct Cut {
+    /// Per session, in table order: its first event's ordinal among the partition's events
+    /// (with `RUN`), that event's `ts` and user, its day, its credited campaign (or `SKIP`),
+    /// its revenue and its row.
+    s_ord: Vec<u32>,
+    s_ts: Vec<u32>,
+    s_u: Vec<u32>,
+    s_day: Vec<u32>,
+    s_camp: Vec<u32>,
+    s_row: Vec<u32>,
+    s_rev: Vec<u64>,
+    /// Per 16 slots: the sessions before them, and the slots where one starts, a bit each.
+    blk_ns: Vec<u32>,
+    starts: Vec<u16>,
+    /// Per run, beside `Work::runs`: its first session; then the number of sessions.
+    run_s0: Vec<u32>,
+    /// Per `user_daily` row (a run's sessions of one day): the day, the first session, the
+    /// first event's ordinal, the revenue and the top category.
+    row_day: Vec<u32>,
+    row_s0: Vec<u32>,
+    row_e0: Vec<u32>,
+    row_rev: Vec<u64>,
+    row_cat: Vec<u8>,
+    /// The partition's fast-lane runs: the person's name and its sessions.
+    fit: Vec<(Id, u32, u32)>,
+    /// Per category: the row its purchases were last summed for, and that sum.
+    cat_row: Vec<u32>,
+    cat_sum: Vec<u64>,
+}
+
+/// How a placed partition becomes sessions, the pick first (`SS_POS_CUT`): one vector pass
+/// over the slots that emits a record per session (`cut`), or two columns and then a walk of
+/// every slot of every run (`scan`, `sessions::positional::person`).
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "bmi2"
+))]
+const CUTS: &[&str] = &["vector", "slots"];
+#[cfg(not(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "bmi2"
+)))]
+const CUTS: &[&str] = &["slots"];
+
 /// A worker's state for the stages after the parse.
 struct Work {
     agg: Agg,
+    cut: Cut,
     slow_events: Vec<PersonEvent>,
     slow_clicks: Vec<ClickRec>,
     placing: Placing,
@@ -389,6 +452,7 @@ impl Work {
         agg.user_daily.reserve(rows);
         Work {
             agg,
+            cut: Cut::default(),
             slow_events: Vec::new(),
             slow_clicks: Vec::new(),
             placing: Placing::default(),
@@ -487,7 +551,8 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
     if STAGES[types::env::pick("SS_POS_STAGES", STAGES)] == "fused" {
         let state: Vec<AtomicU8> = (0..persons).map(|_| AtomicU8::new(0)).collect();
         let conflict = AtomicBool::new(false);
-        let shared = Fused { ctx, plan, parsed: &parsed, links, extras: &extras, grouped: &grouped, click_aliases: &click_aliases, flags: &flags, state: &state, conflict: &conflict };
+        let vector = CUTS[types::env::pick("SS_POS_CUT", CUTS)] == "vector";
+        let shared = Fused { ctx, plan, parsed: &parsed, links, extras: &extras, grouped: &grouped, vector, click_aliases: &click_aliases, flags: &flags, state: &state, conflict: &conflict };
         if fused_stages(&shared, &mut works, &mut slow_events, lap) {
             let sum = |at: usize| works.iter().map(|work| work.stats[at]).sum::<u64>();
             stats = Some((sum(0) as usize, sum(1) as usize, [sum(2), sum(3), sum(4), sum(5)]));
@@ -584,6 +649,8 @@ struct Fused<'a> {
     /// By person.
     extras: &'a [Extra],
     grouped: &'a Grouped,
+    /// Whether a partition is cut by the vector pass (`CUTS`).
+    vector: bool,
     click_aliases: &'a [u64],
     /// `UNFIT` for a person with a click alias over the masks (`group_clicks`), `EXTRA` for
     /// one with extras.
@@ -698,6 +765,189 @@ impl<'a> Fused<'a> {
     /// Places partition `part` in the worker's own slots and, while they are in cache, takes
     /// every run but the first and the last through its sessions. Returns those two.
     fn partition(&self, part: usize, work: &mut Work) -> Vec<Edge> {
+        #[cfg(all(
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512dq",
+            target_feature = "avx512vl",
+            target_feature = "bmi2"
+        ))]
+        if self.vector {
+            return self.partition_cut(part, work);
+        }
+        self.partition_slots(part, work)
+    }
+
+    /// `partition` with the sessions cut by the vector pass. After it no event is looked at
+    /// again but the purchases: a session is a record (`Cut`), and the days and rows, the
+    /// credit, the purchases and the output are each a pass over records of one kind. (Walked
+    /// slot by slot and session by session, each with its day, its purchases, its credit and
+    /// its counters in turn, the sessions were a third of the cycles after the parse.)
+    #[cfg(all(
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512dq",
+        target_feature = "avx512vl",
+        target_feature = "bmi2"
+    ))]
+    fn partition_cut(&self, part: usize, work: &mut Work) -> Vec<Edge> {
+        let Work { agg, slow_events, placing, runs, stats, cut: c, .. } = work;
+        let Some(pays) = place_rows(part, self.plan, self.parsed, self.links, placing) else { return Vec::new() };
+        let (ctx, base, kept) = (self.ctx, part << self.plan.shift, &placing.kept[..]);
+        runs.clear();
+        // SAFETY: the slots are a multiple of 16 (a partition is at least 2^10 numbers).
+        let (events, ns) = unsafe { cut(kept, base, c, runs) };
+
+        // Each session's day, and the rows: a run's sessions of one day.
+        let (mut nrow, mut last_day) = (0usize, u32::MAX);
+        for s in 0..ns {
+            let day = (ctx.day_of(c.s_ts[s]) - ctx.day0) as u32;
+            c.s_day[s] = day;
+            if c.s_ord[s] & RUN != 0 || day != last_day {
+                (c.row_day[nrow], c.row_s0[nrow], c.row_e0[nrow]) = (day, s as u32, c.s_ord[s] & !RUN);
+                nrow += 1;
+            }
+            c.s_row[s] = nrow as u32 - 1;
+            last_day = day;
+        }
+        (c.row_s0[nrow], c.row_e0[nrow]) = (ns as u32, events);
+        let organic = ctx.organic();
+        c.s_camp[..ns].fill(organic);
+        c.s_rev[..ns].fill(0);
+        c.row_rev[..nrow].fill(0);
+        c.row_cat[..nrow].fill(NO_CATEGORY);
+
+        // The runs: who is a fast-lane person, and the credit of those with clicks.
+        let valid = |slot: usize| kept[slot].flags() & POS_VALID != 0;
+        // The `pay` of the event in `slot`, 0 for none; the purchases come in slot order.
+        let pay_of = |slot: usize, next_pay: &mut usize| match pays.get(*next_pay) {
+            Some(&(number, pay)) if number as usize == base + slot => {
+                *next_pay += 1;
+                pay
+            }
+            _ => 0,
+        };
+        c.fit.clear();
+        let (mut edges, mut next_pay) = (Vec::new(), 0);
+        for (at, run) in runs.iter().enumerate() {
+            let person = run.person as usize;
+            let (first, end) = (run.first as usize - base, run.end as usize - base);
+            let (s0, s1) = (c.run_s0[at] as usize, c.run_s0[at + 1] as usize);
+            let edge = at == 0 || at + 1 == runs.len();
+            let (fit, extra) = if edge {
+                (false, false)
+            } else {
+                // A second run of the person: everything here is void (`fused_stages`).
+                let Some(taken) = self.take(person, run.aliases, run.unfit, (end - first) as u64, stats) else { return Vec::new() };
+                taken
+            };
+            if fit && !extra {
+                let name = self.name(person, kept[first].u());
+                // SAFETY: taken just above.
+                let clicks = unsafe { self.clicks(person) };
+                if !clicks.is_empty() {
+                    agg.attribute(clicks, &c.s_ts[s0..s1], &c.s_day[s0..s1], organic, &mut c.s_camp[s0..s1]);
+                }
+                c.fit.push((name, s0 as u32, s1 as u32));
+                continue;
+            }
+            // Everyone else leaves with its events, as before the sessions were records.
+            c.s_camp[s0..s1].fill(SKIP);
+            // Purchases of fast-lane runs passed, and of events that left the table.
+            while pays.get(next_pay).is_some_and(|&(number, _)| number < run.first) {
+                next_pay += 1;
+            }
+            let events = (first..end).filter(|&slot| valid(slot)).map(|slot| (kept[slot].ts(), pay_of(slot, &mut next_pay), kept[slot].u()));
+            if edge {
+                edges.push(Edge { run: *run, first: at == 0, last: at + 1 == runs.len(), events: events.collect() });
+            } else if !fit {
+                slow_events.extend(events.map(|(ts, pay, u)| PersonEvent { person: self.links.person(u), ts, pay }));
+            } else {
+                let name = self.name(person, kept[first].u());
+                // SAFETY: taken just above.
+                let clicks = unsafe { self.clicks(person) };
+                let all = with_extras(events.map(|(ts, pay, _)| (ts, pay)), self.extras_of(person), end - first);
+                sessions::positional::person_pairs(ctx, name, &all, clicks, agg);
+            }
+        }
+
+        // The purchases, the only events looked at again: each to its session (the starts at
+        // or before its slot, counted) and its row.
+        c.cat_row.clear();
+        c.cat_row.resize(256, u32::MAX);
+        c.cat_sum.resize(256, 0);
+        let (mut row_now, mut best) = (u32::MAX, 0u64);
+        for &(number, pay) in &pays {
+            let slot = number as usize - base;
+            let before = u32::from(c.starts[slot >> 4]) & ((2u32 << (slot & 15)) - 1);
+            let session = (c.blk_ns[slot >> 4] + before.count_ones() - 1) as usize;
+            if c.s_camp[session] == SKIP {
+                continue;
+            }
+            let (price, category) = (u64::from(pay & PAY_PRICE_MASK), (pay >> PAY_CATEGORY_SHIFT) as usize);
+            let row = c.s_row[session];
+            c.s_rev[session] += price;
+            c.row_rev[row as usize] += price;
+            // The row's top category so far: the largest sum, the smallest index among equals
+            // (`agg_dense::Day::flush`). The purchases come row after row.
+            let sum = if c.cat_row[category] == row { c.cat_sum[category] } else { 0 } + price;
+            (c.cat_row[category], c.cat_sum[category]) = (row, sum);
+            if row != row_now {
+                (row_now, best) = (row, 0);
+            }
+            let key = sum << 8 | (255 - category as u64);
+            if key > best {
+                best = key;
+                c.row_cat[row as usize] = category as u8;
+            }
+        }
+
+        // The credit of every fast-lane session, then the rows.
+        for &(_, s0, s1) in &c.fit {
+            for s in s0 as usize..s1 as usize {
+                agg.credit(c.s_camp[s], c.s_day[s] as usize, c.s_rev[s]);
+            }
+        }
+        // Room for every row of the partition once, then plain stores: extended run by run,
+        // the six columns were 4 million calls for 2.2 million rows.
+        let out = &mut agg.user_daily;
+        out.reserve(nrow);
+        let mut at = out.person.len();
+        debug_assert!([out.day.len(), out.sessions.len(), out.events.len(), out.revenue_cents.len(), out.top_category.len()].iter().all(|&len| len == at));
+        let (person, day, sessions, events, revenue, category) =
+            (out.person.as_mut_ptr(), out.day.as_mut_ptr(), out.sessions.as_mut_ptr(), out.events.as_mut_ptr(), out.revenue_cents.as_mut_ptr(), out.top_category.as_mut_ptr());
+        for &(name, s0, s1) in &c.fit {
+            let (r0, r1) = (c.s_row[s0 as usize] as usize, if (s1 as usize) < ns { c.s_row[s1 as usize] as usize } else { nrow });
+            for row in r0..r1 {
+                // SAFETY: the fast-lane runs' rows are among the partition's `nrow`, each
+                // written once, inside the room reserved above in every column.
+                unsafe {
+                    person.add(at).write(name);
+                    day.add(at).write(ctx.day0 + c.row_day[row] as i32);
+                    sessions.add(at).write(i64::from(c.row_s0[row + 1] - c.row_s0[row]));
+                    events.add(at).write(i64::from(c.row_e0[row + 1] - c.row_e0[row]));
+                    revenue.add(at).write(c.row_rev[row] as i64);
+                    category.add(at).write(c.row_cat[row]);
+                }
+                at += 1;
+            }
+        }
+        // SAFETY: rows `..at` of every column are written, and the six had one length.
+        unsafe {
+            out.person.set_len(at);
+            out.day.set_len(at);
+            out.sessions.set_len(at);
+            out.events.set_len(at);
+            out.revenue_cents.set_len(at);
+            out.top_category.set_len(at);
+        }
+        edges
+    }
+
+    /// `partition` with the slots read into two columns and every run walked slot by slot.
+    fn partition_slots(&self, part: usize, work: &mut Work) -> Vec<Edge> {
         let Work { agg, slow_events, placing, times, users, runs, stats, .. } = work;
         let Some(pays) = place_rows(part, self.plan, self.parsed, self.links, placing) else { return Vec::new() };
         let (slots, base) = (1usize << self.plan.shift, part << self.plan.shift);
@@ -1347,6 +1597,143 @@ unsafe fn group_clicks_wide(
             }
         }
     });
+}
+
+/// Cuts a placed partition into sessions, 16 slots a step: the kept events' `ts` and users are
+/// packed to the front of two registers, each is compared with the event before it (the last
+/// of the step before, carried), and for every event that starts a session its ordinal, `ts`
+/// and user are stored: `c.s_ord`, `c.s_ts`, `c.s_u`, with `c.blk_ns` and `c.starts` to find
+/// a slot's session again. The runs are listed as `scan` lists them, in `runs`, each with its
+/// first session in `c.run_s0`; only a step where a run starts, an alias changes or a `ts`
+/// goes back leaves the registers. Returns the events and the sessions.
+///
+/// # Safety
+/// `kept.len()` is a multiple of 16.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "bmi2"
+))]
+unsafe fn cut(kept: &[PosEvent], base: usize, c: &mut Cut, runs: &mut Vec<Run>) -> (u32, usize) {
+    use core::arch::x86_64::*;
+    let slots = kept.len();
+    debug_assert!(slots % 16 == 0);
+    let blocks = slots / 16;
+    // A step stores 16 lanes wherever its sessions begin, and the passes after it one entry
+    // past the last: room for both.
+    for column in [&mut c.s_ord, &mut c.s_ts, &mut c.s_u, &mut c.s_day, &mut c.s_camp, &mut c.s_row, &mut c.row_day, &mut c.row_s0, &mut c.row_e0] {
+        column.resize(slots + 32, 0);
+    }
+    c.s_rev.resize(slots + 32, 0);
+    c.row_rev.resize(slots + 32, 0);
+    c.row_cat.resize(slots + 32, 0);
+    c.blk_ns.resize(blocks + 1, 0);
+    c.starts.resize(blocks + 1, 0);
+    c.run_s0.clear();
+    let (s_ord, s_ts, s_u, blk_ns, starts) = (c.s_ord.as_mut_ptr(), c.s_ts.as_mut_ptr(), c.s_u.as_mut_ptr(), c.blk_ns.as_mut_ptr(), c.starts.as_mut_ptr());
+    // SAFETY: every load is of 4 records inside `kept`; every store is at most 16 entries from
+    // `ns <= slots`, inside the room made above.
+    unsafe {
+        let (first_words, second_words) = (_mm512_setr_epi64(0, 2, 4, 6, 8, 10, 12, 14), _mm512_setr_epi64(1, 3, 5, 7, 9, 11, 13, 15));
+        let valid_bit = _mm512_set1_epi64((u64::from(POS_VALID) << 48) as i64);
+        let lanes = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let (person_bits, alias_bits) = (_mm512_set1_epi32(!ALIAS_MASK as i32), _mm512_set1_epi32(ALIAS_MASK as i32));
+        let (gap, run_flag) = (_mm512_set1_epi32(sessions::SESSION_GAP as i32), _mm512_set1_epi32(RUN as i32));
+        // The last kept event so far, in every lane, and as scalars with its slot.
+        let (mut last_ts_lanes, mut last_u_lanes) = (_mm512_setzero_si512(), _mm512_setzero_si512());
+        let (mut last_ts, mut last_slot) = (0u32, 0usize);
+        // The open run.
+        let mut open: Option<Run> = None;
+        let (mut events, mut ns) = (0u32, 0usize);
+        for block in 0..blocks {
+            let rows = kept.as_ptr().add(block * 16).cast::<__m512i>();
+            let (a, b, c2, d) = (_mm512_loadu_si512(rows), _mm512_loadu_si512(rows.add(1)), _mm512_loadu_si512(rows.add(2)), _mm512_loadu_si512(rows.add(3)));
+            // `PosEvent`: u | ts << 32, then ingest | slot << 32 | flags << 48.
+            let (low_0, high_0) = (_mm512_permutex2var_epi64(a, first_words, b), _mm512_permutex2var_epi64(a, second_words, b));
+            let (low_1, high_1) = (_mm512_permutex2var_epi64(c2, first_words, d), _mm512_permutex2var_epi64(c2, second_words, d));
+            let keep = u32::from(_mm512_test_epi64_mask(high_0, valid_bit)) | u32::from(_mm512_test_epi64_mask(high_1, valid_bit)) << 8;
+            *blk_ns.add(block) = ns as u32;
+            if keep == 0 {
+                *starts.add(block) = 0;
+                continue;
+            }
+            let ts = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(_mm512_cvtepi64_epi32(_mm512_srli_epi64::<32>(low_0))), _mm512_cvtepi64_epi32(_mm512_srli_epi64::<32>(low_1)));
+            let u = _mm512_inserti64x4::<1>(_mm512_castsi256_si512(_mm512_cvtepi64_epi32(low_0)), _mm512_cvtepi64_epi32(low_1));
+            // The kept events to the front, in slot order.
+            let (ts, u) = (_mm512_maskz_compress_epi32(keep as __mmask16, ts), _mm512_maskz_compress_epi32(keep as __mmask16, u));
+            let width = keep.count_ones();
+            let live = ((1u32 << width) - 1) as __mmask16;
+            // Each event beside the one before it.
+            let (before_ts, before_u) = (_mm512_alignr_epi32::<15>(ts, last_ts_lanes), _mm512_alignr_epi32::<15>(u, last_u_lanes));
+            let delta = _mm512_xor_si512(u, before_u);
+            // The partition's first event starts a run whatever the lanes held.
+            let run = (_mm512_test_epi32_mask(delta, person_bits) | __mmask16::from(open.is_none())) & live;
+            let start = run | (_mm512_cmpgt_epu32_mask(_mm512_sub_epi32(ts, before_ts), gap) & live);
+            let changed = _mm512_test_epi32_mask(delta, alias_bits) & !run & live;
+            let back = _mm512_cmplt_epu32_mask(ts, before_ts) & !run & live;
+
+            let ordinals = _mm512_add_epi32(_mm512_set1_epi32(events as i32), lanes);
+            let flagged = _mm512_mask_or_epi32(ordinals, run, ordinals, run_flag);
+            _mm512_storeu_si512(s_ord.add(ns).cast(), _mm512_maskz_compress_epi32(start, flagged));
+            _mm512_storeu_si512(s_ts.add(ns).cast(), _mm512_maskz_compress_epi32(start, ts));
+            _mm512_storeu_si512(s_u.add(ns).cast(), _mm512_maskz_compress_epi32(start, u));
+            *starts.add(block) = _pdep_u32(u32::from(start), keep) as u16;
+
+            let odd = run | changed | back;
+            if odd != 0 {
+                let (mut ts_of, mut u_of) = ([0u32; 16], [0u32; 16]);
+                _mm512_storeu_si512(ts_of.as_mut_ptr().cast(), ts);
+                _mm512_storeu_si512(u_of.as_mut_ptr().cast(), u);
+                let slot_of = |lane: usize| block * 16 + _pdep_u32(1 << lane, keep).trailing_zeros() as usize;
+                let mut rest = u32::from(odd);
+                while rest != 0 {
+                    let lane = rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    let (ts_here, u_here) = (ts_of[lane], u_of[lane]);
+                    let alias = u_here & ALIAS_MASK;
+                    if run >> lane & 1 != 0 {
+                        if let Some(mut done) = open.take() {
+                            // Its last event is the one before this.
+                            let (slot, ts_before) = if lane == 0 { (last_slot, last_ts) } else { (slot_of(lane - 1), ts_of[lane - 1]) };
+                            (done.end, done.last_ts) = ((base + slot + 1) as u32, ts_before);
+                            runs.push(done);
+                        }
+                        c.run_s0.push(ns as u32 + (u32::from(start) & ((1 << lane) - 1)).count_ones());
+                        open = Some(Run {
+                            person: u_here >> ALIAS_BITS,
+                            first: (base + slot_of(lane)) as u32,
+                            end: 0,
+                            first_ts: ts_here,
+                            last_ts: ts_here,
+                            aliases: 1 << (alias & (MASK_ALIASES - 1)),
+                            unfit: alias >= MASK_ALIASES,
+                        });
+                    } else if let Some(run) = open.as_mut() {
+                        run.aliases |= 1 << (alias & (MASK_ALIASES - 1));
+                        run.unfit |= alias >= MASK_ALIASES || back >> lane & 1 != 0;
+                    }
+                }
+            }
+
+            let last = _mm512_set1_epi32(width as i32 - 1);
+            (last_ts_lanes, last_u_lanes) = (_mm512_permutexvar_epi32(last, ts), _mm512_permutexvar_epi32(last, u));
+            last_ts = _mm_cvtsi128_si32(_mm512_castsi512_si128(last_ts_lanes)) as u32;
+            last_slot = block * 16 + 31 - keep.leading_zeros() as usize;
+            ns += start.count_ones() as usize;
+            events += width;
+        }
+        if let Some(mut done) = open.take() {
+            (done.end, done.last_ts) = ((base + last_slot + 1) as u32, last_ts);
+            runs.push(done);
+        }
+        *blk_ns.add(blocks) = ns as u32;
+        *s_ord.add(ns) = events | RUN;
+        c.run_s0.push(ns as u32);
+        (events, ns)
+    }
 }
 
 #[cold]

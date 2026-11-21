@@ -105,6 +105,31 @@ impl Agg {
     }
 }
 
+#[cfg(feature = "pipe-positional")]
+impl Agg {
+    /// Credits one person's sessions and counts their assists (`attr-interval`): session `i`
+    /// starts at `starts[i]` on day `days[i]` (an index into the days), in time order, and
+    /// `credits[i]` becomes its campaign. `clicks` are the person's, in any order.
+    pub fn attribute(&mut self, clicks: &mut [Click], starts: &[u32], days: &[u32], organic: u32, credits: &mut [u32]) {
+        let Agg { bucket: scratch, stretch: attr, counters, .. } = self;
+        let clicks = partitioned::sort_person_clicks(scratch, clicks);
+        for ((&start, &day), credit) in starts.iter().zip(days).zip(credits.iter_mut()) {
+            *credit = attr.session(clicks, start, day as usize, organic, counters.assisted());
+        }
+        attr.end_person(counters.assisted());
+    }
+
+    /// One session credited to `campaign` on day `day`, with its revenue.
+    #[inline(always)]
+    pub fn credit(&mut self, campaign: u32, day: usize, revenue: u64) {
+        self.counters.credit(campaign, day, revenue);
+    }
+}
+
+/// A gap between two of a person's events over this many ms starts a session.
+#[cfg(feature = "pipe-positional")]
+pub const SESSION_GAP: u32 = partitioned::GAP as u32;
+
 /// Processes one person bucket: `events` and `clicks` are the workers' vectors of that bucket,
 /// so every row of a person is in them. Appends the bucket's `user_daily` rows to `agg` and
 /// adds its sessions to `agg`'s campaign counters. Called concurrently, one `agg` per worker.
