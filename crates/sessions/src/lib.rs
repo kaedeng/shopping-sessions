@@ -13,6 +13,8 @@
 mod agg_dense;
 #[cfg(feature = "pipe-positional")]
 mod attr_interval;
+#[cfg(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
+mod attr_wide;
 #[cfg(feature = "attr-sweep")]
 mod attr_sweep;
 #[cfg(feature = "sess-partitioned")]
@@ -86,6 +88,10 @@ pub struct Agg {
     /// The positional pipeline's attribution (`attr-interval`).
     #[cfg(feature = "pipe-positional")]
     stretch: attr_interval::Attr,
+    /// The fast lane's (`attr-wide`), where the build has it and the window is at most 16
+    /// days; `SS_ATTR=wide|interval`.
+    #[cfg(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
+    wide: Option<attr_wide::Attr>,
     day: agg_dense::Day,
     counters: agg_dense::Counters,
 }
@@ -99,6 +105,8 @@ impl Agg {
             attr: attr_sweep::Attr::new(ctx),
             #[cfg(feature = "pipe-positional")]
             stretch: attr_interval::Attr::new(ctx),
+            #[cfg(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
+            wide: (ctx.n_days <= attr_wide::DAYS && types::env::pick("SS_ATTR", &["wide", "interval"]) == 0).then(|| attr_wide::Attr::new(ctx.campaigns.len())),
             day: Default::default(),
             counters: agg_dense::Counters::new(ctx),
         }
@@ -111,6 +119,11 @@ impl Agg {
     /// starts at `starts[i]` on day `days[i]` (an index into the days), in time order, and
     /// `credits[i]` becomes its campaign. `clicks` are the person's, in any order.
     pub fn attribute(&mut self, clicks: &mut [Click], starts: &[u32], days: &[u32], organic: u32, credits: &mut [u32]) {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
+        if let Some(wide) = &mut self.wide {
+            credits.fill(organic);
+            return wide.person(clicks, starts, days, credits, self.counters.wide());
+        }
         let Agg { bucket: scratch, stretch: attr, counters, .. } = self;
         let clicks = partitioned::sort_person_clicks(scratch, clicks);
         for ((&start, &day), credit) in starts.iter().zip(days).zip(credits.iter_mut()) {

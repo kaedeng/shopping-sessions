@@ -210,6 +210,13 @@ fn sort_clicks<'s>(clicks: &'s mut [Click], order: &mut Vec<u64>, sorted: &'s mu
     sorted
 }
 
+/// A person's clicks in `click_order`, for tests of other attributions.
+#[cfg(test)]
+pub(crate) fn sort_clicks_for_test(clicks: &mut [Click]) -> Vec<Click> {
+    clicks.sort_unstable_by(click_order);
+    clicks.to_vec()
+}
+
 /// One person's clicks in `click_order`, sorted in place or into the scratch (`sort_clicks`).
 #[cfg(feature = "pipe-positional")]
 pub(crate) fn sort_person_clicks<'s>(scratch: &'s mut Scratch, clicks: &'s mut [Click]) -> &'s [Click] {
@@ -225,7 +232,7 @@ pub fn bucket<'a, const STRETCH: bool>(
     agg: &mut Agg,
 ) {
     #[cfg(feature = "pipe-positional")]
-    let Agg { user_daily, bucket: scratch, rows, attr, stretch, day, counters } = agg;
+    let Agg { user_daily, bucket: scratch, rows, attr, stretch, day, counters, .. } = agg;
     #[cfg(not(feature = "pipe-positional"))]
     let Agg { user_daily, bucket: scratch, rows, attr, day, counters } = agg;
     let n: usize = events.clone().map(<[_]>::len).sum();

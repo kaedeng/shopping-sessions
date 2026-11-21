@@ -90,12 +90,26 @@ pub struct Counters {
     /// apart from credits, since a session writes several of them.
     credited: Vec<Credited>,
     assisted: Vec<u32>,
+    /// More assists, `[campaign * 16 + day]`: `attr-wide`'s, which adds a campaign's days at
+    /// once. Empty for a window of more than 16 days, where that slot does not run.
+    wide: Vec<u32>,
 }
+
+/// Days a campaign has in `Counters::wide`.
+const WIDE_DAYS: usize = 16;
 
 impl Counters {
     pub fn new(ctx: &Ctx) -> Counters {
         let cells = ctx.campaigns.len() * ctx.n_days;
-        Counters { campaigns: ctx.campaigns.len(), credited: vec![Credited::default(); cells], assisted: vec![0; cells] }
+        let wide = if ctx.n_days <= WIDE_DAYS { ctx.campaigns.len() * WIDE_DAYS } else { 0 };
+        Counters { campaigns: ctx.campaigns.len(), credited: vec![Credited::default(); cells], assisted: vec![0; cells], wide: vec![0; wide] }
+    }
+
+    /// The table `attr-wide` adds to, `[campaign * 16 + day]`.
+    #[cfg(feature = "pipe-positional")]
+    #[inline(always)]
+    pub(crate) fn wide(&mut self) -> &mut [u32] {
+        &mut self.wide
     }
 
     #[inline(always)]
@@ -139,6 +153,13 @@ pub fn campaign_daily_part<'a>(ctx: &Ctx, workers: impl Iterator<Item = &'a Coun
             sum[1] += i64::from(credited.purchasing);
             sum[2] += credited.revenue as i64;
             sum[3] += i64::from(assisted);
+        }
+        // The other table's assists, cell by cell: a cell is `day * campaigns + campaign`.
+        if !counters.wide.is_empty() {
+            for (sum, cell) in sums.iter_mut().zip(from..to) {
+                let (day, campaign) = (cell / ctx.campaigns.len(), cell % ctx.campaigns.len());
+                sum[3] += i64::from(counters.wide[campaign * WIDE_DAYS + day]);
+            }
         }
     }
     let mut out = CampaignDaily::default();
