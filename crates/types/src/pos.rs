@@ -31,6 +31,18 @@ impl PosEvent {
         PosEvent { low: u64::from(u) | u64::from(ts) << 32, high: u64::from(ingest) | u64::from(slot) << 32 | u64::from(flags) << 48 }
     }
 
+    /// The record's two words, as `words` gives them.
+    #[inline(always)]
+    pub fn from_words(low: u64, high: u64) -> PosEvent {
+        PosEvent { low, high }
+    }
+
+    /// `(u | ts << 32, ingest | slot << 32 | flags << 48)`.
+    #[inline(always)]
+    pub fn words(&self) -> (u64, u64) {
+        (self.low, self.high)
+    }
+
     /// `person << 9 | alias`, or an index (`POS_ODD_USER`); anything when the row is invalid
     /// for an empty `user_id`.
     #[inline(always)]

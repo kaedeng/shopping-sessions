@@ -351,6 +351,38 @@ fn check_ts(dates: &Dates, ctx: &Ctx, text: &[u8]) {
     let want = reference_ts(text).map(|epoch| epoch - i128::from(ctx.origin)).filter(|&ms| in_click_window(ms));
     let got = (ok && in_click_window(i128::from(ms))).then_some(i128::from(ms));
     assert_eq!(got, want, "{:?}", String::from_utf8_lossy(text));
+    // The 8-wide forms: `f1_wide` accepts exactly what `f1` does, to the same values;
+    // `ts_wide` accepts nothing `ts` rejects, gives its value, and takes every F1, F2 and
+    // plain F3.
+    #[cfg(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq"))]
+    // SAFETY: a padded buffer has PAD bytes after the text.
+    unsafe {
+        use core::arch::x86_64::*;
+        let field = buf.as_ptr().add(1);
+        let all = |value: u64| _mm512_set1_epi64(value as i64);
+        let lane = |v: __m512i| {
+            let mut out = [0i64; 8];
+            _mm512_storeu_si512(out.as_mut_ptr().cast(), v);
+            assert!(out.iter().all(|&x| x == out[0]));
+            out[5]
+        };
+        let (g0, g1, g2, g3) = (all(ts::rd(field)), all(ts::rd(field.add(8))), all(ts::rd(field.add(12))), all(ts::rd(field.add(19))));
+        let (len, date) = (all(text.len() as u64), all(dates.date_s(field) as u64));
+        let (wide_ok, wide_ms, wide_s) = dates.f1_wide(g1, g2, len, date);
+        let (f1_ok, f1_ms, f1_s) = dates.f1(field, text.len());
+        assert_eq!(wide_ok, if f1_ok { 0xFF } else { 0 }, "f1 {:?}", String::from_utf8_lossy(text));
+        if f1_ok {
+            assert_eq!((lane(wide_ms), lane(wide_s)), (f1_ms, f1_s), "f1 {:?}", String::from_utf8_lossy(text));
+        }
+        let (wide_ok, wide_ms) = dates.ts_wide(g0, g1, g2, g3, len, date);
+        assert!(wide_ok == 0 || wide_ok == 0xFF);
+        if wide_ok != 0 {
+            assert_eq!((ok, ms), (true, lane(wide_ms)), "ts {:?}", String::from_utf8_lossy(text));
+        }
+        let plain_f3 = text.len() == 13 && text[0] != b'0' && text.iter().all(u8::is_ascii_digit);
+        let dated = text.len() > 10 && text[10] == b'T';
+        assert!(!((plain_f3 || dated) && ok) || wide_ok != 0, "ts not taken {:?}", String::from_utf8_lossy(text));
+    }
 }
 
 #[test]

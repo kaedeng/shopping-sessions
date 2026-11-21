@@ -139,6 +139,12 @@ impl Ctx {
         (self.origin_day + ((u64::from(ts) + self.origin_in_day) / DAY as u64) as i64) as i32
     }
 
+    /// The epoch second `ingest_rel` counts from.
+    #[inline(always)]
+    pub fn ingest_base(&self) -> i64 {
+        self.ingest_base
+    }
+
     /// An `ingest_ts` in epoch seconds as `EventRec::ingest` holds it: order-preserving over
     /// origin - 34 years to origin + 102 years, clamped beyond.
     #[inline(always)]

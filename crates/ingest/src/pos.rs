@@ -27,6 +27,12 @@ use crate::tok::{Field, Scalar, Scratch, Tok};
 use crate::ts::{Dates, rd};
 use crate::{Ingest, ingest_slow, price_cents};
 
+/// How event rows are decoded, the pick first (`SS_POS_DECODE`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq"))]
+const DECODES: &[&str] = &["wide", "row"];
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq")))]
+const DECODES: &[&str] = &["row"];
+
 /// Bytes of the first event chunk the key search reads, and the rows it takes from them.
 const SAMPLE_BYTES: usize = 512 << 10;
 const SAMPLE_ROWS: usize = 5000;
@@ -49,6 +55,8 @@ pub struct PosPlan {
     /// Persons per click list = `1 << click_shift`.
     pub click_shift: u32,
     pub click_parts: usize,
+    /// Event rows decoded eight at a time (`wide`), where the build has AVX-512; `SS_POS_DECODE`.
+    pub wide: bool,
 }
 
 impl PosPlan {
@@ -99,6 +107,20 @@ struct Pending<T> {
     lists: [u32; PENDING],
     recs: [T; PENDING],
     len: usize,
+}
+
+/// Where `event_row` leaves a record: the row path's `Pending`, or the wide path's batch.
+trait Sink {
+    /// # Safety
+    /// `list < events.lists()`.
+    unsafe fn put<M: Mode>(&mut self, list: usize, rec: PosEvent, events: &mut Parts<PosEvent>);
+}
+
+impl Sink for Pending<PosEvent> {
+    #[inline(always)]
+    unsafe fn put<M: Mode>(&mut self, list: usize, rec: PosEvent, events: &mut Parts<PosEvent>) {
+        unsafe { self.push::<M>(list, rec, events) }
+    }
 }
 
 impl<T: Copy + Default> Pending<T> {
@@ -161,6 +183,7 @@ impl Ingest {
             persons: persons as u32,
             click_shift,
             click_parts: persons.div_ceil(1 << click_shift),
+            wide: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "wide",
         })
     }
 
@@ -268,11 +291,15 @@ pub(crate) fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, plan: &PosPlan, tas
 /// `p, len` is a segment.
 #[inline(always)]
 unsafe fn events<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &PosPlan, out: &mut PosOut) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq"))]
+    if plan.wide {
+        return unsafe { wide::events::<T, M>(p, len, ctx, dates, plan, out) };
+    }
     let PosOut { events, pays, odd_events, odd_users, scratch, .. } = out;
     let limit = plan.events() as u64;
     let mut pending = Pending::new();
     unsafe {
-        T::lines::<7>(p, len, scratch, |fields| event_row::<M>(ctx, dates, plan, limit, fields, &mut pending, events, pays, odd_events, odd_users))
+        T::lines::<7>(p, len, scratch, |fields| event_row::<M, Pending<PosEvent>>(ctx, dates, plan, limit, fields, &mut pending, events, pays, odd_events, odd_users))
     };
     pending.flush::<M>(events);
     // Streamed lines become visible to the placing threads.
@@ -297,13 +324,13 @@ unsafe fn clicks<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &D
 /// The fields are from a segment.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn event_row<M: Mode>(
+unsafe fn event_row<M: Mode, S: Sink>(
     ctx: &Ctx,
     dates: &Dates,
     plan: &PosPlan,
     limit: u64,
     fields: &[Field; 7],
-    pending: &mut Pending<PosEvent>,
+    pending: &mut S,
     events: &mut Parts<PosEvent>,
     pays: &mut Parts<PosPay>,
     odd_events: &mut Vec<EventRec>,
@@ -346,7 +373,7 @@ unsafe fn event_row<M: Mode>(
             let (part, slot) = ((number >> plan.shift) as usize, (number & ((1 << plan.shift) - 1)) as u16);
             let rec = PosEvent::new(u, ts as u32, ingest_rel, slot, POS_VALID * u16::from(valid) | odd);
             // SAFETY: `number < parts << shift`.
-            unsafe { pending.push::<M>(part, rec, events) };
+            unsafe { pending.put::<M>(part, rec, events) };
             if valid & (pay != 0) {
                 pays.push(part, PosPay { slot: u32::from(slot), ingest: ingest_rel, pay });
             }
@@ -413,6 +440,254 @@ unsafe fn click_row<M: Mode>(
                 unsafe { pending.push::<M>(list, PosClick::new(click, number as u32, ts as u32, campaign), clicks) };
             }
             _ => odd_clicks.push(ClickRec { user: unsafe { pack_at(user.p, user.len) }, click, ts: ts as u32, campaign }),
+        }
+    }
+}
+
+/// Slot `pos-wide`: the event rows decoded eight at a time (AVX-512).
+///
+/// The rows of a chunk are gathered 64 at a time: each row's fields as the tokenizer gave
+/// them, the few 8-byte words of them the decode reads, and the dates of its two timestamps
+/// looked up. For each group of 8 the wide kernels (`types::scramble::wide::numbers`,
+/// `Dates::ts_wide`, `Dates::f1_wide`) decode both IDs, the `ts` and the `ingest_ts` in one
+/// pass, and the lanes that are plainly ordinary go out as records straight from the
+/// registers: both IDs spelled the generator's way with numbers inside the arrays, a `ts` that
+/// is F1, F2 or 13-digit F3, an F1 `ingest_ts` in the date table, the type `view` or `cart`, a
+/// `product_id`. Such a row's record is, bit for bit, the one `event_row` makes (the window
+/// and the late check are the same compares). Every other row (a purchase, anything dirty or
+/// odd) goes to `event_row` itself, so the wide path never has to be right about an unusual
+/// row, only to recognise one.
+///
+/// The words are copied row by row and not gathered: a gather is one instruction, but slow on
+/// AMD cores and on Intel ones under the Downfall mitigation.
+///
+/// One core, 20M: an event row was about 670 instructions, 255 of them the tokenizer; the
+/// decode's 350 are what this replaces for about 95% of the rows.
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq"
+))]
+pub(crate) mod wide {
+    use core::arch::x86_64::*;
+
+    use types::scramble::wide::numbers;
+
+    use super::*;
+    use crate::ts::rd;
+
+    /// Rows gathered before they are decoded; a multiple of 8.
+    const ROWS: usize = 64;
+    /// Records held before they are scattered; a group adds at most 8.
+    const HELD: usize = 128;
+
+    /// The words of a row the kernels read, one array per word (see `Batch::take`).
+    const ID_FIRST: usize = 0;
+    const ID_DIGITS: usize = 1;
+    const USER_FIRST: usize = 2;
+    const USER_DIGITS: usize = 3;
+    const TS_0: usize = 4;
+    const TS_8: usize = 5;
+    const TS_12: usize = 6;
+    const TS_19: usize = 7;
+    const TS_DATE: usize = 8;
+    const INGEST_8: usize = 9;
+    const INGEST_12: usize = 10;
+    const INGEST_DATE: usize = 11;
+    const KIND: usize = 12;
+    const WORDS: usize = 13;
+
+    pub(super) struct Batch {
+        /// `at[field][row]`, `len[field][row]`: the row's fields as the tokenizer gave them.
+        at: [[u64; ROWS]; 7],
+        len: [[u64; ROWS]; 7],
+        words: [[u64; ROWS]; WORDS],
+        rows: usize,
+        /// The records decoded and not yet scattered: list, then the record's two words.
+        lists: [u64; HELD],
+        low: [u64; HELD],
+        high: [u64; HELD],
+        held: usize,
+    }
+
+    impl Sink for Batch {
+        #[inline(always)]
+        unsafe fn put<M: Mode>(&mut self, list: usize, rec: PosEvent, _: &mut Parts<PosEvent>) {
+            debug_assert!(self.held < HELD);
+            let (low, high) = rec.words();
+            (self.lists[self.held], self.low[self.held], self.high[self.held]) = (list as u64, low, high);
+            self.held += 1;
+        }
+    }
+
+    impl Batch {
+        fn new() -> Batch {
+            Batch { at: [[0; ROWS]; 7], len: [[0; ROWS]; 7], words: [[0; ROWS]; WORDS], rows: 0, lists: [0; HELD], low: [0; HELD], high: [0; HELD], held: 0 }
+        }
+
+        /// Adds a row: its fields, and the words of them the kernels read.
+        ///
+        /// # Safety
+        /// `self.rows < ROWS`, and the fields are from a segment (27 bytes readable at each).
+        #[inline(always)]
+        unsafe fn take(&mut self, dates: &Dates, fields: &[Field; 7]) {
+            let row = self.rows;
+            // SAFETY: `row < ROWS`; every read is within 27 bytes of a field's first.
+            unsafe {
+                for (field, value) in fields.iter().enumerate() {
+                    *self.at.get_unchecked_mut(field).get_unchecked_mut(row) = value.p as u64;
+                    *self.len.get_unchecked_mut(field).get_unchecked_mut(row) = value.len as u64;
+                }
+                let [id, user, ts, ingest, kind, ..] = *fields;
+                let mut set = |word: usize, value: u64| *self.words.get_unchecked_mut(word).get_unchecked_mut(row) = value;
+                set(ID_FIRST, rd(id.p));
+                set(ID_DIGITS, rd(id.p.add(1)));
+                set(USER_FIRST, rd(user.p));
+                set(USER_DIGITS, rd(user.p.add(1)));
+                set(TS_0, rd(ts.p));
+                set(TS_8, rd(ts.p.add(8)));
+                set(TS_12, rd(ts.p.add(12)));
+                set(TS_19, rd(ts.p.add(19)));
+                set(TS_DATE, dates.date_s(ts.p) as u64);
+                set(INGEST_8, rd(ingest.p.add(8)));
+                set(INGEST_12, rd(ingest.p.add(12)));
+                set(INGEST_DATE, dates.date_s(ingest.p) as u64);
+                set(KIND, rd(kind.p));
+            }
+            self.rows = row + 1;
+        }
+
+        #[inline(always)]
+        fn flush<M: Mode>(&mut self, events: &mut Parts<PosEvent>) {
+            for at in 0..self.held {
+                // SAFETY: every list here was in range when put.
+                unsafe { events.push_as::<M>(self.lists[at] as usize, PosEvent::from_words(self.low[at], self.high[at])) };
+            }
+            self.held = 0;
+        }
+    }
+
+    #[inline(always)]
+    fn all(value: u64) -> __m512i {
+        // SAFETY: AVX-512F is compiled in (cfg above).
+        #[allow(unused_unsafe)]
+        unsafe {
+            _mm512_set1_epi64(value as i64)
+        }
+    }
+
+    /// One event chunk through the batches.
+    ///
+    /// # Safety
+    /// `p, len` is a segment.
+    #[inline(always)]
+    pub(super) unsafe fn events<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &PosPlan, out: &mut PosOut) {
+        let PosOut { events, pays, odd_events, odd_users, scratch, .. } = out;
+        let limit = plan.events() as u64;
+        let mut batch = Batch::new();
+        unsafe {
+            T::lines::<7>(p, len, scratch, |fields| {
+                // An empty `event_id` drops the line (rules "Events" step 1).
+                if fields[0].len == 0 {
+                    return;
+                }
+                batch.take(dates, fields);
+                if batch.rows == ROWS {
+                    decode::<M>(&mut batch, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+                }
+            });
+            decode::<M>(&mut batch, ctx, dates, plan, limit, events, pays, odd_events, odd_users);
+        }
+        batch.flush::<M>(events);
+        // Streamed lines become visible to the placing threads.
+        events.fence();
+        pays.fence();
+    }
+
+    /// Decodes the gathered rows and leaves the batch empty of rows.
+    ///
+    /// # Safety
+    /// Every gathered row's fields are from a segment still mapped.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn decode<M: Mode>(
+        batch: &mut Batch,
+        ctx: &Ctx,
+        dates: &Dates,
+        plan: &PosPlan,
+        limit: u64,
+        events: &mut Parts<PosEvent>,
+        pays: &mut Parts<PosPay>,
+        odd_events: &mut Vec<EventRec>,
+        odd_users: &mut Vec<Id>,
+    ) {
+        let rows = std::mem::take(&mut batch.rows);
+        let mut first = 0;
+        while first < rows {
+            if batch.held + 8 > HELD {
+                batch.flush::<M>(events);
+            }
+            let live: __mmask8 = if rows - first >= 8 { 0xFF } else { (1u8 << (rows - first)) - 1 };
+            // SAFETY: `first + 8 <= ROWS`. A lane past `rows` holds an older row's words or
+            // zeros, and `live` keeps it out of everything below.
+            unsafe {
+                let word = |word: usize| _mm512_loadu_si512(batch.words[word].as_ptr().add(first).cast());
+                let len = |field: usize| _mm512_loadu_si512(batch.len[field].as_ptr().add(first).cast());
+
+                let (number, id_ok) = numbers(word(ID_FIRST), word(ID_DIGITS), len(0), b'e', plan.event_key);
+                let (user, user_ok) = numbers(word(USER_FIRST), word(USER_DIGITS), len(1), b'u', plan.user_key);
+                let (ts_ok, ts) = dates.ts_wide(word(TS_0), word(TS_8), word(TS_12), word(TS_19), len(2), word(TS_DATE));
+                let (ingest_ok, ingest_ms, ingest_s) = dates.f1_wide(word(INGEST_8), word(INGEST_12), len(3), word(INGEST_DATE));
+                let kind = _mm512_and_si512(word(KIND), all(0xFFFF_FFFF));
+                let view_or_cart = (_mm512_cmpeq_epi64_mask(kind, all(u64::from(u32::from_le_bytes(*b"view"))))
+                    | _mm512_cmpeq_epi64_mask(kind, all(u64::from(u32::from_le_bytes(*b"cart")))))
+                    & _mm512_cmpeq_epi64_mask(len(4), all(4));
+                let fast = live
+                    & id_ok
+                    & _mm512_cmplt_epu64_mask(number, all(limit))
+                    & user_ok
+                    & _mm512_cmplt_epu64_mask(_mm512_srli_epi64::<{ ALIAS_BITS }>(user), all(u64::from(plan.persons)))
+                    & ts_ok
+                    & ingest_ok
+                    & view_or_cart
+                    & _mm512_cmpneq_epi64_mask(len(5), all(0));
+
+                // `event_row`'s `valid` for such a row: the window, and not late.
+                let valid = _mm512_cmpge_epi64_mask(ts, all(u64::from(ctx.event_lo)))
+                    & _mm512_cmplt_epi64_mask(ts, all(u64::from(ctx.ts_end)))
+                    & _mm512_cmple_epi64_mask(_mm512_sub_epi64(ingest_ms, ts), all(DAY as u64));
+                // `Ctx::ingest_rel`.
+                let ingest_rel = _mm512_min_epi64(
+                    _mm512_max_epi64(_mm512_sub_epi64(ingest_s, all(ctx.ingest_base() as u64)), all(0)),
+                    all(u64::from(u32::MAX)),
+                );
+                // `PosEvent::new`: u | ts << 32, then ingest | slot << 32 | flags << 48.
+                let low = _mm512_or_si512(_mm512_and_si512(user, all(0xFFFF_FFFF)), _mm512_slli_epi64::<32>(ts));
+                let slot = _mm512_and_si512(number, all((1u64 << plan.shift) - 1));
+                let high = _mm512_or_si512(
+                    _mm512_or_si512(ingest_rel, _mm512_slli_epi64::<32>(slot)),
+                    _mm512_maskz_mov_epi64(valid, all(u64::from(POS_VALID) << 48)),
+                );
+                let list = _mm512_srl_epi64(number, _mm_cvtsi32_si128(plan.shift as i32));
+                // Compressed in a register and stored whole (the lanes past the fast ones are
+                // overwritten by the next store): the compressing store is microcoded on Zen 4.
+                let held = batch.held;
+                _mm512_storeu_si512(batch.lists.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, list));
+                _mm512_storeu_si512(batch.low.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, low));
+                _mm512_storeu_si512(batch.high.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, high));
+                batch.held = held + fast.count_ones() as usize;
+
+                // Every other row, through the row code.
+                let mut rest = live & !fast;
+                while rest != 0 {
+                    let row = first + rest.trailing_zeros() as usize;
+                    rest &= rest - 1;
+                    let fields: [Field; 7] = std::array::from_fn(|field| Field { p: batch.at[field][row] as *const u8, len: batch.len[field][row] as usize });
+                    event_row::<M, Batch>(ctx, dates, plan, limit, &fields, batch, events, pays, odd_events, odd_users);
+                }
+            }
+            first += 8;
         }
     }
 }

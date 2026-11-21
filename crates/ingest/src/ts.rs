@@ -185,3 +185,150 @@ impl Dates {
         (true, digits.iter().fold(0i64, |v, &d| v * 10 + i64::from(d - b'0')) - self.origin)
     }
 }
+
+/// Eight timestamps at once (AVX-512), for the positional parse's batches (`pos`). Each lane
+/// is a field's bytes as words the caller loaded (`rd`) and its date looked up (`date_s`); a
+/// lane these do not accept is not bad, only left to `Dates::ts`.
+#[cfg(all(
+    feature = "pipe-positional",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq"
+))]
+pub(crate) mod wide {
+    use core::arch::x86_64::*;
+
+    use super::{Dates, HIGH, OVER, TIME_ADD, TIME_COLON_BYTES, TIME_COLONS, ZEROS, ZONE_ADD, ZONE_BYTES, ZONE_COLON, ZONE_COLON_BYTE, rd};
+
+    /// `Dates::date_s` of text that is not a date of the table.
+    pub(crate) const NO_DATE: i64 = i64::MIN;
+
+    #[inline(always)]
+    fn all(value: u64) -> __m512i {
+        // SAFETY: AVX-512F is compiled in (cfg above).
+        #[allow(unused_unsafe)]
+        unsafe {
+            _mm512_set1_epi64(value as i64)
+        }
+    }
+
+    /// `HH:MM:SS` or the `HH:MM` of an offset, as `local` and `offset` check and convert them:
+    /// `t` is the 8 bytes less `'0'`. Returns the lanes with a digit out of place or range,
+    /// and the bytes as `10 * digit + next digit`.
+    #[inline(always)]
+    fn pairs(t: __m512i, add: u64, colons: u64, colon_bytes: u64) -> (__m512i, __m512i) {
+        // SAFETY: register arithmetic.
+        #[allow(unused_unsafe)]
+        unsafe {
+            let bad = _mm512_or_si512(
+                _mm512_or_si512(_mm512_and_si512(t, all(HIGH)), _mm512_and_si512(_mm512_add_epi64(t, all(add)), all(OVER))),
+                _mm512_and_si512(_mm512_xor_si512(t, all(colons)), all(colon_bytes)),
+            );
+            (bad, _mm512_add_epi64(_mm512_add_epi64(_mm512_slli_epi64::<3>(t), _mm512_slli_epi64::<1>(t)), _mm512_srli_epi64::<8>(t)))
+        }
+    }
+
+    impl Dates {
+        /// The epoch second of the midnight of the date `YYYY-MM-DDT` at `p`, or `NO_DATE`:
+        /// the table lookup of `local`, done row by row so the wide code needs no gather.
+        ///
+        /// # Safety
+        /// 11 bytes readable at `p`.
+        #[inline(always)]
+        pub(crate) unsafe fn date_s(&self, p: *const u8) -> i64 {
+            let (head, tail) = unsafe { (rd(p), rd(p.add(3))) };
+            // SAFETY: `shift` leaves exactly the bits that index `slots`.
+            let slot = unsafe { *self.slots.get_unchecked((tail.wrapping_mul(self.mul) >> self.shift) as usize) };
+            if (slot.head == head) & (slot.tail == tail) { slot.s } else { NO_DATE }
+        }
+
+        /// A `YYYY-MM-DDTHH:MM:SS` whose bytes 8..16 are `g1`, bytes 12..20 `g2` and date
+        /// `date_s`: the lanes `local` accepts, their epoch seconds, and byte 19.
+        #[inline(always)]
+        fn local_wide(&self, g1: __m512i, g2: __m512i, date_s: __m512i) -> (__mmask8, __m512i, __m512i) {
+            // SAFETY: register arithmetic.
+            #[allow(unused_unsafe)]
+            unsafe {
+                // The time is bytes 11..19: one byte of `g1`, seven of `g2`.
+                let time = _mm512_or_si512(_mm512_and_si512(_mm512_srli_epi64::<24>(g1), all(0xFF)), _mm512_slli_epi64::<8>(g2));
+                let (bad, t) = pairs(_mm512_xor_si512(time, all(ZEROS)), TIME_ADD, TIME_COLONS, TIME_COLON_BYTES);
+                let byte = all(0xFF);
+                let (hour, minute, second) =
+                    (_mm512_and_si512(t, byte), _mm512_and_si512(_mm512_srli_epi64::<24>(t), byte), _mm512_and_si512(_mm512_srli_epi64::<48>(t), byte));
+                let ok = _mm512_cmpneq_epi64_mask(date_s, all(NO_DATE as u64)) & _mm512_testn_epi64_mask(bad, bad) & _mm512_cmple_epu64_mask(hour, all(23));
+                let seconds = _mm512_add_epi64(_mm512_add_epi64(_mm512_mul_epu32(hour, all(3600)), _mm512_mul_epu32(minute, all(60))), second);
+                (ok, _mm512_add_epi64(date_s, seconds), _mm512_srli_epi64::<56>(g2))
+            }
+        }
+
+        /// A slot's `ms` is its `s` in ms less the origin.
+        #[inline(always)]
+        fn ms_of(&self, s: __m512i) -> __m512i {
+            // SAFETY: register arithmetic.
+            #[allow(unused_unsafe)]
+            unsafe {
+                _mm512_sub_epi64(_mm512_mullo_epi64(s, all(1000)), all(self.origin as u64))
+            }
+        }
+
+        /// `f1` for 8 fields of `len` bytes: the lanes it accepts, their ms after origin and
+        /// their epoch seconds.
+        #[inline(always)]
+        pub(crate) fn f1_wide(&self, g1: __m512i, g2: __m512i, len: __m512i, date_s: __m512i) -> (__mmask8, __m512i, __m512i) {
+            let (ok, s, zone) = self.local_wide(g1, g2, date_s);
+            // SAFETY: register arithmetic.
+            #[allow(unused_unsafe)]
+            let ok = unsafe { ok & _mm512_cmpeq_epi64_mask(len, all(20)) & _mm512_cmpeq_epi64_mask(zone, all(u64::from(b'Z'))) };
+            (ok, self.ms_of(s), s)
+        }
+
+        /// `ts` for 8 fields of `len` bytes, bytes 0..8 `g0`, 8..16 `g1`, 12..20 `g2` and
+        /// 19..27 `g3`: F1, F2, and F3 as 13 digits without a leading zero. Returns the lanes
+        /// that are one of these (each a value `ts` accepts) and their ms after origin.
+        #[inline(always)]
+        pub(crate) fn ts_wide(&self, g0: __m512i, g1: __m512i, g2: __m512i, g3: __m512i, len: __m512i, date_s: __m512i) -> (__mmask8, __m512i) {
+            let (local_ok, s, zone) = self.local_wide(g1, g2, date_s);
+            let local_ms = self.ms_of(s);
+            // SAFETY: register arithmetic.
+            #[allow(unused_unsafe)]
+            unsafe {
+                let f1 = local_ok & _mm512_cmpeq_epi64_mask(len, all(20)) & _mm512_cmpeq_epi64_mask(zone, all(u64::from(b'Z')));
+
+                // The offset, as `offset` reads it: the sign, then `HH:MM` in bytes 1..6.
+                let z = _mm512_xor_si512(g3, all(ZEROS));
+                let sign = _mm512_and_si512(z, all(0xFF));
+                let (bad, pair) = pairs(_mm512_and_si512(z, all(ZONE_BYTES)), ZONE_ADD, ZONE_COLON, ZONE_COLON_BYTE);
+                let byte = all(0xFF);
+                let (hour, minute) = (_mm512_and_si512(_mm512_srli_epi64::<8>(pair), byte), _mm512_and_si512(_mm512_srli_epi64::<32>(pair), byte));
+                let offset = _mm512_mullo_epi64(_mm512_add_epi64(_mm512_mul_epu32(hour, all(3600)), _mm512_mul_epu32(minute, all(60))), all(1000));
+                let plus = _mm512_cmpeq_epi64_mask(sign, all(u64::from(b'+' ^ b'0')));
+                let minus = _mm512_cmpeq_epi64_mask(sign, all(u64::from(b'-' ^ b'0')));
+                let f2 = local_ok & _mm512_cmpeq_epi64_mask(len, all(25)) & _mm512_testn_epi64_mask(bad, bad) & _mm512_cmple_epu64_mask(hour, all(23)) & (plus | minus);
+                // A `+` offset is ahead of UTC: subtract it.
+                let f2_ms = _mm512_mask_add_epi64(_mm512_sub_epi64(local_ms, offset), minus, local_ms, offset);
+
+                // Bytes 0..8 and 5..13, as `ts` reads an F3.
+                let (w0, w1) = (g0, _mm512_or_si512(_mm512_srli_epi64::<40>(g0), _mm512_slli_epi64::<24>(g1)));
+                let (zero, nine) = (_mm512_set1_epi8(b'0' as i8), _mm512_set1_epi8(9));
+                let (d0, d1) = (_mm512_sub_epi8(w0, zero), _mm512_sub_epi8(w1, zero));
+                let digits = _mm512_cmple_epu8_mask(d0, nine) & _mm512_cmple_epu8_mask(d1, nine);
+                let f3 = _mm512_cmpeq_epi64_mask(_mm512_movm_epi8(digits), all(u64::MAX))
+                    & _mm512_cmpneq_epi64_mask(_mm512_and_si512(w0, all(0xFF)), all(u64::from(b'0')))
+                    & _mm512_cmpeq_epi64_mask(len, all(self.f3_len as u64));
+                // 8 digits, the first in the low byte: pairs, pairs of pairs, the two halves.
+                let convert = |digits: __m512i| {
+                    let pairs = _mm512_maddubs_epi16(digits, _mm512_set1_epi16(0x010A));
+                    let quads = _mm512_madd_epi16(pairs, _mm512_set1_epi32(0x0001_0064));
+                    _mm512_add_epi64(_mm512_mul_epu32(quads, all(10_000)), _mm512_srli_epi64::<32>(quads))
+                };
+                // The first five digits behind three zeros, then the last eight.
+                let value = _mm512_add_epi64(_mm512_mul_epu32(convert(_mm512_slli_epi64::<24>(d0)), all(100_000_000)), convert(d1));
+                let f3_ms = _mm512_sub_epi64(value, all(self.origin as u64));
+
+                let ms = _mm512_mask_blend_epi64(f3, _mm512_mask_blend_epi64(f2, local_ms, f2_ms), f3_ms);
+                (f1 | f2 | f3, ms)
+            }
+        }
+    }
+}
