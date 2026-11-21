@@ -12,7 +12,7 @@
 
 use types::Id;
 use types::hash::person_hash;
-use types::parts::Parts;
+use types::parts::{Combine, Mode, Parts, Plain};
 use types::record::{ClickRec, EventRec, PersonEvent, VALID};
 
 use crate::LinkTable;
@@ -22,18 +22,27 @@ use crate::LinkTable;
 const AHEAD: usize = 64;
 
 pub fn scatter_events(table: &LinkTable, kept: &[EventRec], bucket_bits: u32, out: &mut Parts<PersonEvent>) {
-    scatter(table, kept, bucket_bits, out, |r| (r.flags & VALID != 0).then_some(r.user), |r, person| {
-        PersonEvent { person, ts: r.ts, pay: r.pay }
-    });
+    let user = |r: &EventRec| (r.flags & VALID != 0).then_some(r.user);
+    let make = |r: &EventRec, person| PersonEvent { person, ts: r.ts, pay: r.pay };
+    if out.combining() {
+        scatter::<_, _, Combine>(table, kept, bucket_bits, out, user, make);
+    } else {
+        scatter::<_, _, Plain>(table, kept, bucket_bits, out, user, make);
+    }
 }
 
 pub fn scatter_clicks(table: &LinkTable, clicks: &[ClickRec], bucket_bits: u32, out: &mut Parts<ClickRec>) {
-    scatter(table, clicks, bucket_bits, out, |r| Some(r.user), |r, person| ClickRec { user: person, ..*r });
+    let (user, make) = (|r: &ClickRec| Some(r.user), |r: &ClickRec, person| ClickRec { user: person, ..*r });
+    if out.combining() {
+        scatter::<_, _, Combine>(table, clicks, bucket_bits, out, user, make);
+    } else {
+        scatter::<_, _, Plain>(table, clicks, bucket_bits, out, user, make);
+    }
 }
 
-/// `user` is `None` for a row to skip.
+/// `user` is `None` for a row to skip. `M` is how `out` is written (`out.combining()`).
 #[inline(always)]
-fn scatter<R, O: Copy>(
+fn scatter<R, O: Copy, M: Mode>(
     table: &LinkTable,
     rows: &[R],
     bucket_bits: u32,
@@ -54,7 +63,9 @@ fn scatter<R, O: Copy>(
         if let Some(id) = user(r) {
             let person = table.person(id);
             // SAFETY: the shift leaves `bucket_bits` bits, and `out` has `1 << bucket_bits` buckets.
-            unsafe { out.push_unchecked((person_hash(person) >> shift) as usize, make(r, person)) };
+            unsafe { out.push_as::<M>((person_hash(person) >> shift) as usize, make(r, person)) };
         }
     }
+    // Streamed lines become visible to the sessions stage's threads.
+    out.fence();
 }

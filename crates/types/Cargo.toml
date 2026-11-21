@@ -5,11 +5,13 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-default = ["id-u64", "rec-32", "hash-mul", "table-linear", "par-counter"]
+default = ["id-u64", "rec-32", "hash-mul", "table-linear", "par-counter", "scatter-wc"]
 id-u64 = []
 rec-32 = []
 hash-mul = []
 table-linear = []
 par-counter = []
+# `parts::Combine`: staged lists written with streaming stores, `SS_SCATTER=combine|plain`.
+scatter-wc = []
 # Not a slot: records every task as a span for `par::trace::write` (`SS_TRACE`).
 trace = []

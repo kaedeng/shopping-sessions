@@ -33,7 +33,7 @@ default = [
     "dedup-partitioned",
     "sess-partitioned", "sess-purchase-side", "sort-std", "attr-sweep", "agg-dense",
     "out-arrow",
-    "fast-exit", "alloc-parallel",
+    "fast-exit", "alloc-parallel", "scatter-wc",
 ]
 # types
 id-u64 = ["types/id-u64"]
@@ -41,6 +41,7 @@ rec-32 = ["types/rec-32"]
 hash-mul = ["types/hash-mul"]
 table-linear = ["types/table-linear"]
 par-counter = ["types/par-counter"]
+scatter-wc = ["types/scatter-wc"]
 # ingest
 reader-mmap = ["ingest/reader-mmap"]
 reader-populate = ["ingest/reader-populate"]

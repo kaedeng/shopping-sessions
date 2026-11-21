@@ -137,7 +137,8 @@ fn lookup(workers: usize) {
     let per_part = rows.len().div_ceil(parts);
     let room = rows.len() / workers / (1 << BUCKET_BITS) * 9 / 8 + 64;
     let run = |with_lookup: bool| {
-        let mut out: Vec<Parts<PersonEvent>> = (0..workers).map(|_| Parts::new(1 << BUCKET_BITS, room)).collect();
+        let mode = types::parts::mode_from_env();
+        let mut out: Vec<Parts<PersonEvent>> = (0..workers).map(|_| Parts::new(1 << BUCKET_BITS, room, mode)).collect();
         let started = Instant::now();
         par::run(&mut out, parts, |_, buckets, part| {
             let kept = &rows[(part * per_part).min(rows.len())..((part + 1) * per_part).min(rows.len())];
