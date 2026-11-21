@@ -90,6 +90,9 @@ def main():
     parser.add_argument("--warmup", type=int, default=1, help="untimed rounds first (default 1)")
     parser.add_argument("--volume", default="ss-p20", help="Docker volume holding the dataset (default ss-p20)")
     parser.add_argument("--idle", type=float, default=0, help="seconds to wait before each timed run")
+    parser.add_argument("--cold", action="store_true",
+                        help="drop the Docker VM's page cache before each timed run (a privileged container "
+                             "writes /proc/sys/vm/drop_caches), so the input is read from disk")
     parser.add_argument("--cpus", default="8")
     parser.add_argument("--memory", default="24g")
     parser.add_argument("variants", nargs="+")
@@ -101,6 +104,10 @@ def main():
     runs = {text: [] for text in args.variants}
     for round in range(args.runs):
         for text in args.variants:
+            if args.cold:
+                drop = ["docker", "run", "--rm", "--privileged", "debian:trixie-slim", "sh", "-c",
+                        "sync; echo 3 > /proc/sys/vm/drop_caches"]
+                subprocess.run(drop, check=True, capture_output=True)
             if args.idle:
                 time.sleep(args.idle)
             metrics = run_once(text, args)
@@ -112,7 +119,8 @@ def main():
     print()
     for label, text in zip(labels, args.variants):
         print(f"{label}: {text}")
-    print(f"{args.runs} runs each, volume {args.volume}, idle {args.idle:g} s before each; median (min) in ms\n")
+    cold = ", page cache dropped before each" if args.cold else ""
+    print(f"{args.runs} runs each, volume {args.volume}, idle {args.idle:g} s before each{cold}; median (min) in ms\n")
     names = list(dict.fromkeys(name for metrics in runs[args.variants[0]] for name in metrics))
     print(f"{'':12}" + "".join(f"{label:>18}" for label in labels) + "".join(f"{label + ' vs A':>12}" for label in labels[1:]))
     for name in names:
