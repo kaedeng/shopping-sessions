@@ -137,11 +137,16 @@ impl ParseOut {
     }
 }
 
-/// A file mapped, or a padded copy of a file's last lines.
+/// A file mapped (and its path, for `Ingest::read`), or a padded copy of a file's last lines.
 enum Buf {
-    Map(memmap2::Mmap),
+    Map(memmap2::Mmap, PathBuf),
     Own(Vec<u8>),
 }
+
+/// Bytes `Ingest::read` takes past a segment's cut for its last line; a longer line sends the
+/// segment to the mapping.
+#[cfg(feature = "pipe-positional")]
+const READ_SLACK: usize = 4096;
 
 /// The lines of a buffer that begin in bytes `start..end`: a cut by bytes, so planning reads
 /// (and faults in) none of the file. `Ingest::seg` finds the lines when the segment is parsed,
@@ -200,6 +205,9 @@ pub struct Ingest {
     /// The campaigns by their bytes, for the fused click parse (`pos`).
     #[cfg(feature = "pipe-positional")]
     campaigns: pos::Campaigns,
+    /// The positional parse reads its chunks with `pread` (`read`); `SS_POS_READER`.
+    #[cfg(feature = "pipe-positional")]
+    pread: bool,
     /// How the partitions are written: `types::parts::mode_from_env` (slot `scatter-wc`).
     scatter: Option<usize>,
     /// Slot `reader-populate`, picked by `SS_READER=populate`.
@@ -286,6 +294,8 @@ impl Ingest {
             pos_fn: pos::parse_with::<Scalar>,
             #[cfg(feature = "pipe-positional")]
             campaigns: pos::Campaigns::new(ctx),
+            #[cfg(feature = "pipe-positional")]
+            pread: env::pick("SS_POS_READER", &["pread", "mmap"]) == 0,
             scatter: types::parts::mode_from_env(),
             #[cfg(all(feature = "reader-populate", target_os = "linux"))]
             populate: false,
@@ -331,11 +341,55 @@ impl Ingest {
         (bytes.as_ptr().wrapping_add(start), end.saturating_sub(start))
     }
 
+    /// The whole lines of a segment as `seg` gives them, but read with one `pread` into `buf`,
+    /// a worker's own: the mapping's pages are then never touched. Reading through the
+    /// mapping costs a fault per 64 KB, and handing a chunk's pages back (`release`) takes the
+    /// kernel a TLB flush on every other worker's CPU: with 8 workers at 20M, the parse took
+    /// 179 ms with the release and 159 without, and without it the process then spent 60 ms
+    /// unmapping at exit (x86 box). A copy has neither cost, and leaves the bytes in cache.
+    /// `None` for a segment that is not a mapped file's, a read that fails, or a last line
+    /// that passes `READ_SLACK`: the caller takes the mapping (`seg`, then `release`).
+    #[cfg(feature = "pipe-positional")]
+    fn read(&self, seg: &Seg, buf: &mut Vec<u8>) -> Option<(*const u8, usize)> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt;
+            let Buf::Map(_, path) = &self.bufs[seg.buf] else { return None };
+            if !self.pread {
+                return None;
+            }
+            // Opened for this read only. Kept open, a few hundred files grow the descriptor
+            // table while the workers run, and each growth waits out an RCU grace period
+            // (40 ms each at 20M on the x86 box); thousands would pass the usual limit.
+            let file = File::open(path).ok()?;
+            // From the byte before the segment's first to a little past its cut.
+            let (from, to) = (seg.start - 1, (seg.end + READ_SLACK).min(seg.limit));
+            let bytes = to - from;
+            // The bytes past the read are an earlier read's or zeros: readable, like a
+            // mapping's bytes past a segment.
+            if buf.len() < bytes + PAD {
+                buf.resize(bytes + PAD, 0);
+            }
+            file.read_exact_at(&mut buf[..bytes], from as u64).ok()?;
+            // As `seg`: after the first `\n` at or after byte `start - 1`, to after the first
+            // at or after byte `end - 1`.
+            let start = memchr(b'\n', &buf[..bytes])? + 1;
+            let cut = seg.end - seg.start;
+            let end = cut + memchr(b'\n', &buf[cut..bytes])? + 1;
+            Some((buf.as_ptr().wrapping_add(start), end.saturating_sub(start)))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (seg, buf);
+            None
+        }
+    }
+
     /// Slot `free-early`: a parsed segment's pages of the mapped file go back to the kernel on
     /// the worker that parsed it. Left mapped, the input is unmapped at exit by one thread, a
     /// page-table entry per 4 KB.
     fn release(&self, seg: &Seg) {
-        if types::mem::free_early() && let Buf::Map(map) = &self.bufs[seg.buf] {
+        if types::mem::free_early() && let Buf::Map(map, _) = &self.bufs[seg.buf] {
             // SAFETY: a read-only file mapping. A neighbour still reading here (its last line,
             // which begins before `start`, or `PAD` bytes past its end) faults the page back
             // in from the page cache.
@@ -346,7 +400,7 @@ impl Ingest {
 
 fn buf_bytes(buf: &Buf) -> &[u8] {
     match buf {
-        Buf::Map(map) => map,
+        Buf::Map(map, _) => map,
         Buf::Own(own) => own,
     }
 }
@@ -394,7 +448,7 @@ fn plan(path: &Path, chunk: usize, bufs: &mut Vec<Buf>, segs: &mut Vec<Seg>) -> 
             segs.push(Seg { buf: bufs.len(), start, end, limit: tail });
             start = end;
         }
-        bufs.push(Buf::Map(map));
+        bufs.push(Buf::Map(map, path.to_path_buf()));
     }
     Ok(())
 }
@@ -403,7 +457,7 @@ fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, task: usize, out: &mut ParseOu
     let (seg, click) = &ingest.tasks[task];
     let (p, len) = ingest.seg(seg);
     #[cfg(all(feature = "reader-populate", target_os = "linux"))]
-    if ingest.populate && let Buf::Map(map) = &ingest.bufs[seg.buf] {
+    if ingest.populate && let Buf::Map(map, _) = &ingest.bufs[seg.buf] {
         // One call faults the chunk in, instead of a fault per 64 KB while parsing. A kernel
         // before 5.14 answers EINVAL and the pages fault in as before.
         let _ = map.advise_range(memmap2::Advice::PopulateRead, seg.start, len);

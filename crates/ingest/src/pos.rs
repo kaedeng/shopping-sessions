@@ -101,6 +101,8 @@ pub struct PosOut {
     /// Every other valid click, as the classic record (`user` as read).
     pub odd_clicks: Vec<ClickRec>,
     scratch: Scratch,
+    /// The chunk being parsed, when it is read and not mapped (`Ingest::read`).
+    input: Vec<u8>,
 }
 
 impl PosOut {
@@ -266,6 +268,8 @@ impl Ingest {
         // Event numbers are below the number of distinct events, so below the lines.
         let room = rows + rows / 8 + 4096;
         let shift = (room / 1024).next_power_of_two().trailing_zeros().clamp(12, 16);
+        // `SS_POS_SHIFT`: the numbers per partition as a power of two, for measurements.
+        let shift = (types::env::number("SS_POS_SHIFT", shift as usize) as u32).clamp(10, 16);
         let persons = (rows / 8).clamp(4096, PERSON_LIMIT as usize);
         let click_shift = (persons / 1024).next_power_of_two().trailing_zeros().max(6);
         let _ = ctx;
@@ -331,6 +335,7 @@ impl Ingest {
             odd_users: Vec::new(),
             odd_clicks: Vec::new(),
             scratch: Scratch::new(),
+            input: Vec::new(),
         }
     }
 
@@ -391,9 +396,13 @@ fn find_keys(sample: &[(u64, u64)], event_rows: usize) -> Option<(u64, u64)> {
 
 pub(crate) fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, plan: &PosPlan, task: usize, out: &mut PosOut) {
     let (seg, click) = &ingest.tasks[task];
-    let (p, len) = ingest.seg(seg);
+    // The chunk in the worker's buffer, or through the mapping.
+    let mut input = std::mem::take(&mut out.input);
+    let read = ingest.read(seg, &mut input);
+    let (p, len) = read.unwrap_or_else(|| ingest.seg(seg));
     let dates = &ingest.dates;
-    // SAFETY: `plan` made every task a segment.
+    // SAFETY: `plan` made every task a segment, and `read` gives one as `seg` does: whole
+    // lines, the byte before them and `PAD` bytes after them readable.
     unsafe {
         if *click {
             if out.clicks.combining() {
@@ -407,7 +416,10 @@ pub(crate) fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, plan: &PosPlan, tas
             events::<T, Plain>(p, len, ctx, dates, plan, out);
         }
     }
-    ingest.release(seg);
+    if read.is_none() {
+        ingest.release(seg);
+    }
+    out.input = input;
 }
 
 /// # Safety
