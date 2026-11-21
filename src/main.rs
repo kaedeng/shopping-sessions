@@ -103,6 +103,18 @@ fn run() -> Result<(), String> {
         }
     });
     lap("dedup");
+    // Lists that outgrew their carved room and spilled into a `Vec` (`types::parts`), counted
+    // before `free-early` empties them.
+    let spilled = |count: usize, of: usize| format!("{count} of {of}");
+    let spilled_partitions = spilled(parsed.iter().map(|out| out.parts.spilled()).sum(), parts * ctx.workers);
+    let spilled_events = spilled(scattered.iter().map(|mine| mine.events.spilled()).sum(), buckets * ctx.workers);
+    let spilled_clicks = spilled(scattered.iter().map(|mine| mine.clicks.spilled()).sum(), buckets * ctx.workers);
+    // Slot `free-early`: the dedup partitions and the parsed clicks are dead; each worker hands
+    // its own back to the kernel, so their pages are not left for the one thread that exits.
+    let free_early = types::mem::free_early();
+    if free_early {
+        par::each(&mut parsed, |_, out| out.release());
+    }
 
     // Stage 3. Person buckets, largest first so a whale's bucket is not the last to start.
     let mut order: Vec<usize> = (0..buckets).collect();
@@ -123,12 +135,19 @@ fn run() -> Result<(), String> {
         std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
     }
     let failure = OnceLock::new();
-    par::each(&mut aggs, |worker, agg| {
+    let mut outputs: Vec<(&mut Agg, &mut Scattered)> = aggs.iter_mut().zip(&mut scattered).collect();
+    par::each(&mut outputs, |worker, (agg, mine)| {
         let rows = std::mem::take(&mut agg.user_daily);
         if let Err(error) = output::user_daily(&user_folder, worker, &ctx, rows) {
             drop(failure.set(error));
         }
+        // Slot `free-early`: the person buckets are dead since the sessions stage.
+        if free_early {
+            mine.events.release();
+            mine.clicks.release();
+        }
     });
+    drop(outputs);
     if let Some(error) = failure.into_inner() {
         return Err(error);
     }
@@ -136,17 +155,15 @@ fn run() -> Result<(), String> {
     lap("output");
     if timing {
         eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
-        // Lists that outgrew their carved room and spilled into a `Vec` (`types::parts`).
-        let spilled = |count: usize, of: usize| format!("{count} of {of}");
-        let partitions = spilled(parsed.iter().map(|out| out.parts.spilled()).sum(), parts * ctx.workers);
-        let events = spilled(scattered.iter().map(|mine| mine.events.spilled()).sum(), buckets * ctx.workers);
-        let clicks = spilled(scattered.iter().map(|mine| mine.clicks.spilled()).sum(), buckets * ctx.workers);
-        eprintln!("spilled: {partitions} partitions, {events} event buckets, {clicks} click buckets");
+        eprintln!("spilled: {spilled_partitions} partitions, {spilled_events} event buckets, {spilled_clicks} click buckets");
     }
     #[cfg(feature = "trace")]
     if let Some(path) = std::env::var_os("SS_TRACE") {
-        // One name per `par` scope, in order: each `par::init` is a stage of its own.
-        let stages = ["parse init", "parse", "dedup init", "dedup", "sessions init", "sessions", "output"];
+        // One name per `par` scope, in order: each `par::init` and `par::each` is a stage of its own.
+        let mut stages = vec!["parse init", "parse", "dedup init", "dedup", "sessions init", "sessions", "output"];
+        if free_early {
+            stages.insert(4, "free parse");
+        }
         par::trace::write(path.as_ref(), &stages).map_err(|error| format!("SS_TRACE: {error}"))?;
     }
     // Slot `fast-exit`: the files are written, so skip the destructors and let the kernel reclaim.

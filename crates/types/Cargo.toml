@@ -5,11 +5,16 @@ edition.workspace = true
 publish.workspace = true
 
 [features]
-default = ["id-u64", "rec-32", "hash-mul", "table-linear", "par-counter"]
+default = ["id-u64", "rec-32", "hash-mul", "table-linear", "par-counter", "scatter-wc", "free-early"]
 id-u64 = []
 rec-32 = []
 hash-mul = []
 table-linear = []
 par-counter = []
+# `Parts` stages each list's records and flushes whole cache lines with streaming stores
+# (`SS_SCATTER=wc|plain`; the pick on x86-64 only).
+scatter-wc = []
+# Buffers go back to the kernel as soon as they are dead (`SS_FREE=early|exit`).
+free-early = []
 # Not a slot: records every task as a span for `par::trace::write` (`SS_TRACE`).
 trace = []

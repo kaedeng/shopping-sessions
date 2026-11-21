@@ -57,4 +57,6 @@ fn scatter<R, O: Copy>(
             unsafe { out.push_unchecked((person_hash(person) >> shift) as usize, make(r, person)) };
         }
     }
+    // The sessions stage reads these buckets from other threads.
+    out.fence();
 }

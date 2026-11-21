@@ -33,7 +33,7 @@ default = [
     "dedup-partitioned",
     "sess-partitioned", "sess-purchase-side", "sort-std", "attr-sweep", "agg-dense",
     "out-arrow",
-    "fast-exit", "alloc-parallel",
+    "fast-exit", "alloc-parallel", "free-early", "scatter-wc",
 ]
 # types
 id-u64 = ["types/id-u64"]
@@ -41,6 +41,8 @@ rec-32 = ["types/rec-32"]
 hash-mul = ["types/hash-mul"]
 table-linear = ["types/table-linear"]
 par-counter = ["types/par-counter"]
+# Write-combining buffers with streaming stores in every scatter (`SS_SCATTER=wc|plain`).
+scatter-wc = ["types/scatter-wc"]
 # ingest
 reader-mmap = ["ingest/reader-mmap"]
 reader-populate = ["ingest/reader-populate"]
@@ -64,6 +66,8 @@ out-arrow = ["output/out-arrow"]
 fast-exit = []
 # Each stage's per-worker buffers built on the workers' own threads (`SS_ALLOC=serial|parallel`).
 alloc-parallel = []
+# Input pages and dead buffers are handed back by the workers, not at exit (`SS_FREE=early|exit`).
+free-early = ["types/free-early"]
 # Not a slot: `SS_TRACE=FILE` writes every task as a span, for ui.perfetto.dev (implementation.md).
 trace = ["types/trace"]
 # A process has one global allocator, so this one swaps at build time; no env var.

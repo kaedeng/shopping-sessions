@@ -102,6 +102,19 @@ pub struct ParseOut {
     scratch: Scratch,
 }
 
+impl ParseOut {
+    /// Slot `free-early`: empties the partitions and the click list and hands their pages back
+    /// to the kernel on the calling thread. For the worker to call once the dedup stage has
+    /// read them.
+    pub fn release(&mut self) {
+        self.parts.release();
+        let bytes = self.clicks.capacity() * size_of::<ClickRec>();
+        self.clicks.clear();
+        // SAFETY: the list is empty, so nothing reads its buffer before writing it again.
+        unsafe { types::mem::release(self.clicks.as_ptr().cast(), bytes) };
+    }
+}
+
 /// A file mapped, or a padded copy of a file's last lines.
 enum Buf {
     Map(memmap2::Mmap),
@@ -225,6 +238,18 @@ impl Ingest {
     fn seg(&self, seg: &Seg) -> (*const u8, usize) {
         (buf_bytes(&self.bufs[seg.buf]).as_ptr().wrapping_add(seg.start), seg.end - seg.start)
     }
+
+    /// Slot `free-early`: a parsed segment's pages of the mapped file go back to the kernel on
+    /// the worker that parsed it. Left mapped, the input is unmapped at exit by one thread, a
+    /// page-table entry per 4 KB.
+    fn release(&self, seg: &Seg) {
+        if types::mem::free_early() && let Buf::Map(_) = &self.bufs[seg.buf] {
+            let (p, len) = self.seg(seg);
+            // SAFETY: a read-only file mapping. A neighbour's read past its own end (`PAD`)
+            // into a page dropped here faults it back in from the page cache.
+            unsafe { types::mem::release(p, len) };
+        }
+    }
 }
 
 fn buf_bytes(buf: &Buf) -> &[u8] {
@@ -300,8 +325,11 @@ fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, task: usize, out: &mut ParseOu
         } else {
             let (parts, shift) = (&mut out.parts, 64 - ctx.part_bits);
             T::lines::<7>(p, len, &mut out.scratch, |fields| event_row(ctx, dates, shift, fields, parts));
+            // The dedup stage reads these partitions from other threads.
+            out.parts.fence();
         }
     }
+    ingest.release(seg);
 }
 
 fn links_with<T: Tok>(ingest: &Ingest) -> Vec<[Id; 2]> {
@@ -318,6 +346,7 @@ fn links_with<T: Tok>(ingest: &Ingest) -> Vec<[Id; 2]> {
                 }
             })
         };
+        ingest.release(seg);
     }
     pairs
 }
