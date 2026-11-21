@@ -193,6 +193,8 @@ mod pool {
         let pool = pool();
         let workers = workers.min(MOST);
         grow(pool, workers);
+        // (Going on at once, with the first stage's tasks taken by the threads as they
+        // appear, measured the same within the noise: 40 runs each in alternation at 1M.)
         while pool.up.load(SeqCst) + 1 < workers {
             std::hint::spin_loop();
         }

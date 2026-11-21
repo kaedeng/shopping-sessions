@@ -144,6 +144,14 @@ impl Ctx {
         })
     }
 
+    /// Gives the `Ctx` its products: `categories` and `products` as `with_products` takes
+    /// them. For a `Ctx` made without them while they were still being read.
+    pub fn set_products(&mut self, categories: Vec<Vec<u8>>, products: Products) -> Result<(), String> {
+        self.unknown = categories.iter().position(|name| name == b"unknown").ok_or("the categories lack `unknown`")? as u8;
+        (self.categories, self.products) = (categories, products);
+        Ok(())
+    }
+
     /// The index of `organic` in `campaigns`: one past the real campaigns.
     #[inline(always)]
     pub fn organic(&self) -> u32 {

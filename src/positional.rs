@@ -441,7 +441,12 @@ struct Work {
     /// The fused stages' count of runs taken and of those sent to the classic lane, then the
     /// latter's slots by reason (`Fused::take`).
     stats: [u64; 6],
+    /// Where the fused stages' time goes (`SS_TIMING=2`): `PHASES`.
+    phases: types::tl::Phases,
 }
+
+/// The phases of a partition's task, as `Work::phases` counts them.
+const PHASES: [&str; 8] = ["place", "cut", "days and rows", "runs and credit", "purchases", "counters", "rows out", "edges"];
 
 impl Work {
     /// `rows`: the `user_daily` rows to make room for. The six columns grow together, and
@@ -462,6 +467,7 @@ impl Work {
             users: Vec::new(),
             runs: Vec::new(),
             stats: [0; 6],
+            phases: types::tl::Phases::new(),
         }
     }
 }
@@ -628,6 +634,12 @@ pub fn run(
     // of the cells, summed over every worker's counters. (Summed and written whole by a thread
     // of its own, through arrow-rs, that table was 2 ms of a run of 21 at 1M events: a thread
     // to start, 4.5 MB of counters read cold, a megabyte of sums on fresh pages.)
+    let mut phase_ns = [0u64; 12];
+    for work in &works {
+        for (sum, ns) in phase_ns.iter_mut().zip(work.phases.ns) {
+            *sum += ns;
+        }
+    }
     let mut tables: Vec<UserDaily> = works.iter_mut().map(|work| std::mem::take(&mut work.agg.user_daily)).collect();
     let aggs: Vec<Agg> = works.into_iter().map(|work| work.agg).collect();
     let failure = OnceLock::new();
@@ -644,6 +656,10 @@ pub fn run(
         return Err(error);
     }
     lap("output");
+    if types::tl::on() {
+        let line: Vec<String> = PHASES.iter().enumerate().map(|(at, name)| format!("{name} {:.1}", phase_ns[at] as f64 / 1e6)).collect();
+        eprintln!("fused stages, thread-ms: {}", line.join(", "));
+    }
     if timing && let Some((runs, unfit, why)) = stats {
         // Why, in slots: flagged (split, out of order, wide alias, outside the numbering),
         // mixed links, an ID outside the one component, several unlinked IDs.
@@ -811,12 +827,15 @@ impl<'a> Fused<'a> {
         target_feature = "bmi2"
     ))]
     fn partition_cut(&self, part: usize, work: &mut Work) -> Vec<Edge> {
-        let Work { agg, slow_events, placing, runs, stats, cut: c, .. } = work;
+        let Work { agg, slow_events, placing, runs, stats, cut: c, phases, .. } = work;
+        phases.start();
         let Some(pays) = place_rows(part, self.plan, self.parsed, self.links, placing) else { return Vec::new() };
+        phases.lap(0);
         let (ctx, base, kept) = (self.ctx, part << self.plan.shift, &placing.kept[..]);
         runs.clear();
         // SAFETY: the slots are a multiple of 16 (a partition is at least 2^10 numbers).
         let (events, ns) = unsafe { cut(kept, base, c, runs) };
+        phases.lap(1);
 
         // Each session's day, and the rows: a run's sessions of one day.
         let (mut nrow, mut last_day) = (0usize, u32::MAX);
@@ -836,6 +855,7 @@ impl<'a> Fused<'a> {
         c.s_rev[..ns].fill(0);
         c.row_rev[..nrow].fill(0);
         c.row_cat[..nrow].fill(NO_CATEGORY);
+        phases.lap(2);
 
         // The runs: who is a fast-lane person, and the credit of those with clicks.
         let valid = |slot: usize| kept[slot].flags() & POS_VALID != 0;
@@ -891,6 +911,7 @@ impl<'a> Fused<'a> {
             }
         }
 
+        phases.lap(3);
         // The purchases, the only events looked at again: each to its session (the starts at
         // or before its slot, counted) and its row.
         c.cat_row.clear();
@@ -922,12 +943,14 @@ impl<'a> Fused<'a> {
             }
         }
 
+        phases.lap(4);
         // The credit of every fast-lane session, then the rows.
         for &(_, s0, s1) in &c.fit {
             for s in s0 as usize..s1 as usize {
                 agg.credit(c.s_camp[s], c.s_day[s] as usize, c.s_rev[s]);
             }
         }
+        phases.lap(5);
         // Room for every row of the partition once, then plain stores: extended run by run,
         // the six columns were 4 million calls for 2.2 million rows.
         let out = &mut agg.user_daily;
@@ -961,6 +984,7 @@ impl<'a> Fused<'a> {
             out.revenue_cents.set_len(at);
             out.top_category.set_len(at);
         }
+        phases.lap(6);
         edges
     }
 

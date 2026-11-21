@@ -65,10 +65,7 @@ def run_once(text, args):
     wall = time.perf_counter() - start
     output = proc.stderr + proc.stdout
     if proc.returncode != 0:
-        hint = ""
-        if "exec /app/run.sh" in output:
-            hint = "\nrun.sh has CRLF line endings: see .gitattributes, then rebuild the image."
-        sys.exit(f"{text}: exit {proc.returncode}\n{output}{hint}")
+        sys.exit(f"{text}: exit {proc.returncode}\n{output}")
     metrics = {}
     for line in output.splitlines():
         words = line.split()

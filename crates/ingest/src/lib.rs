@@ -44,8 +44,9 @@ const PAD: usize = 64;
 /// calling thread. The binary reads them beside the inputs' opening (`open`).
 pub fn load_ctx(data: &Path) -> Result<Ctx, String> {
     let products = Lookup::read(data, "products.csv")?;
-    let rows = products.products(0, 1);
-    ctx_of(window(data)?, &[&rows], &Lookup::read(data, "campaigns.csv")?)
+    let (categories, products) = products_of(&[&products.products(0, 1)])?;
+    let window = window(data)?;
+    Ctx::with_products(window.0, window.1, categories, products, &Lookup::read(data, "campaigns.csv")?.rows())
 }
 
 /// `\n`, the bytes, a `\n` if they lack a final one, then `PAD` zeros: segment `1..len - PAD`.
@@ -157,7 +158,8 @@ impl Lookup {
     fn products(&self, piece: usize, pieces: usize) -> ProductRows {
         let (from, to) = self.piece(piece, pieces);
         let mut rows = ProductRows::default();
-        rows.numbers.reserve((to - from) / 8);
+        // A line is 14 bytes or so.
+        rows.numbers.reserve((to - from) / 12);
         // The name of the row before, most often not this row's: a scan of the few names.
         let mut last = usize::MAX;
         self.pairs(from, to, |key, category| {
@@ -180,8 +182,9 @@ impl Lookup {
     }
 }
 
-/// The `Ctx` of a window, the pieces of `products.csv` in file order, and `campaigns.csv`.
-fn ctx_of(window: (i64, i64), pieces: &[&ProductRows], campaigns: &Lookup) -> Result<Ctx, String> {
+/// The categories in byte order and the products' table (`Ctx::with_products`) from the
+/// pieces of `products.csv` in file order.
+fn products_of(pieces: &[&ProductRows]) -> Result<(Vec<Vec<u8>>, Products), String> {
     // The categories in order of first appearance, as one pass over the rows would list them.
     let mut names: Vec<&[u8]> = vec![b"unknown"];
     let mut global: Vec<Vec<usize>> = Vec::with_capacity(pieces.len());
@@ -217,7 +220,7 @@ fn ctx_of(window: (i64, i64), pieces: &[&ProductRows], campaigns: &Lookup) -> Re
             products.insert(id, rank[global[category as usize]]);
         }
     }
-    Ctx::with_products(window.0, window.1, categories, products, &campaigns.rows())
+    Ok((categories, products))
 }
 
 /// What `open` leaves: the lookups, the inputs, and when the positional pipeline is to run,
@@ -281,13 +284,16 @@ pub fn open(data: &Path, workers: usize, positional: Option<bool>, keep_open: bo
     #[cfg(not(feature = "pipe-positional"))]
     let _ = positional;
     let chunk = chunk_bytes();
-    let files: Cell<Result<Files, String>> = Cell::new();
+    let folders: [Cell<Result<Folder, String>>; 3] = [Cell::new(), Cell::new(), Cell::new()];
     let products: Cell<Result<Lookup, String>> = Cell::new();
     let pieces: Vec<Cell<Option<ProductRows>>> = (0..PRODUCT_PIECES).map(|_| Cell::new()).collect();
-    let lookups: Cell<Result<((i64, i64), Lookup), String>> = Cell::new();
-    let ctx: Cell<Result<Ctx, String>> = Cell::new();
+    // The `Ctx` without its products, and what the parse wants prepared from it; then the
+    // products, which take longest to read.
+    let base: Cell<Result<(Ctx, Prepared), String>> = Cell::new();
+    let table: Cell<Result<(Vec<Vec<u8>>, Products), String>> = Cell::new();
     #[cfg(feature = "pipe-positional")]
-    let (shape, keys): (Cell<Option<(pos::PosShape, [usize; 3])>>, Cell<Option<(u64, u64)>>) = (Cell::new(), Cell::new());
+    // The shape with the events' estimated lines, which it is from.
+    let (shape, keys): (Cell<Option<(pos::PosShape, usize)>>, Cell<Option<(u64, u64)>>) = (Cell::new(), Cell::new());
     #[cfg(feature = "pipe-positional")]
     let scatter = types::parts::mode_from_env();
     #[cfg(feature = "pipe-positional")]
@@ -298,15 +304,20 @@ pub fn open(data: &Path, workers: usize, positional: Option<bool>, keep_open: bo
     types::par::each(&mut outs, |_worker, _out| {
         loop {
             match next.fetch_add(1, Relaxed) {
+                // The folders by size, each a task; the events' first lines are also the
+                // positional pipeline's sample, which wants more of them.
                 0 => {
-                    let opened = Files::open(data, chunk, keep_open);
-                    types::tl::mark("files open");
                     #[cfg(feature = "pipe-positional")]
-                    match (&opened, positional) {
-                        (Ok(opened), Some(force)) => {
-                            shape.set(Some((pos::PosShape::of(opened.rows[0]), opened.rows)));
-                            types::tl::mark("shape");
-                            keys.set(pos::keys(&opened.sample, opened.rows[0], force));
+                    let sample = if positional.is_some() { pos::SAMPLE_BYTES } else { ROWS_SAMPLE };
+                    #[cfg(not(feature = "pipe-positional"))]
+                    let sample = ROWS_SAMPLE;
+                    let events = Folder::open(data, 0, chunk, keep_open, sample);
+                    types::tl::mark("events open");
+                    #[cfg(feature = "pipe-positional")]
+                    match (&events, positional) {
+                        (Ok(events), Some(force)) => {
+                            shape.set(Some((pos::PosShape::of(events.rows), events.rows)));
+                            keys.set(pos::keys(&pos::sample(&events.lines), events.rows, force));
                             types::tl::mark("keys");
                         }
                         _ => {
@@ -314,43 +325,66 @@ pub fn open(data: &Path, workers: usize, positional: Option<bool>, keep_open: bo
                             keys.set(None);
                         }
                     }
-                    files.set(opened);
+                    folders[0].set(events);
                 }
                 1 => {
                     products.set(Lookup::read(data, "products.csv"));
                     types::tl::mark("products read");
                 }
                 2 => {
-                    lookups.set(window(data).and_then(|window| Ok((window, Lookup::read(data, "campaigns.csv")?))));
-                    types::tl::mark("campaigns read");
+                    folders[1].set(Folder::open(data, 1, chunk, keep_open, ROWS_SAMPLE));
+                    types::tl::mark("clicks open");
                 }
-                task if task < 3 + PRODUCT_PIECES => {
-                    pieces[task - 3].set(products.wait().as_ref().ok().map(|lookup| lookup.products(task - 3, PRODUCT_PIECES)));
+                3 => {
+                    base.set(window(data).and_then(|window| {
+                        let campaigns = Lookup::read(data, "campaigns.csv")?;
+                        let ctx = Ctx::with_products(window.0, window.1, vec![b"unknown".to_vec()], Products::new(0, 0), &campaigns.rows())?;
+                        let prepared = Prepared::new(&ctx);
+                        Ok((ctx, prepared))
+                    }));
+                    types::tl::mark("campaigns");
+                }
+                4 => {
+                    folders[2].set(Folder::open(data, 2, chunk, keep_open, ROWS_SAMPLE));
+                    types::tl::mark("links open");
+                }
+                task if task < 5 + PRODUCT_PIECES => {
+                    pieces[task - 5].set(products.wait().as_ref().ok().map(|lookup| lookup.products(task - 5, PRODUCT_PIECES)));
                     types::tl::mark("products piece");
                 }
-                task if task == 3 + PRODUCT_PIECES => {
-                    // The lookups together, once their parts are read.
+                task if task == 5 + PRODUCT_PIECES => {
+                    // The products' pieces together, once all are read.
                     let rows: Option<Vec<&ProductRows>> = pieces.iter().map(|piece| piece.wait().as_ref()).collect();
-                    ctx.set(match (products.wait(), lookups.wait(), rows) {
-                        (Ok(_), Ok((window, campaigns)), Some(rows)) => ctx_of(*window, &rows, campaigns),
-                        (Err(error), _, _) | (_, Err(error), _) => Err(error.clone()),
-                        (Ok(_), Ok(_), None) => unreachable!("products.csv was read, so its pieces are"),
+                    table.set(match (products.wait(), rows) {
+                        (Ok(_), Some(rows)) => products_of(&rows),
+                        (Err(error), _) => Err(error.clone()),
+                        (Ok(_), None) => unreachable!("products.csv was read, so its pieces are"),
                     });
-                    types::tl::mark("ctx");
+                    types::tl::mark("products");
                 }
                 _ => break,
             }
         }
+        // The worker's lists, as soon as the estimates say how large; then, while the round
+        // still waits for the keys or the lookups, their pages (`PosOut::touch`).
         #[cfg(feature = "pipe-positional")]
-        if let Some((shape, rows)) = shape.wait() {
-            *_out = Some(pos::out(workers, shape, rows[0], rows[1], scatter));
+        if let Some((shape, event_rows)) = shape.wait() {
+            let (events, pays) = pos::event_lists(workers, shape, scatter);
+            let click_rows = folders[1].wait().as_ref().map_or(0, |folder| folder.rows);
+            let clicks = pos::click_lists(workers, shape, *event_rows, click_rows, scatter);
+            let out = _out.insert(pos::PosOut::new(events, pays, clicks, chunk));
             types::tl::mark("lists");
+            out.touch(&|| keys.0.get().is_some() && base.0.get().is_some() && table.0.get().is_some() && folders[2].0.get().is_some());
+            types::tl::mark("touched");
         }
     });
     types::tl::mark("setup round");
-    let files = files.take()?;
-    let ctx = ctx.take()?;
-    let ingest = Ingest::with_files(files, &ctx)?;
+    let [events, clicks, links] = folders.map(Cell::take);
+    let files = Files::join([events?, clicks?, links?]);
+    let (mut ctx, prepared) = base.take()?;
+    let (categories, products) = table.take()?;
+    ctx.set_products(categories, products)?;
+    let ingest = Ingest::with_files(files, &ctx, prepared)?;
     #[cfg(feature = "pipe-positional")]
     let pos = match (shape.take(), keys.take()) {
         (Some((shape, _)), Some(keys)) => Some((ingest.pos_plan(shape, keys), outs.into_iter().map(|out| out.expect("every worker built its lists")).collect())),
@@ -363,6 +397,23 @@ pub fn open(data: &Path, workers: usize, positional: Option<bool>, keep_open: bo
         #[cfg(feature = "pipe-positional")]
         pos,
     })
+}
+
+/// What the parse wants prepared from the `Ctx`: made beside the inputs' opening.
+struct Prepared {
+    dates: Dates,
+    #[cfg(feature = "pipe-positional")]
+    campaigns: pos::Campaigns,
+}
+
+impl Prepared {
+    fn new(ctx: &Ctx) -> Prepared {
+        Prepared {
+            dates: Dates::new(ctx),
+            #[cfg(feature = "pipe-positional")]
+            campaigns: pos::Campaigns::new(ctx),
+        }
+    }
 }
 
 /// `SS_CHUNK_KB` in bytes.
@@ -412,9 +463,6 @@ struct Input {
     file: Option<File>,
     map: OnceLock<memmap2::Mmap>,
 }
-
-/// Input files kept open at most. More would pass the usual limit of 1,024 descriptors.
-const KEEP_OPEN: usize = 768;
 
 impl Input {
     /// The file mapped, on first use.
@@ -484,75 +532,84 @@ struct Files {
     links: Vec<Seg>,
     /// Estimated lines of the events, the clicks and the links, to size the buffers.
     rows: [usize; 3],
-    /// The first lines of the largest event segment, as `pos::sample` wants them.
-    #[cfg(feature = "pipe-positional")]
-    sample: Vec<(u64, u64)>,
 }
 
-/// Bytes of a kind's largest segment read to estimate its lines.
+/// One of the three input folders opened and cut into segments.
+struct Folder {
+    bufs: Vec<Buf>,
+    /// Their `buf` counts within this folder's `bufs`.
+    segs: Vec<Seg>,
+    /// Estimated lines.
+    rows: usize,
+    /// The first lines of the largest segment (`head`), which the estimate is from.
+    lines: Vec<u8>,
+}
+
+/// Bytes of a folder's largest segment read to estimate its lines.
 const ROWS_SAMPLE: usize = 64 << 10;
 
-impl Files {
-    fn open(data: &Path, chunk: usize, keep_open: bool) -> Result<Files, String> {
-        let (mut bufs, mut segs) = (Vec::new(), [Vec::new(), Vec::new(), Vec::new()]);
-        for (folder, segs) in ["events", "clicks", "links"].into_iter().zip(&mut segs) {
-            for path in csv_files(&data.join(folder))? {
-                let keep = keep_open && bufs.len() < KEEP_OPEN;
-                plan(path, chunk, keep, &mut bufs, segs)?;
-            }
-        }
-        let [events, clicks, links] = segs;
-        let mut files = Files {
-            bufs,
-            events,
-            clicks,
-            links,
-            rows: [0; 3],
-            #[cfg(feature = "pipe-positional")]
-            sample: Vec::new(),
-        };
-        // The events' sample is also the positional pipeline's, which wants more lines.
-        #[cfg(feature = "pipe-positional")]
-        let event_bytes = pos::SAMPLE_BYTES;
-        #[cfg(not(feature = "pipe-positional"))]
-        let event_bytes = ROWS_SAMPLE;
-        let lines = files.head(&files.events, event_bytes);
-        files.rows[0] = Files::rows(&files.events, &lines);
-        #[cfg(feature = "pipe-positional")]
-        {
-            files.sample = pos::sample(&lines);
-        }
-        files.rows[1] = Files::rows(&files.clicks, &files.head(&files.clicks, ROWS_SAMPLE));
-        files.rows[2] = Files::rows(&files.links, &files.head(&files.links, ROWS_SAMPLE));
-        Ok(files)
-    }
+/// Input files of each folder kept open at most (`Input::file`): together under the usual
+/// limit of 1,024 descriptors.
+const KEEP_OPEN: [usize; 3] = [512, 192, 64];
+const FOLDERS: [&str; 3] = ["events", "clicks", "links"];
 
-    /// The first whole lines in at most `most` bytes of the largest of `segs`, padded like
-    /// `padded`: a `\n`, the lines, `PAD` zeros. No lines for no segments or a failed read.
-    fn head(&self, segs: &[Seg], most: usize) -> Vec<u8> {
-        let Some(seg) = segs.iter().max_by_key(|seg| seg.end - seg.start) else { return padded(&[]) };
-        // From the byte before the segment, as `Ingest::seg` looks for the first line.
-        let (from, to) = (seg.start - 1, seg.limit.min(seg.start + most));
-        let mut bytes = vec![0u8; to - from];
-        match &self.bufs[seg.buf] {
-            Buf::Own(own) => bytes.copy_from_slice(&own[from..to]),
-            Buf::File(input) => {
-                if input.read_at(&mut bytes, from).is_err() {
-                    return padded(&[]);
-                }
-            }
+impl Folder {
+    /// Folder `which` of `FOLDERS` under `data`. `sample`: the bytes to estimate its lines from.
+    fn open(data: &Path, which: usize, chunk: usize, keep_open: bool, sample: usize) -> Result<Folder, String> {
+        let (mut bufs, mut segs) = (Vec::new(), Vec::new());
+        for path in csv_files(&data.join(FOLDERS[which]))? {
+            let keep = keep_open && bufs.len() < KEEP_OPEN[which];
+            plan(path, chunk, keep, &mut bufs, &mut segs)?;
         }
-        match (memchr(b'\n', &bytes), memrchr(b'\n', &bytes)) {
-            (Some(first), Some(last)) if first < last => padded(&bytes[first + 1..=last]),
-            _ => padded(&[]),
-        }
-    }
-
-    /// The lines `segs` hold, from the lines in a sample of them (`head`).
-    fn rows(segs: &[Seg], lines: &[u8]) -> usize {
+        let lines = head(&bufs, &segs, sample);
         let bytes: usize = segs.iter().map(|seg| seg.end - seg.start).sum();
-        let sample = &lines[1..lines.len() - PAD];
-        if sample.is_empty() { 0 } else { bytes * memchr::memchr_iter(b'\n', sample).count() / sample.len() }
+        let sampled = &lines[1..lines.len() - PAD];
+        let rows = if sampled.is_empty() { 0 } else { bytes * memchr::memchr_iter(b'\n', sampled).count() / sampled.len() };
+        Ok(Folder { bufs, segs, rows, lines })
+    }
+}
+
+/// The first whole lines in at most `most` bytes of the largest of `segs`, padded like
+/// `padded`: a `\n`, the lines, `PAD` zeros. No lines for no segments or a failed read.
+fn head(bufs: &[Buf], segs: &[Seg], most: usize) -> Vec<u8> {
+    let Some(seg) = segs.iter().max_by_key(|seg| seg.end - seg.start) else { return padded(&[]) };
+    // From the byte before the segment, as `Ingest::seg` looks for the first line.
+    let (from, to) = (seg.start - 1, seg.limit.min(seg.start + most));
+    let mut bytes = vec![0u8; to - from];
+    match &bufs[seg.buf] {
+        Buf::Own(own) => bytes.copy_from_slice(&own[from..to]),
+        Buf::File(input) => {
+            if input.read_at(&mut bytes, from).is_err() {
+                return padded(&[]);
+            }
+        }
+    }
+    match (memchr(b'\n', &bytes), memrchr(b'\n', &bytes)) {
+        (Some(first), Some(last)) if first < last => padded(&bytes[first + 1..=last]),
+        _ => padded(&[]),
+    }
+}
+
+impl Files {
+    /// The three folders, one after another.
+    fn open(data: &Path, chunk: usize, keep_open: bool) -> Result<Files, String> {
+        let folder = |which| Folder::open(data, which, chunk, keep_open, ROWS_SAMPLE);
+        Ok(Files::join([folder(0)?, folder(1)?, folder(2)?]))
+    }
+
+    /// The folders of `FOLDERS`, in that order, as one.
+    fn join(folders: [Folder; 3]) -> Files {
+        let rows = [folders[0].rows, folders[1].rows, folders[2].rows];
+        let (mut bufs, mut kinds) = (Vec::new(), Vec::new());
+        for folder in folders {
+            let first = bufs.len();
+            bufs.extend(folder.bufs);
+            kinds.push(folder.segs.into_iter().map(|seg| Seg { buf: first + seg.buf, ..seg }).collect::<Vec<Seg>>());
+        }
+        let links = kinds.pop().expect("three folders");
+        let clicks = kinds.pop().expect("three folders");
+        let events = kinds.pop().expect("three folders");
+        Files { bufs, events, clicks, links, rows }
     }
 }
 
@@ -590,11 +647,11 @@ impl Ingest {
     /// Opens every `*.csv` in `events/`, `clicks/` and `links/` and plans the chunk tasks.
     /// `crate::open` does this beside the lookups.
     pub fn open(data: &Path, ctx: &Ctx) -> Result<Ingest, String> {
-        Ingest::with_files(Files::open(data, chunk_bytes(), false)?, ctx)
+        Ingest::with_files(Files::open(data, chunk_bytes(), false)?, ctx, Prepared::new(ctx))
     }
 
     /// The tokenizer `SS_TOK` picks, and the reader `SS_READER` picks.
-    fn with_files(files: Files, ctx: &Ctx) -> Result<Ingest, String> {
+    fn with_files(files: Files, ctx: &Ctx, prepared: Prepared) -> Result<Ingest, String> {
         let options: &[(&str, ParseFn, LinksFn)] = &[
             #[cfg(feature = "tok-mask")]
             ("mask", parse_with::<tok::Mask>, links_with::<tok::Mask>),
@@ -605,7 +662,7 @@ impl Ingest {
         let picked = env::pick("SS_TOK", &names);
         let (_, parse_fn, links_fn) = options[picked];
         #[allow(unused_mut)]
-        let mut ingest = Ingest::with(files, ctx, parse_fn, links_fn)?;
+        let mut ingest = Ingest::with(files, ctx, prepared, parse_fn, links_fn)?;
         #[cfg(feature = "pipe-positional")]
         {
             // The positional parse's own tokenizer (`SS_POS_TOK`): `shape` by default, while the
@@ -632,10 +689,10 @@ impl Ingest {
 
     #[cfg(test)]
     fn open_with(data: &Path, ctx: &Ctx, chunk: usize, parse_fn: ParseFn, links_fn: LinksFn) -> Result<Ingest, String> {
-        Ingest::with(Files::open(data, chunk, false)?, ctx, parse_fn, links_fn)
+        Ingest::with(Files::open(data, chunk, false)?, ctx, Prepared::new(ctx), parse_fn, links_fn)
     }
 
-    fn with(files: Files, ctx: &Ctx, parse_fn: ParseFn, links_fn: LinksFn) -> Result<Ingest, String> {
+    fn with(files: Files, ctx: &Ctx, prepared: Prepared, parse_fn: ParseFn, links_fn: LinksFn) -> Result<Ingest, String> {
         if !(1..=20).contains(&ctx.part_bits) {
             return Err(format!("SS_PART_BITS={}: 1 to 20 supported", ctx.part_bits));
         }
@@ -647,7 +704,7 @@ impl Ingest {
             bufs,
             tasks,
             links,
-            dates: Dates::new(ctx),
+            dates: prepared.dates,
             event_rows,
             click_rows,
             link_rows,
@@ -656,7 +713,7 @@ impl Ingest {
             #[cfg(feature = "pipe-positional")]
             pos_fn: pos::parse_with::<Scalar>,
             #[cfg(feature = "pipe-positional")]
-            campaigns: pos::Campaigns::new(ctx),
+            campaigns: prepared.campaigns,
             #[cfg(feature = "pipe-positional")]
             pread: env::pick("SS_POS_READER", &["pread", "mmap"]) == 0,
             scatter: types::parts::mode_from_env(),

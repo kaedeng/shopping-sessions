@@ -49,6 +49,43 @@ fn thread() -> u64 {
     MINE.with(|mine| *mine)
 }
 
+/// A stopwatch for the phases of a task that runs thousands of times, where a mark each time
+/// would be too many: `lap(n)` adds the time since the last lap (or `new`) to phase `n`. It
+/// reads no clock when the timeline is off.
+pub struct Phases {
+    last: Option<Instant>,
+    pub ns: [u64; 12],
+}
+
+impl Phases {
+    pub fn new() -> Phases {
+        Phases { last: None, ns: [0; 12] }
+    }
+
+    /// Starts the watch: the next `lap` counts from here.
+    #[inline(always)]
+    pub fn start(&mut self) {
+        if on() {
+            self.last = Some(Instant::now());
+        }
+    }
+
+    #[inline(always)]
+    pub fn lap(&mut self, phase: usize) {
+        if let Some(last) = self.last {
+            let now = Instant::now();
+            self.ns[phase] += (now - last).as_nanos() as u64;
+            self.last = Some(now);
+        }
+    }
+}
+
+impl Default for Phases {
+    fn default() -> Phases {
+        Phases::new()
+    }
+}
+
 /// Prints every mark in time order: milliseconds since `start`, the thread, the name.
 pub fn report() {
     if !on() {

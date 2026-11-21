@@ -16,11 +16,13 @@ chmod 777 "$OUT" "$SCRATCH"
 OUT_HOST=$(host "$OUT"); SCRATCH_HOST=$(host "$SCRATCH")
 # The run's files belong to uid 1000, as on the scorer. If that is not you (a
 # Linux user other than the first, a cloud VM, rootless Docker), you could not
-# delete them, so they are made writable for everyone before cleaning up.
+# delete them, so they are made writable for everyone before cleaning up. The
+# image itself is the binary alone (no chmod in it), so another one does this:
+# the build stage's base by default, which a build leaves on the machine.
 release() {
   if [ -n "$(find "$OUT" "$SCRATCH" ! -user "$(id -u)" -print -quit 2>/dev/null)" ]; then
     docker run --rm --platform "$PLATFORM" --network none --user 1000:1000 \
-      -v "$OUT_HOST":/output:z -v "$SCRATCH_HOST":/scratch:z --entrypoint chmod "$IMAGE" \
+      -v "$OUT_HOST":/output:z -v "$SCRATCH_HOST":/scratch:z --entrypoint chmod "${HELPER_IMAGE:-rust:1.98-slim-trixie}" \
       -R a+rwX /output /scratch >/dev/null 2>&1 || true
   fi
   rm -rf "$SCRATCH" 2>/dev/null || true

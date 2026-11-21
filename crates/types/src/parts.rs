@@ -311,6 +311,28 @@ impl<T: Copy> Parts<T> {
         (0..self.lists()).flat_map(move |list| self.pieces(list)).flatten()
     }
 
+    /// Writes a byte into every page of the lists' room and of the staging buffers until
+    /// `stop` says so, so that the kernel backs them now: for a thread with nothing else to do
+    /// while the inputs stage ends. Left to the first records, those page faults (2 MB zeroed
+    /// each with huge pages) made a worker's first chunk take two to three times as long as
+    /// its later ones. The lists are empty; nothing reads these bytes before a record
+    /// overwrites them.
+    pub fn touch(&mut self, stop: &impl Fn() -> bool) {
+        const PAGE: usize = 4096;
+        for block in [(self.stage.ptr.as_ptr().cast::<u8>(), self.stage.layout.size()), (self.region.ptr.as_ptr().cast::<u8>(), self.region.layout.size())] {
+            let (bytes, len) = block;
+            let mut at = 0;
+            while at < len {
+                if stop() {
+                    return;
+                }
+                // SAFETY: inside the block, which this `Parts` owns and holds no record yet.
+                unsafe { bytes.add(at).write(0) };
+                at += PAGE;
+            }
+        }
+    }
+
     /// Slot `free-early`: empties every list and hands the region's pages back to the kernel on
     /// the calling thread (`mem::release`), instead of leaving them to the one thread that
     /// exits. The lists can be filled again afterwards.

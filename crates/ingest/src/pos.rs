@@ -84,25 +84,53 @@ impl PosShape {
     }
 }
 
-/// A worker's buffers for the positional parse, for `workers` workers and about `event_rows`
-/// event lines and `click_rows` click lines; `scatter` as `types::parts::mode_from_env`.
-pub(crate) fn out(workers: usize, shape: &PosShape, event_rows: usize, click_rows: usize, scatter: Option<usize>) -> PosOut {
+/// A worker's lists for the event lines of the positional parse (`PosOut::events`,
+/// `PosOut::pays`), for `workers` workers; `scatter` as `types::parts::mode_from_env`.
+pub(crate) fn event_lists(workers: usize, shape: &PosShape, scatter: Option<usize>) -> (Parts<PosEvent>, Parts<PosPay>) {
     // A partition holds `1 << shift` event numbers and a few percent more lines; a quarter
     // to spare, as workers pull chunks unevenly.
     let room = (1usize << shape.shift) * 9 / 8 / workers * 5 / 4 + 64;
+    (Parts::new(shape.parts, room, scatter), Parts::new(shape.parts, room / 16 + 32, scatter))
+}
+
+/// A worker's lists for the click lines (`PosOut::clicks`), for about `event_rows` event
+/// lines and `click_rows` click lines.
+pub(crate) fn click_lists(workers: usize, shape: &PosShape, event_rows: usize, click_rows: usize, scatter: Option<usize>) -> Parts<PosClick> {
     // The persons in use are about a 30th of the events, far fewer than the lists allow.
     let lists_in_use = ((event_rows / 30) >> shape.click_shift).max(1);
     let click_room = click_rows / workers / lists_in_use * 5 / 4 + 64;
-    PosOut {
-        events: Parts::new(shape.parts, room, scatter),
-        pays: Parts::new(shape.parts, room / 16 + 32, scatter),
-        clicks: Parts::new(shape.click_parts, click_room, scatter),
-        odd_events: Vec::new(),
-        odd_users: Vec::new(),
-        odd_clicks: Vec::new(),
-        scratch: Scratch::new(),
-        input: Vec::new(),
-        file: None,
+    Parts::new(shape.click_parts, click_room, scatter)
+}
+
+impl PosOut {
+    /// A worker's buffers for the positional parse: its lists, and room to read a chunk of
+    /// `chunk` bytes into.
+    pub(crate) fn new(events: Parts<PosEvent>, pays: Parts<PosPay>, clicks: Parts<PosClick>, chunk: usize) -> PosOut {
+        PosOut {
+            events,
+            pays,
+            clicks,
+            odd_events: Vec::new(),
+            odd_users: Vec::new(),
+            odd_clicks: Vec::new(),
+            scratch: Scratch::new(),
+            // What `Ingest::read` takes for a chunk: untouched until read into, or `touch`.
+            input: vec![0; chunk + crate::READ_SLACK + 1 + crate::PAD],
+            file: None,
+        }
+    }
+
+    /// Has the kernel back the buffers now, until `stop` says so (`Parts::touch`).
+    pub(crate) fn touch(&mut self, stop: &impl Fn() -> bool) {
+        for page in self.input.chunks_mut(4096) {
+            if stop() {
+                return;
+            }
+            page[0] = 0;
+        }
+        self.events.touch(stop);
+        self.pays.touch(stop);
+        self.clicks.touch(stop);
     }
 }
 
