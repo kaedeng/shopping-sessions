@@ -5,7 +5,7 @@
 //!
 //! Each slot is one module behind its feature, its own contract at the top of its file:
 //! `sess-partitioned` (the bucket pipeline), `sess-purchase-side` (where a purchase's price
-//! and category ride through the sort), `sort-grouped` and `sort-std` (the key sort, `SS_SORT`),
+//! and category ride through the sort), `sort-radix`, `sort-grouped` and `sort-std` (the key sort, `SS_SORT`),
 //! `attr-sweep` (credit and assists), `agg-dense` (both tables' counters). `implementation.md` has
 //! the choices inside them.
 
@@ -19,6 +19,8 @@ mod partitioned;
 mod purchase_side;
 #[cfg(feature = "sort-grouped")]
 mod sort_grouped;
+#[cfg(feature = "sort-radix")]
+mod sort_radix;
 #[cfg(feature = "sort-std")]
 mod sort_std;
 #[cfg(test)]
@@ -36,14 +38,14 @@ struct Click {
     id: Id,
 }
 
-#[cfg(not(any(feature = "sort-grouped", feature = "sort-std")))]
-compile_error!("sessions needs a key sort: enable `sort-grouped` or `sort-std`");
+#[cfg(not(any(feature = "sort-radix", feature = "sort-grouped", feature = "sort-std")))]
+compile_error!("sessions needs a key sort: enable `sort-radix`, `sort-grouped` or `sort-std`");
 
 /// A key sort's spare buffers, one set per worker: any length on entry, left in any state.
 #[derive(Default)]
 pub(crate) struct SortScratch {
     keys: Vec<u64>,
-    /// `sort-grouped`: where each group's keys start.
+    /// `sort-grouped`: where each group's keys start. `sort-radix`: every digit's counts.
     starts: Vec<u32>,
 }
 
@@ -62,6 +64,8 @@ fn key_sort() -> SortFn {
             ("grouped", sort_grouped::sort),
             #[cfg(feature = "sort-std")]
             ("std", sort_std::sort),
+            #[cfg(feature = "sort-radix")]
+            ("radix", sort_radix::sort),
         ];
         let names: Vec<&str> = options.iter().map(|option| option.0).collect();
         options[types::env::pick("SS_SORT", &names)].1

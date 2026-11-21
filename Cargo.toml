@@ -59,6 +59,7 @@ sess-partitioned = ["sessions/sess-partitioned"]
 sess-purchase-side = ["sessions/sess-purchase-side"]
 sort-std = ["sessions/sort-std"]
 sort-grouped = ["sessions/sort-grouped"]
+sort-radix = ["sessions/sort-radix"]
 attr-sweep = ["sessions/attr-sweep"]
 agg-dense = ["sessions/agg-dense"]
 # output

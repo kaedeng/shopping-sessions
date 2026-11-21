@@ -54,7 +54,7 @@ fn scatter<R, O: Copy>(
         if let Some(id) = user(r) {
             let person = table.person(id);
             // SAFETY: the shift leaves `bucket_bits` bits, and `out` has `1 << bucket_bits` buckets.
-            unsafe { out.push_unchecked((person_hash(person) >> shift) as usize, make(r, person)) };
+            unsafe { out.push_with((person_hash(person) >> shift) as usize, |slot| slot.write(make(r, person))) };
         }
     }
     // The sessions stage reads these buckets from other threads.

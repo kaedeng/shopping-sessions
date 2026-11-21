@@ -390,9 +390,13 @@ unsafe fn event_row(ctx: &Ctx, dates: &Dates, shift: u32, fields: &[Field; 7], p
         & price_ok
         & ingest_ok
         & (ingest_ms - ts <= DAY);
-    let rec = EventRec { id, user, ts: ts as u32, ingest: ingest_rel, pay, flags: VALID * u32::from(valid) };
-    // SAFETY: `shift` leaves `part_bits` bits, and there are `1 << part_bits` partitions.
-    unsafe { parts.push_unchecked((hash(id) >> shift) as usize, rec) };
+    // SAFETY: `shift` leaves `part_bits` bits, and there are `1 << part_bits` partitions. The
+    // record is written where it goes (`Parts::push_with`), every field of it.
+    unsafe {
+        parts.push_with((hash(id) >> shift) as usize, |slot| {
+            slot.write(EventRec { id, user, ts: ts as u32, ingest: ingest_rel, pay, flags: VALID * u32::from(valid) })
+        })
+    };
 }
 
 /// An `ingest_ts` outside the date table (or not F1, which the rules leave undefined: such an

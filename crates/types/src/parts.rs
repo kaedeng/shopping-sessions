@@ -102,8 +102,9 @@ pub struct Parts<T> {
     room: usize,
     lens: Vec<u32>,
     spill: Vec<Vec<T>>,
-    /// Slot `scatter-wc`: list `i` stages its newest `fill[i]` records in slots `i * stage ..`
-    /// of `staged`. `stage` is 0 for plain stores, and then nothing is ever staged.
+    /// Slot `scatter-wc`: list `i` stages its newest `fill[i]` records (up to `stage`: a full
+    /// stage moves out when the next record arrives) in slots `i * stage ..` of `staged`.
+    /// `stage` is 0 for plain stores, and then nothing is ever staged.
     staged: Block<T>,
     stage: usize,
     fill: Vec<u8>,
@@ -126,6 +127,7 @@ impl<T: Copy> Parts<T> {
         } else {
             // The fewest records that end on a line boundary, then as many of those groups as fit.
             let group = LINE / gcd(size, LINE);
+            // `fill` counts a full stage in a `u8`.
             (group * (stage_bytes / (group * size)).max(1)).min(u8::MAX as usize / group * group)
         };
         // A flush moves a whole stage, so a staged list's room is a whole number of stages and
@@ -154,20 +156,35 @@ impl<T: Copy> Parts<T> {
     /// `list < self.lists()`.
     #[inline(always)]
     pub unsafe fn push_unchecked(&mut self, list: usize, rec: T) {
+        // SAFETY: the caller keeps `list` in range, and the closure writes the whole record.
+        unsafe { self.push_with(list, |slot| slot.write(rec)) }
+    }
+
+    /// Appends to list `list` the record `write` writes into the slot it is given. For a record
+    /// of several fields this is the fast form: the fields go straight to the slot. Built as a
+    /// value first, a 32-byte record was stored to the stack field by field and copied out with
+    /// one wide load, which waits for every one of those stores to leave the store buffer (no
+    /// forwarding from several small stores to one wide load): 26% of the parse's samples on
+    /// the x86 box.
+    ///
+    /// # Safety
+    /// `list < self.lists()`, and `write` initialises the whole record.
+    #[inline(always)]
+    pub unsafe fn push_with(&mut self, list: usize, write: impl FnOnce(*mut T)) {
         // One branch per record on a value fixed for the run, so the predictor always has it;
         // the two loops are not worth a second copy of every caller.
         if self.stage != 0 {
-            // SAFETY: the caller keeps `list` in range, and `fill[list] < stage`.
+            // SAFETY: the caller keeps `list` in range, and `fill[list] <= stage`.
             unsafe {
-                let fill = self.fill.get_unchecked_mut(list);
-                let at = *fill as usize;
-                self.staged.at.as_ptr().add(list * self.stage + at).write(rec);
-                if at + 1 == self.stage {
-                    *fill = 0;
+                let mut at = *self.fill.get_unchecked(list) as usize;
+                // A full stage leaves when the next record comes, not when its last one lands:
+                // by then its stores have retired, so the flush's wide loads do not wait on them.
+                if at == self.stage {
                     self.flush(list);
-                } else {
-                    *fill = at as u8 + 1;
+                    at = 0;
                 }
+                write(self.staged.at.as_ptr().add(list * self.stage + at));
+                *self.fill.get_unchecked_mut(list) = at as u8 + 1;
             }
             return;
         }
@@ -176,10 +193,13 @@ impl<T: Copy> Parts<T> {
         if (*len as usize) < self.room {
             // SAFETY: `list * room + len < lists * room`, the region's capacity, and each slot is
             // written at most once before `pieces` reads it.
-            unsafe { self.region.at.as_ptr().add(list * self.room + *len as usize).write(rec) };
+            unsafe { write(self.region.at.as_ptr().add(list * self.room + *len as usize)) };
             *len += 1;
         } else {
-            self.spill(list, rec);
+            let mut rec = std::mem::MaybeUninit::<T>::uninit();
+            write(rec.as_mut_ptr());
+            // SAFETY: `write` initialised it (the caller's contract).
+            self.spill(list, unsafe { rec.assume_init() });
         }
     }
 

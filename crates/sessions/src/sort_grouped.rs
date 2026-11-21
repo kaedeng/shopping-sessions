@@ -37,14 +37,36 @@ pub fn sort(keys: &mut Vec<u64>, key_bits: u32, low_bits: u32, scratch: &mut Sor
     grouped.clear();
     // Room for the caller's sentinel too, so its push does not grow the buffer.
     grouped.reserve(keys.len() + 1);
-    let out = grouped.as_mut_ptr();
-    for &key in keys.iter() {
-        // SAFETY: the count pass indexed the same groups, and the running sums make the
-        // positions a permutation of `0..keys.len()`, inside the reserved room.
+    let (out, next) = (grouped.as_mut_ptr(), starts.as_mut_ptr());
+    // Eight keys a round, their loads before the stores that depend on them: under the
+    // store-bypass mitigation a load waits for every earlier store's address, and a key's
+    // store address comes out of a load, so key by key each waits for the one before
+    // (`sort_radix.rs`, `x86.md`).
+    let mut chunks = keys.chunks_exact(8);
+    for chunk in &mut chunks {
+        let batch: [u64; 8] = chunk.try_into().expect("chunks of 8");
+        let mut at = [0u32; 8];
+        for (at, key) in at.iter_mut().zip(batch) {
+            // SAFETY: the count pass indexed the same groups. Two keys of one group update
+            // its position in turn.
+            unsafe {
+                let slot = next.add((key >> low_bits) as usize);
+                *at = *slot;
+                *slot = *at + 1;
+            }
+        }
+        for (at, key) in at.into_iter().zip(batch) {
+            // SAFETY: the running sums make the positions a permutation of `0..keys.len()`,
+            // inside the reserved room.
+            unsafe { out.add(at as usize).write(key) };
+        }
+    }
+    for &key in chunks.remainder() {
+        // SAFETY: as above.
         unsafe {
-            let at = starts.get_unchecked_mut((key >> low_bits) as usize);
-            out.add(*at as usize).write(key);
-            *at += 1;
+            let slot = next.add((key >> low_bits) as usize);
+            out.add(*slot as usize).write(key);
+            *slot += 1;
         }
     }
     // SAFETY: every position in `0..keys.len()` was written once above.
