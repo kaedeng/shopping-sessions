@@ -114,7 +114,21 @@ pub fn bucket<'a>(
     clicks: impl Iterator<Item = &'a [ClickRec]> + Clone,
     agg: &mut Agg,
 ) {
-    partitioned::bucket(ctx, events, clicks, agg)
+    partitioned::bucket::<false>(ctx, events, clicks, agg)
+}
+
+/// `bucket` with the assists counted per stretch of a person's sessions (`attr-interval`): for
+/// the positional pipeline's classic lane. Its persons include a few with tens of thousands of
+/// events and as many clicks, and counted per session and campaign their assists made a
+/// bucket of one such person the longest task of the lane (8 ms of a 290 ms run at 20M).
+#[cfg(feature = "pipe-positional")]
+pub fn bucket_stretch<'a>(
+    ctx: &Ctx,
+    events: impl Iterator<Item = &'a [PersonEvent]> + Clone,
+    clicks: impl Iterator<Item = &'a [ClickRec]> + Clone,
+    agg: &mut Agg,
+) {
+    partitioned::bucket::<true>(ctx, events, clicks, agg)
 }
 
 /// Sums the workers' campaign counters into the `campaign_daily` rows: one per (campaign, day)

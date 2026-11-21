@@ -216,13 +216,18 @@ pub(crate) fn sort_person_clicks<'s>(scratch: &'s mut Scratch, clicks: &'s mut [
     sort_clicks(clicks, &mut scratch.order, &mut scratch.sorted)
 }
 
-pub fn bucket<'a>(
+/// `STRETCH` picks the attribution: `attr-interval` (assists counted per stretch of sessions)
+/// where the build has it, else the bucket's own, `attr-sweep` (per session and campaign).
+pub fn bucket<'a, const STRETCH: bool>(
     ctx: &Ctx,
     events: impl Iterator<Item = &'a [PersonEvent]> + Clone,
     clicks: impl Iterator<Item = &'a [ClickRec]> + Clone,
     agg: &mut Agg,
 ) {
-    let Agg { user_daily, bucket: scratch, rows, attr, day, counters, .. } = agg;
+    #[cfg(feature = "pipe-positional")]
+    let Agg { user_daily, bucket: scratch, rows, attr, stretch, day, counters } = agg;
+    #[cfg(not(feature = "pipe-positional"))]
+    let Agg { user_daily, bucket: scratch, rows, attr, day, counters } = agg;
     let n: usize = events.clone().map(<[_]>::len).sum();
     let ts_bits = ctx.ts_bits;
     scratch.reset(n, ctx.bucket_bits);
@@ -257,12 +262,23 @@ pub fn bucket<'a>(
             let d = (ctx.day_of(start) - ctx.day0) as usize;
             day.session(d, at - first, person, ctx.day0, user_daily);
             let revenue = rows.purchases(first..at, |price, category| day.purchase(price, category));
+            #[cfg(feature = "pipe-positional")]
+            let credit =
+                if STRETCH { stretch.session(clicks, start, d, organic, counters.assisted()) } else { attr.session(clicks, start, organic, counters.assists(d)) };
+            #[cfg(not(feature = "pipe-positional"))]
             let credit = attr.session(clicks, start, organic, counters.assists(d));
             counters.credit(credit, d, revenue);
             if rows.key(at) >> ts_bits != local as u64 {
                 break;
             }
         }
+        #[cfg(feature = "pipe-positional")]
+        if STRETCH {
+            stretch.end_person(counters.assisted());
+        } else {
+            attr.end_person();
+        }
+        #[cfg(not(feature = "pipe-positional"))]
         attr.end_person();
         day.flush(person, ctx.day0, user_daily);
     }

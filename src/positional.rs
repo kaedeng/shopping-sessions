@@ -298,6 +298,9 @@ struct Placing {
     /// Kept-copy candidates whose user is not a number: (slot, ingest, worker, index).
     odd: Vec<(u32, u32, u32, u32)>,
     slow_events: Vec<PersonEvent>,
+    /// The slots with a kept purchase, a bit each, and the `pay` of each such slot.
+    paid: Vec<u64>,
+    pay_at: Vec<u32>,
 }
 
 /// A worker's state for the stages after the parse.
@@ -375,6 +378,9 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
     let persons = plan.persons as usize;
     let mut click_aliases = vec![0u64; persons];
     let mut flags = vec![0u8; persons];
+    for extra in &extras {
+        flags[extra.person as usize] |= EXTRA;
+    }
     let (click_aliases_at, flags_at) = (Shared(click_aliases.as_mut_ptr()), Shared(flags.as_mut_ptr()));
     let grouped: Vec<OnceLock<Grouped>> = (0..plan.click_parts).map(|_| OnceLock::new()).collect();
     let mut works: Vec<Work> = par::init(ctx.workers, parallel_alloc, |_| Work::new(ctx));
@@ -437,7 +443,7 @@ pub fn run(ctx: &Ctx, ingest: &Ingest, plan: &PosPlan, out: &Path, parallel_allo
         }
         par::run(&mut works, 1 << SLOW_BITS, |_, work, bucket| {
             if !event_buckets[bucket].is_empty() {
-                sessions::bucket(ctx, std::iter::once(&event_buckets[bucket][..]), std::iter::once(&click_buckets[bucket][..]), &mut work.agg);
+                sessions::bucket_stretch(ctx, std::iter::once(&event_buckets[bucket][..]), std::iter::once(&click_buckets[bucket][..]), &mut work.agg);
             }
         });
     }
@@ -484,7 +490,8 @@ struct Fused<'a> {
     extras: &'a [Extra],
     grouped: &'a [OnceLock<Grouped>],
     click_aliases: &'a [u64],
-    /// `UNFIT` for a person with a click alias over the masks (`group_clicks`).
+    /// `UNFIT` for a person with a click alias over the masks (`group_clicks`), `EXTRA` for
+    /// one with extras.
     flags: &'a [u8],
     /// Per person: `SEEN` once a run of it is taken, `UNFIT` once that run is found to be the
     /// classic lane's.
@@ -507,6 +514,10 @@ struct Edge {
 
 impl<'a> Fused<'a> {
     fn extras_of(&self, person: usize) -> &'a [Extra] {
+        // Nearly nobody has any, and the search was a dozen steps for every person.
+        if self.flags[person] & EXTRA == 0 {
+            return &[];
+        }
         let from = self.extras.partition_point(|extra| (extra.person as usize) < person);
         let count = self.extras[from..].iter().take_while(|extra| extra.person as usize == person).count();
         &self.extras[from..from + count]
@@ -996,7 +1007,7 @@ fn place_rows(part: usize, plan: &PosPlan, parsed: &[PosOut], links: &Links, wor
         return None;
     }
     let (slots, base) = (1usize << plan.shift, part << plan.shift);
-    let Placing { kept, odd, slow_events } = work;
+    let Placing { kept, odd, slow_events, paid, pay_at } = work;
     // One 16-byte slot per event number while placing: a row reads and writes one cache line
     // of a table that fits L2. Three arrays (ingest, time, user) were three lines a row, and
     // those accesses were two thirds of this stage.
@@ -1036,22 +1047,36 @@ fn place_rows(part: usize, plan: &PosPlan, parsed: &[PosOut], links: &Links, wor
         }
     }
     let valid = |row: &PosEvent| row.flags() & POS_VALID != 0;
-    let mut pays: Vec<(u32, u32)> = Vec::new();
+    // The purchases come in any order and leave in slot order: a bit per slot that has one
+    // and its `pay` beside, then the bits read in order. (Sorted as pairs they were 108
+    // instructions a purchase.) Twins give one entry, with the smaller `pay` should they differ.
+    paid.clear();
+    paid.resize(slots.div_ceil(64), 0);
+    pay_at.resize(slots, 0);
+    let mut count = 0;
     for out in parsed {
         for piece in out.pays.pieces(part) {
             for pay in piece {
                 let slot = pay.slot as usize & (slots - 1);
                 // The kept copy has this `ingest`, so it is this row or its twin.
                 if kept[slot].ingest() == pay.ingest && valid(&kept[slot]) {
-                    pays.push(((base + slot) as u32, pay.pay));
+                    let (word, bit) = (&mut paid[slot / 64], 1u64 << (slot % 64));
+                    pay_at[slot] = if *word & bit == 0 { pay.pay } else { pay_at[slot].min(pay.pay) };
+                    count += usize::from(*word & bit == 0);
+                    *word |= bit;
                 }
             }
         }
     }
-    // By event number, then `pay`, as one word a pair: the pairs compared field by field
-    // were 135 instructions a purchase.
-    pays.sort_unstable_by_key(|&(number, pay)| u64::from(number) << 32 | u64::from(pay));
-    pays.dedup_by_key(|&mut (number, _)| number);
+    let mut pays: Vec<(u32, u32)> = Vec::with_capacity(count);
+    for (at, &word) in paid.iter().enumerate() {
+        let mut rest = word;
+        while rest != 0 {
+            let slot = at * 64 + rest.trailing_zeros() as usize;
+            rest &= rest - 1;
+            pays.push(((base + slot) as u32, pay_at[slot]));
+        }
+    }
     // A kept copy whose user is not a number leaves the table for the classic lane.
     if !odd.is_empty() {
         for &(slot, row_ingest, worker, index) in odd.iter() {
@@ -1197,17 +1222,28 @@ unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_al
         ends[local] += ends[local - 1];
     }
     // `ends[local]` is the person's first position, and the scatter moves it to one past the last.
-    let mut clicks: Vec<Click> = vec![Click::default(); total];
-    let mut aliases = vec![0u16; total];
+    // Both arrays are written here and nowhere before: filled with zeros first, they were
+    // written twice.
+    let (mut clicks, mut aliases): (Vec<Click>, Vec<u16>) = (Vec::with_capacity(total), Vec::with_capacity(total));
+    let (click_room, alias_room) = (clicks.as_mut_ptr(), aliases.as_mut_ptr());
     for out in parsed {
         for piece in out.clicks.pieces(range) {
             for click in piece {
                 let at = &mut ends[(click.u() >> ALIAS_BITS) as usize - first];
-                clicks[*at as usize] = Click { ts: click.ts(), campaign: click.campaign(), id: click.click };
-                aliases[*at as usize] = (click.u() & ALIAS_MASK) as u16;
+                // SAFETY: the counts above are of these same clicks, so the positions are a
+                // permutation of `0..total`, inside the reserved room.
+                unsafe {
+                    click_room.add(*at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.click });
+                    alias_room.add(*at as usize).write((click.u() & ALIAS_MASK) as u16);
+                }
                 *at += 1;
             }
         }
+    }
+    // SAFETY: every position in `0..total` of both was written once above.
+    unsafe {
+        clicks.set_len(total);
+        aliases.set_len(total);
     }
     ends.truncate(persons);
     Some(Grouped { ends, clicks: Shared(clicks.as_mut_ptr()), aliases, _owner: clicks })
