@@ -104,6 +104,35 @@ fn descriptors() -> bool {
     false
 }
 
+/// Slot `free-early`, the last of it (`SS_EXIT=release|leave`): every large block the
+/// run still holds goes back to the kernel now, a piece a task on all the workers, and the
+/// process ends with next to nothing mapped. Call it last: what the blocks held reads as
+/// zeros afterwards.
+///
+/// Left to the exit, one thread unmaps it all after the output is written and before the
+/// process is gone, which whoever times the run waits for. With 2 MB pages that is 5 ms at
+/// 20M events; on 4 KB pages (the scorer has no huge pages) the 900 MB still held are
+/// 225,000 pages and it was 55 ms, a tenth of the run.
+fn hand_back(workers: usize) {
+    #[cfg(feature = "alloc-region")]
+    if types::mem::free_early() && types::env::pick("SS_EXIT", &["release", "leave"]) == 0 {
+        if let Some((from, to)) = region::large_used() {
+            // A thread's chunk is 64 MB, mostly one worker's; smaller pieces so that the
+            // workers come out even.
+            const PIECE: usize = 8 << 20;
+            let mut states = vec![(); workers.max(1)];
+            par::run(&mut states, (to - from).div_ceil(PIECE), |_, _, piece| {
+                let start = from + piece * PIECE;
+                // SAFETY: whole pages of the reservation; nothing reads a large block after
+                // this (the caller exits, and the workers' own state is not in one).
+                unsafe { types::mem::release(start as *const u8, PIECE.min(to - start)) };
+            });
+        }
+    }
+    #[cfg(not(feature = "alloc-region"))]
+    let _ = workers;
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("shopping-sessions: {error}");
@@ -176,6 +205,7 @@ fn run() -> Result<(), String> {
             }
             types::tl::report();
             if cfg!(feature = "fast-exit") {
+                hand_back(workers);
                 std::process::exit(0);
             }
             return Ok(());
@@ -378,8 +408,10 @@ fn run() -> Result<(), String> {
         }
         par::trace::write(path.as_ref(), &stages).map_err(|error| format!("SS_TRACE: {error}"))?;
     }
-    // Slot `fast-exit`: the files are written, so skip the destructors and let the kernel reclaim.
+    // Slot `fast-exit`: the files are written, so skip the destructors and let the kernel
+    // reclaim; what is large goes back first, on all the workers (`hand_back`).
     if cfg!(feature = "fast-exit") {
+        hand_back(workers);
         std::process::exit(0);
     }
     Ok(())
