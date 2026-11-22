@@ -20,7 +20,7 @@
 //! - **A record is written once.** What a record holds beside its user is made for eight
 //!   rows at a time in registers (`prepare`); the loop of a kind looks the user up and puts
 //!   the record in its list's staging block. No second batch, no held records.
-//! - **One batch of 64 rows**, 6 KB with its lists, where `kern` keeps two batches and the
+//! - **One batch of 64 rows**, 7 KB with its lists (5 KB of it in use), where `kern` keeps two batches and the
 //!   held records (12 KB) in a first-level cache that two workers share on the scorer. A
 //!   short user's line of the directory is asked for eight rows at a time as they are
 //!   decoded, a long user's when its batch is sorted; the rows with two short IDs, three in
