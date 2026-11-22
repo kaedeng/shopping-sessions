@@ -256,6 +256,64 @@ fn matches_the_reference_on_random_buckets() {
         let got = pipeline(&ctx, &buckets, workers, |at| at % workers);
         assert_eq!(got.0, want.0, "user_daily, seed {seed}");
         assert_eq!(got.1, want.1, "campaign_daily, seed {seed}");
+
+        // The same rows through the dense bucket, the persons as numbers from some base on,
+        // in every combination of its two choices.
+        #[cfg(feature = "pipe-positional")]
+        {
+            let mut everyone: Vec<Id> = events.iter().map(|event| event.person).chain(clicks.iter().map(|click| click.user)).collect();
+            everyone.sort_unstable();
+            everyone.dedup();
+            // Some numbers without a person between them, and room past the last.
+            let step = 1 + rng.below(3) as usize;
+            let base = 1 + rng.below(5_000) as u32;
+            let span = everyone.len() * step + rng.below(4) as usize + 1;
+            let number = |person: Id| base + (everyone.binary_search(&person).unwrap() * step) as u32;
+            let mut keys: Vec<u64> = events.iter().map(|event| u64::from(number(event.person)) << 32 | u64::from(event.ts)).collect();
+            let mut paid: Vec<crate::DensePay> =
+                events.iter().filter(|event| event.pay != 0).map(|event| crate::DensePay { key: u64::from(number(event.person)) << 32 | u64::from(event.ts), pay: event.pay, pad: 0 }).collect();
+            let mut numbered: Vec<ClickRec> = clicks.iter().map(|click| ClickRec { user: Id::from(number(click.user)), ..*click }).collect();
+            // In another order than they were made in.
+            for at in (1..keys.len()).rev() {
+                keys.swap(at, rng.below(at as u64 + 1) as usize);
+            }
+            for at in (1..paid.len()).rev() {
+                paid.swap(at, rng.below(at as u64 + 1) as usize);
+            }
+            for at in (1..numbered.len()).rev() {
+                numbered.swap(at, rng.below(at as u64 + 1) as usize);
+            }
+            let cut = rng.below(keys.len() as u64 + 1) as usize;
+            for (net, wide_walk) in [(true, true), (false, true), (true, false), (false, false)] {
+                let mut agg = Agg::new(&ctx);
+                crate::partitioned::bucket_dense_as(
+                    &ctx,
+                    base,
+                    span,
+                    &|each| {
+                        each(&keys[..cut]);
+                        each(&keys[cut..]);
+                    },
+                    &|each| each(&paid),
+                    &|each| each(&numbered),
+                    &mut agg,
+                    net,
+                    wide_walk,
+                );
+                let rows = &agg.user_daily;
+                let mut user_rows: Vec<UserRow> = (0..rows.person.len())
+                    .map(|i| (everyone[(rows.person[i] as usize - base as usize) / step], rows.day[i], rows.sessions[i], rows.events[i], rows.revenue_cents[i], rows.top_category[i]))
+                    .collect();
+                user_rows.sort();
+                let rows = campaign_daily(&ctx, std::slice::from_ref(&agg));
+                let mut campaign_rows: Vec<CampaignRow> = (0..rows.campaign.len())
+                    .map(|i| (rows.campaign[i], rows.day[i], rows.sessions[i], rows.purchasing_sessions[i], rows.revenue_cents[i], rows.assisted_sessions[i]))
+                    .collect();
+                campaign_rows.sort();
+                assert_eq!(user_rows, want.0, "dense user_daily, seed {seed}, sort {net}, walk {wide_walk}");
+                assert_eq!(campaign_rows, want.1, "dense campaign_daily, seed {seed}, sort {net}, walk {wide_walk}");
+            }
+        }
     }
 }
 

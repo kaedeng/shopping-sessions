@@ -47,11 +47,34 @@ pub(crate) struct Attr {
     keys: Vec<u64>,
     ts: Vec<u32>,
     campaign: Vec<u32>,
+    /// `heavy` sorts the clicks (`SS_ATTR_HEAVY=sort`); `heavy_table` does not (the pick).
+    sorted: bool,
+    /// `heavy_table`: the person's starts with `u32::MAX` after them, and how many starts lie
+    /// before each step of 2^`STEP` ms.
+    st: Vec<u32>,
+    table: Vec<u16>,
+    /// Per session, and one more: the latest click whose stretch begins there.
+    best_ts: Vec<u32>,
+    best_at: Vec<u32>,
+    /// Per campaign, `words` words: the sessions it assists, a bit each. All zero between
+    /// persons.
+    cmask: Vec<u64>,
+    words: usize,
+    /// Per campaign: `stamp` once it is in `touched` for the person in hand.
+    seen: Vec<u32>,
+    stamp: u32,
+    touched: Vec<u32>,
 }
+
+/// A step of `Attr::table`, as a shift of milliseconds: 17.5 minutes, under the 30 that part
+/// two sessions' starts.
+const STEP: u32 = 20;
+/// No click yet, in `Attr::best_at`.
+const NO_CLICK: u32 = u32::MAX;
 
 impl Attr {
     pub(crate) fn new(campaigns: usize) -> Attr {
-        Attr { last: vec![0; campaigns], ..Attr::default() }
+        Attr { last: vec![0; campaigns], seen: vec![0; campaigns], sorted: types::env::pick("SS_ATTR_HEAVY", &["table", "sort"]) == 1, ..Attr::default() }
     }
 
     /// Credits one person's sessions and counts their assists. Session `i` starts at
@@ -65,7 +88,172 @@ impl Attr {
         if clicks.is_empty() || starts.is_empty() {
             return;
         }
-        if clicks.len() <= LIGHT { self.light(clicks, starts, days, credits, assisted) } else { self.heavy(clicks, starts, days, credits, assisted) }
+        if clicks.len() <= LIGHT {
+            self.light(clicks, starts, days, credits, assisted)
+        } else if self.sorted || starts.len() >= usize::from(u16::MAX) {
+            self.heavy(clicks, starts, days, credits, assisted)
+        } else {
+            self.heavy_table(clicks, starts, days, credits, assisted)
+        }
+    }
+
+    /// `person` for any number of clicks, in any order: nothing is sorted.
+    ///
+    /// A click covers the sessions `lo..hi`: from the first that starts at or after it to the
+    /// first that starts more than a week after it. Both are counts of starts, read from a
+    /// table of the starts by steps of 2^`STEP` ms: two sessions start more than 30 minutes
+    /// apart, so a step holds at most one start and a count is one entry and one compare (more
+    /// starts in a step would only cost more compares). With at most 16 sessions the counts
+    /// are two compares against all the starts instead.
+    ///
+    /// - The credit of session `s` is the latest click with `lo <= s`, if it is within the
+    ///   week: the latest click per `lo` (clicks of one `ts` share theirs, and the smallest
+    ///   `click_id` wins), then the latest so far, session by session.
+    /// - A campaign assists the union of its clicks' stretches: a bit per session, and each
+    ///   run of bits is a difference of two prefix sums, as in `heavy`.
+    fn heavy_table(&mut self, clicks: &[Click], starts: &[u32], days: &[u32], credits: &mut [u32], assisted: &mut [u32]) {
+        let (n, sessions) = (clicks.len(), starts.len());
+        let week = WEEK as u32;
+        // Room for a 16-lane load, and two entries past the last start.
+        self.st.clear();
+        self.st.extend_from_slice(starts);
+        self.st.resize(sessions.max(LIGHT) + 2, u32::MAX);
+        if self.prefix.len() < sessions + 1 {
+            self.prefix.resize(sessions + 1, [0; DAYS]);
+        }
+        self.best_ts.clear();
+        self.best_ts.resize(sessions + 1, 0);
+        self.best_at.clear();
+        self.best_at.resize(sessions + 1, NO_CLICK);
+        let words = sessions.div_ceil(64);
+        if words > self.words {
+            self.words = words;
+            self.cmask.clear();
+            self.cmask.resize(self.seen.len() * words, 0);
+        }
+        if self.stamp == u32::MAX {
+            self.seen.fill(0);
+            self.stamp = 0;
+        }
+        self.stamp += 1;
+        self.touched.clear();
+        self.touched.reserve(n + 1);
+        // The table: `table[g]` starts lie in the steps before step `g`; `cap` is the step
+        // after the last start's, and stands for every later one.
+        let wide = sessions > LIGHT;
+        let mut cap = 0usize;
+        if wide {
+            cap = (starts[sessions - 1] >> STEP) as usize + 1;
+            self.table.clear();
+            self.table.resize(cap + 1, 0);
+            let mut from = 0usize;
+            for (at, &start) in starts.iter().enumerate() {
+                let step = (start >> STEP) as usize;
+                if step >= from {
+                    self.table[from..=step].fill(at as u16);
+                    from = step + 1;
+                }
+            }
+            self.table[cap] = sessions as u16;
+        }
+        let (stride, stamp) = (self.words, self.stamp);
+        let (st, table, prefix) = (self.st.as_ptr(), self.table.as_ptr(), self.prefix.as_mut_ptr());
+        let (best_ts, best_at) = (self.best_ts.as_mut_ptr(), self.best_at.as_mut_ptr());
+        let (cmask, seen, touched) = (self.cmask.as_mut_ptr(), self.seen.as_mut_ptr(), self.touched.as_mut_ptr());
+        // SAFETY: `st` holds the starts and `u32::MAX` after them, so a count stops at
+        // `sessions` at the latest (no click is at `u32::MAX`, and a week's end is kept below
+        // it); `table` has `cap + 1` entries; `best_*` and `prefix` have `sessions + 1`; a
+        // campaign is below the counters' count (the caller's contract), which is `seen`'s, and
+        // its `stride >= words` words of `cmask` hold bits below `sessions` only; `touched` has
+        // room for a campaign per click. AVX-512 F and BMI2 are compiled in.
+        unsafe {
+            let mut before = _mm512_setzero_si512();
+            let one = _mm512_set1_epi32(1);
+            for at in 0..sessions {
+                _mm512_storeu_si512(prefix.add(at).cast(), before);
+                before = _mm512_mask_add_epi32(before, (1u32 << (days[at] as usize & (DAYS - 1))) as __mmask16, before, one);
+            }
+            _mm512_storeu_si512(prefix.add(sessions).cast(), before);
+
+            let all = _mm512_loadu_si512(st.cast());
+            let mut marked = 0usize;
+            for (k, click) in clicks.iter().enumerate() {
+                let ts = click.ts;
+                let end = ts.saturating_add(week).min(u32::MAX - 1);
+                let (lo, hi) = if wide {
+                    let mut lo = usize::from(*table.add(((ts >> STEP) as usize).min(cap)));
+                    lo += usize::from(*st.add(lo) < ts);
+                    while *st.add(lo) < ts {
+                        lo += 1;
+                    }
+                    let mut hi = usize::from(*table.add(((end >> STEP) as usize).min(cap)));
+                    hi += usize::from(*st.add(hi) <= end);
+                    while *st.add(hi) <= end {
+                        hi += 1;
+                    }
+                    (lo, hi)
+                } else {
+                    (
+                        _mm512_cmplt_epu32_mask(all, _mm512_set1_epi32(ts as i32)).count_ones() as usize,
+                        _mm512_cmple_epu32_mask(all, _mm512_set1_epi32(end as i32)).count_ones() as usize,
+                    )
+                };
+                // The latest click of this `lo`.
+                let (held_ts, held) = (*best_ts.add(lo), *best_at.add(lo));
+                let take = (held == NO_CLICK) | (ts > held_ts);
+                *best_ts.add(lo) = if take { ts } else { held_ts };
+                *best_at.add(lo) = if take { k as u32 } else { held };
+                if !take && ts == held_ts {
+                    let other = clicks.get_unchecked(held as usize);
+                    if crate::id_order(click, other) == std::cmp::Ordering::Less {
+                        *best_at.add(lo) = k as u32;
+                    }
+                }
+                // Its campaign's sessions.
+                let campaign = click.campaign as usize;
+                *touched.add(marked) = campaign as u32;
+                marked += usize::from(*seen.add(campaign) != stamp);
+                *seen.add(campaign) = stamp;
+                let row = cmask.add(campaign * stride);
+                if words == 1 {
+                    *row |= _bzhi_u64(!0, hi as u32) & !_bzhi_u64(!0, lo as u32);
+                } else {
+                    for word in lo >> 6..=(hi.max(1) - 1) >> 6 {
+                        let (from, to) = (lo.saturating_sub(64 * word).min(64), hi.saturating_sub(64 * word).min(64));
+                        *row.add(word) |= _bzhi_u64(!0, to as u32) & !_bzhi_u64(!0, from as u32);
+                    }
+                }
+            }
+
+            // The credit: the latest click so far, while it is within the week.
+            // Whether a session has a click of its own, and whether the latest is in its
+            // week, are as good as coin tosses: selects, not jumps. Click 0 stands in where
+            // there is none yet.
+            let (mut latest_ts, mut latest) = (0u32, NO_CLICK);
+            for at in 0..sessions {
+                let here = *best_at.add(at);
+                let own = here != NO_CLICK;
+                latest_ts = if own { *best_ts.add(at) } else { latest_ts };
+                latest = if own { here } else { latest };
+                let any = latest != NO_CLICK;
+                let campaign = clicks.get_unchecked(if any { latest as usize } else { 0 }).campaign;
+                let credit = credits.get_unchecked_mut(at);
+                *credit = if any & (starts.get_unchecked(at).wrapping_sub(latest_ts) <= week) { campaign } else { *credit };
+            }
+
+            // The assists: each campaign's runs of sessions, a day's count each.
+            for &campaign in std::slice::from_raw_parts(touched, marked) {
+                let row = std::slice::from_raw_parts_mut(cmask.add(campaign as usize * stride), words);
+                let cells = assisted.as_mut_ptr().add(campaign as usize * DAYS).cast::<__m512i>();
+                debug_assert!(campaign as usize * DAYS + DAYS <= assisted.len());
+                let mut sum = _mm512_loadu_si512(cells);
+                each_run(row, |from, to| {
+                    sum = _mm512_add_epi32(sum, _mm512_sub_epi32(_mm512_loadu_si512(prefix.add(to).cast()), _mm512_loadu_si512(prefix.add(from).cast())));
+                });
+                _mm512_storeu_si512(cells, sum);
+                row.fill(0);
+            }
+        }
     }
 
     /// `person` for at most `LIGHT` clicks.
@@ -95,14 +283,16 @@ impl Attr {
                 // In the session's week: `ts <= start` and `start - ts <= WEEK`, as one
                 // unsigned compare (a later click wraps to more than a week).
                 let window = _mm512_cmple_epu32_mask(_mm512_sub_epi32(_mm512_set1_epi32(start as i32), times), week) & live;
-                if window == 0 {
-                    continue;
-                }
                 // The credit: the latest of them, and among equals the smallest `click_id`.
+                // A session with no click in its week goes through the same steps and keeps
+                // the campaign it has (whether it has one is as good as a coin's toss, and
+                // a jump over the rest was mispredicted about that often): no lane is the
+                // latest, lane 0 stands in, and nothing is stored or counted.
                 let latest = _mm512_mask_reduce_max_epu32(window, times);
                 let top = _mm512_mask_cmpeq_epu32_mask(window, times, _mm512_set1_epi32(latest as i32));
-                let lane = if top & (top - 1) == 0 { top.trailing_zeros() as usize } else { smallest(clicks, top) };
-                *credits.get_unchecked_mut(at) = *campaign.get_unchecked(lane);
+                let lane = if top & top.wrapping_sub(1) == 0 { top.trailing_zeros() as usize & (LIGHT - 1) } else { smallest(clicks, top) };
+                let credit = credits.get_unchecked_mut(at);
+                *credit = if window != 0 { *campaign.get_unchecked(lane) } else { *credit };
                 // The assists: each campaign in the window once, at its first lane there.
                 let repeated = _mm512_mask_test_epi32_mask(window, earlier, _mm512_set1_epi32(i32::from(window)));
                 let first = window & !repeated;
@@ -192,6 +382,39 @@ impl Attr {
     }
 }
 
+/// Calls `f(from, to)` for every run of set bits `from..to` of `words` (bit `b` of word `w` is
+/// `64 * w + b`), ascending. A run may cross from a word into the next.
+#[inline(always)]
+fn each_run(words: &[u64], mut f: impl FnMut(usize, usize)) {
+    // Where a run that reached its word's last bit began.
+    let mut open = usize::MAX;
+    for (at, &word) in words.iter().enumerate() {
+        let (base, mut rest) = (64 * at, word);
+        if open != usize::MAX {
+            let more = (!rest).trailing_zeros() as usize;
+            if more == 64 {
+                continue;
+            }
+            f(open, base + more);
+            open = usize::MAX;
+            rest &= !0u64 << more;
+        }
+        while rest != 0 {
+            let from = rest.trailing_zeros() as usize;
+            let to = from + (!(rest >> from)).trailing_zeros() as usize;
+            if to == 64 {
+                open = base + from;
+                break;
+            }
+            f(base + from, base + to);
+            rest &= !0u64 << to;
+        }
+    }
+    if open != usize::MAX {
+        f(open, 64 * words.len());
+    }
+}
+
 /// Among the lanes `lanes` (several clicks of one `ts`), the one with the smallest `click_id`.
 #[cold]
 #[inline(never)]
@@ -260,7 +483,10 @@ mod tests {
             state ^= state << 17;
             state % below
         };
-        let mut wide = Attr::new(ctx.campaigns.len());
+        // Both ways of a long run of clicks: unsorted through the table, and sorted.
+        let (mut wide, mut by_sort) = (Attr::new(ctx.campaigns.len()), Attr::new(ctx.campaigns.len()));
+        (wide.sorted, by_sort.sorted) = (false, true);
+        let mut by_sorted = vec![0u32; ctx.campaigns.len() * DAYS];
         let mut interval = attr_interval::Attr::new(&ctx);
         let cells = ctx.campaigns.len() * ctx.n_days;
         let (mut by_wide, mut by_interval) = (vec![0u32; ctx.campaigns.len() * DAYS], vec![0u32; cells]);
@@ -300,6 +526,9 @@ mod tests {
                 .collect();
             let mut got = vec![organic; starts.len()];
             wide.person(&clicks, &starts, &days, &mut got, &mut by_wide);
+            let mut got_sorted = vec![organic; starts.len()];
+            by_sort.person(&clicks, &starts, &days, &mut got_sorted, &mut by_sorted);
+            assert_eq!(got, got_sorted, "person {person}: {clicks_n} clicks, {} sessions, table against sort", starts.len());
             let sorted = sort_clicks_for_test(&mut clicks);
             let want: Vec<u32> = starts.iter().zip(&days).map(|(&start, &day)| interval.session(&sorted, start, day as usize, organic, &mut by_interval)).collect();
             interval.end_person(&mut by_interval);
@@ -308,6 +537,7 @@ mod tests {
         for campaign in 0..ctx.campaigns.len() {
             for day in 0..ctx.n_days {
                 assert_eq!(by_wide[campaign * DAYS + day], by_interval[day * ctx.campaigns.len() + campaign], "campaign {campaign}, day {day}");
+                assert_eq!(by_sorted[campaign * DAYS + day], by_interval[day * ctx.campaigns.len() + campaign], "sorted: campaign {campaign}, day {day}");
             }
             assert!(by_wide[campaign * DAYS + ctx.n_days..(campaign + 1) * DAYS].iter().all(|&count| count == 0));
         }

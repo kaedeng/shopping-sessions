@@ -17,6 +17,8 @@ mod attr_interval;
 mod attr_wide;
 #[cfg(feature = "attr-sweep")]
 mod attr_sweep;
+#[cfg(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl", target_feature = "avx512cd", target_feature = "bmi2"))]
+mod dense_walk;
 #[cfg(feature = "sess-partitioned")]
 mod partitioned;
 #[cfg(feature = "pipe-positional")]
@@ -29,6 +31,8 @@ mod sort_grouped;
 mod sort_radix;
 #[cfg(feature = "sort-std")]
 mod sort_std;
+#[cfg(feature = "sess-partitioned")]
+mod sort_times;
 #[cfg(test)]
 mod tests;
 

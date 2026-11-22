@@ -303,6 +303,11 @@ pub struct Dense {
     clicks: Vec<Click>,
     /// The purchases as `(key - base << 32, pay)`, ascending, then a sentinel.
     side: Vec<(u64, u32)>,
+    /// The sort of a person's times.
+    sorter: crate::sort_times::Scratch,
+    /// The walk a bucket at a time.
+    #[cfg(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl", target_feature = "avx512cd", target_feature = "bmi2"))]
+    walk: crate::dense_walk::Walk,
 }
 
 /// `crate::bucket_dense`: the bucket's persons are the numbers `base..base + span`.
@@ -322,11 +327,34 @@ pub fn bucket_dense(
     clicks: &dyn Fn(&mut dyn FnMut(&[ClickRec])),
     agg: &mut Agg,
 ) {
+    // `SS_TIME_SORT=net|std`: a person's times by `sort_times`, or by `sort_unstable`.
+    // `SS_DENSE_WALK=wide|person`: the sessions, rows and counters a bucket at a time
+    // (`dense_walk`), or person by person.
+    static PICKS: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    let (net, wide_walk) = *PICKS.get_or_init(|| (types::env::pick("SS_TIME_SORT", &["net", "std"]) == 0, types::env::pick("SS_DENSE_WALK", &["wide", "person"]) == 0));
+    bucket_dense_as(ctx, base, span, events, pays, clicks, agg, net, wide_walk)
+}
+
+/// `bucket_dense` with its two choices given: `net` sorts a person's times by `sort_times`,
+/// `wide_walk` takes the bucket through `dense_walk` where it can run.
+#[cfg(feature = "pipe-positional")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn bucket_dense_as(
+    ctx: &Ctx,
+    base: u32,
+    span: usize,
+    events: &dyn Fn(&mut dyn FnMut(&[u64])),
+    pays: &dyn Fn(&mut dyn FnMut(&[crate::DensePay])),
+    clicks: &dyn Fn(&mut dyn FnMut(&[ClickRec])),
+    agg: &mut Agg,
+    net: bool,
+    wide_walk: bool,
+) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
     let Agg { user_daily, bucket: scratch, attr, wide, day, counters, dense, .. } = agg;
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd")))]
     let Agg { user_daily, bucket: scratch, attr, day, counters, dense, .. } = agg;
-    let Dense { ends, click_ends, ts, clicks: grouped, side } = dense;
+    let Dense { ends, click_ends, ts, clicks: grouped, side, sorter, .. } = dense;
     let offset = u64::from(base) << 32;
     // A key's person as its place among the bucket's; checked where it is first met, in the
     // counting passes, so that the scatters may trust it.
@@ -425,6 +453,21 @@ pub fn bucket_dense(
         unsafe { grouped.set_len(kept as usize) };
     }
 
+    // The sessions, rows and counters a bucket at a time, where the build, the window and
+    // the attribution allow it; person by person below otherwise.
+    let _ = wide_walk;
+    #[cfg(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl", target_feature = "avx512cd", target_feature = "bmi2"))]
+    {
+        if wide_walk
+            && crate::dense_walk::fits(ctx)
+            && !counters.counted().is_empty()
+            && let Some(wide) = wide.as_mut()
+        {
+            // SAFETY: the scatters above left `ends` and `click_ends` as each person's end.
+            unsafe { crate::dense_walk::walk(ctx, base, span, ends, click_ends, &mut ts[..], &mut grouped[..], &side[..], &mut dense.walk, sorter, wide, counters, user_daily) };
+            return;
+        }
+    }
     let Scratch { starts, days, revenue, credits, order, sorted, .. } = scratch;
     let organic = ctx.organic();
     let gap = GAP as u32;
@@ -440,7 +483,11 @@ pub fn bucket_dense(
         }
         let person = Id::from(base) + at as Id;
         let times = &mut ts[from..end];
-        times.sort_unstable();
+        if net {
+            crate::sort_times::sort(times, sorter);
+        } else {
+            times.sort_unstable();
+        }
         let high = (at as u64) << 32;
         starts.clear();
         days.clear();
