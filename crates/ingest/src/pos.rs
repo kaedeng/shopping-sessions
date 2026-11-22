@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 
+use types::chunks::Chunks;
 use types::id::pack_at;
 use types::parts::{Combine, Mode, Parts, Plain};
 use types::pos::{POS_ODD_USER, POS_VALID, PosClick, PosEvent, PosPay};
@@ -88,11 +89,15 @@ impl PosShape {
 
 /// A worker's lists for the event lines of the positional parse (`PosOut::events`,
 /// `PosOut::pays`), for `workers` workers; `scatter` as `types::parts::mode_from_env`.
-pub(crate) fn event_lists(workers: usize, shape: &PosShape, scatter: Option<usize>) -> (Parts<PosEvent>, Parts<PosPay>) {
+pub(crate) fn event_lists(workers: usize, shape: &PosShape, scatter: Option<usize>) -> (Chunks<PosEvent>, Parts<PosPay>) {
     // A partition holds `1 << shift` event numbers and a few percent more lines; a quarter
     // to spare, as workers pull chunks unevenly.
     let room = (1usize << shape.shift) * 9 / 8 / workers * 5 / 4 + 64;
-    (Parts::new(shape.parts, room, scatter), Parts::new(shape.parts, room / 16 + 32, scatter))
+    // The events' chunks: the numbers the arrays hold are an eighth more than the lines
+    // expected, and a worker's block has room for four times its share of them (it is
+    // address space until written), a chunk a list and a huge page more.
+    let bytes = (shape.parts << shape.shift) * size_of::<PosEvent>() * 4 / workers.max(4) + shape.parts * 4096 + (2 << 20);
+    (Chunks::new(shape.parts, bytes), Parts::new(shape.parts, room / 16 + 32, scatter))
 }
 
 /// A worker's lists for the click lines (`PosOut::clicks`), for about `event_rows` event
@@ -111,7 +116,7 @@ pub(crate) fn lists_in_use(shape: &PosShape, event_rows: usize) -> usize {
 impl PosOut {
     /// A worker's buffers for the positional parse: its lists, and room to read a chunk of
     /// `chunk` bytes into.
-    pub(crate) fn new(events: Parts<PosEvent>, pays: Parts<PosPay>, clicks: Parts<PosClick>, chunk: usize) -> PosOut {
+    pub(crate) fn new(events: Chunks<PosEvent>, pays: Parts<PosPay>, clicks: Parts<PosClick>, chunk: usize) -> PosOut {
         PosOut {
             events,
             pays,
@@ -137,7 +142,8 @@ impl PosOut {
             }
             page[0] = 0;
         }
-        self.events.touch(usize::MAX, stop);
+        // A fair share of the rows: a quarter of the block (`event_lists`).
+        self.events.touch(self.events.capacity() / 4, stop);
         self.clicks.touch(click_lists, stop);
         self.pays.touch(usize::MAX, stop);
     }
@@ -207,7 +213,7 @@ impl PosPlan {
 pub struct PosOut {
     /// List `number >> shift`: every well-formed line whose `event_id` is a number below
     /// `PosPlan::events`, valid or not.
-    pub events: Parts<PosEvent>,
+    pub events: Chunks<PosEvent>,
     /// The same lists: the `pay` of each valid purchase among them.
     pub pays: Parts<PosPay>,
     /// List `person >> click_shift`: valid clicks whose `user_id` is a number.
@@ -366,16 +372,37 @@ struct Pending<T> {
     len: usize,
 }
 
+/// Lists a parse appends to: `Parts`, or `Chunks` (which write one way only).
+trait Lists<T> {
+    /// # Safety
+    /// `list` is one of the lists, and `M` the mode they were built for.
+    unsafe fn append<M: Mode>(&mut self, list: usize, rec: T);
+}
+
+impl<T: Copy> Lists<T> for Parts<T> {
+    #[inline(always)]
+    unsafe fn append<M: Mode>(&mut self, list: usize, rec: T) {
+        unsafe { self.push_as::<M>(list, rec) }
+    }
+}
+
+impl<T: Copy> Lists<T> for Chunks<T> {
+    #[inline(always)]
+    unsafe fn append<M: Mode>(&mut self, list: usize, rec: T) {
+        unsafe { self.push_at(list, rec) }
+    }
+}
+
 /// Where `event_row` leaves a record: the row path's `Pending`, or the wide path's batch.
 trait Sink {
     /// # Safety
     /// `list < events.lists()`.
-    unsafe fn put<M: Mode>(&mut self, list: usize, rec: PosEvent, events: &mut Parts<PosEvent>);
+    unsafe fn put<M: Mode>(&mut self, list: usize, rec: PosEvent, events: &mut Chunks<PosEvent>);
 }
 
 impl Sink for Pending<PosEvent> {
     #[inline(always)]
-    unsafe fn put<M: Mode>(&mut self, list: usize, rec: PosEvent, events: &mut Parts<PosEvent>) {
+    unsafe fn put<M: Mode>(&mut self, list: usize, rec: PosEvent, events: &mut Chunks<PosEvent>) {
         unsafe { self.push::<M>(list, rec, events) }
     }
 }
@@ -388,7 +415,7 @@ impl<T: Copy + Default> Pending<T> {
     /// # Safety
     /// `list < out.lists()`.
     #[inline(always)]
-    unsafe fn push<M: Mode>(&mut self, list: usize, rec: T, out: &mut Parts<T>) {
+    unsafe fn push<M: Mode>(&mut self, list: usize, rec: T, out: &mut impl Lists<T>) {
         // SAFETY: `len < PENDING` between calls.
         unsafe {
             *self.lists.get_unchecked_mut(self.len) = list as u32;
@@ -401,10 +428,10 @@ impl<T: Copy + Default> Pending<T> {
     }
 
     #[inline(always)]
-    fn flush<M: Mode>(&mut self, out: &mut Parts<T>) {
+    fn flush<M: Mode>(&mut self, out: &mut impl Lists<T>) {
         for at in 0..self.len {
             // SAFETY: every list here was in range when pushed.
-            unsafe { out.push_as::<M>(self.lists[at] as usize, self.recs[at]) };
+            unsafe { out.append::<M>(self.lists[at] as usize, self.recs[at]) };
         }
         self.len = 0;
     }
@@ -520,7 +547,7 @@ pub(crate) fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, plan: &PosPlan, tas
             } else {
                 clicks::<T, Plain>(p, len, ctx, dates, &ingest.campaigns, plan, out);
             }
-        } else if out.events.combining() {
+        } else if out.pays.combining() {
             events::<T, Combine>(p, len, ctx, dates, plan, out);
         } else {
             events::<T, Plain>(p, len, ctx, dates, plan, out);
@@ -616,7 +643,7 @@ unsafe fn event_row<M: Mode, S: Sink>(
     limit: u64,
     fields: &[Field; 7],
     pending: &mut S,
-    events: &mut Parts<PosEvent>,
+    events: &mut Chunks<PosEvent>,
     pays: &mut Parts<PosPay>,
     odd_events: &mut Vec<EventRec>,
     odd_users: &mut Vec<Id>,
@@ -777,7 +804,7 @@ pub(crate) mod wide {
 
     impl Sink for Held {
         #[inline(always)]
-        unsafe fn put<M: Mode>(&mut self, list: usize, rec: PosEvent, _: &mut Parts<PosEvent>) {
+        unsafe fn put<M: Mode>(&mut self, list: usize, rec: PosEvent, _: &mut Chunks<PosEvent>) {
             debug_assert!(self.len < HELD);
             let (low, high) = rec.words();
             (self.lists[self.len], self.low[self.len], self.high[self.len]) = (list as u64, low, high);
@@ -793,11 +820,11 @@ pub(crate) mod wide {
         /// A function of its own: inside the decode its loop had no registers left, and
         /// reloaded the lists' base, room and staging from the stack for every record.
         #[inline(never)]
-        fn flush<M: Mode>(&mut self, events: &mut Parts<PosEvent>) {
+        fn flush<M: Mode>(&mut self, events: &mut Chunks<PosEvent>) {
             let (lists, low, high) = (&self.lists, &self.low, &self.high);
             // SAFETY: `len <= HELD`, and every list here was in range when put.
             unsafe {
-                events.extend_as::<M>(self.len, |at| (*lists.get_unchecked(at) as usize, PosEvent::from_words(*low.get_unchecked(at), *high.get_unchecked(at))))
+                events.extend(self.len, |at| (*lists.get_unchecked(at) as usize, PosEvent::from_words(*low.get_unchecked(at), *high.get_unchecked(at))))
             };
             self.len = 0;
         }
@@ -1085,7 +1112,7 @@ pub(crate) mod wide {
         dates: &Dates,
         plan: &PosPlan,
         limit: u64,
-        events: &mut Parts<PosEvent>,
+        events: &mut Chunks<PosEvent>,
         pays: &mut Parts<PosPay>,
         odd_events: &mut Vec<EventRec>,
         odd_users: &mut Vec<Id>,
@@ -1550,7 +1577,7 @@ pub(crate) mod wide {
             dates: &Dates,
             plan: &PosPlan,
             limit: u64,
-            events: &mut Parts<PosEvent>,
+            events: &mut Chunks<PosEvent>,
             pays: &mut Parts<PosPay>,
             odd_events: &mut Vec<EventRec>,
             odd_users: &mut Vec<Id>,
@@ -1661,7 +1688,7 @@ pub(crate) mod wide {
             dates: &Dates,
             plan: &PosPlan,
             limit: u64,
-            events: &mut Parts<PosEvent>,
+            events: &mut Chunks<PosEvent>,
             pays: &mut Parts<PosPay>,
             odd_events: &mut Vec<EventRec>,
             odd_users: &mut Vec<Id>,

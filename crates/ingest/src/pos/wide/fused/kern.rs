@@ -755,7 +755,7 @@ unsafe fn finish<M: Mode>(
     dates: &Dates,
     plan: &PosPlan,
     limit: u64,
-    events: &mut Parts<PosEvent>,
+    events: &mut Chunks<PosEvent>,
     pays: &mut Parts<PosPay>,
     odd_events: &mut Vec<EventRec>,
     odd_users: &mut Vec<Id>,
@@ -847,7 +847,7 @@ unsafe fn others<M: Mode>(
     dates: &Dates,
     plan: &PosPlan,
     limit: u64,
-    events: &mut Parts<PosEvent>,
+    events: &mut Chunks<PosEvent>,
     pays: &mut Parts<PosPay>,
     odd_events: &mut Vec<EventRec>,
     odd_users: &mut Vec<Id>,
@@ -1030,12 +1030,14 @@ mod tests {
         let mut events = Vec::new();
         let mut pays = Vec::new();
         for list in 0..out.events.lists() {
-            for rec in out.events.pieces(list).into_iter().flatten() {
-                let (low, high) = rec.words();
-                // An odd user's index depends on the order of the rows: its ID instead.
-                let odd = rec.flags() & POS_ODD_USER != 0;
-                events.push((list, if odd { low >> 32 } else { low }, high, if odd { out.odd_users[rec.u() as usize] } else { 0 }));
-            }
+            out.events.for_each(list, |piece| {
+                for rec in piece {
+                    let (low, high) = rec.words();
+                    // An odd user's index depends on the order of the rows: its ID instead.
+                    let odd = rec.flags() & POS_ODD_USER != 0;
+                    events.push((list, if odd { low >> 32 } else { low }, high, if odd { out.odd_users[rec.u() as usize] } else { 0 }));
+                }
+            });
             for pay in out.pays.pieces(list).into_iter().flatten() {
                 pays.push((list, pay.slot, pay.ingest, pay.pay));
             }

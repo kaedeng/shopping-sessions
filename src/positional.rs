@@ -1411,7 +1411,7 @@ fn place_rows(part: usize, plan: &PosPlan, parsed: &[PosOut], links: &Links, wor
     kept.resize(slots, PosEvent::EMPTY);
     odd.clear();
     for (worker, out) in parsed.iter().enumerate() {
-        for piece in out.events.pieces(part) {
+        out.events.for_each(part, |piece| {
             for row in piece {
                 // SAFETY: the mask keeps the slot below `slots`, the table's length.
                 let slot = unsafe { kept.get_unchecked_mut(row.slot() as usize & (slots - 1)) };
@@ -1422,7 +1422,7 @@ fn place_rows(part: usize, plan: &PosPlan, parsed: &[PosOut], links: &Links, wor
                     }
                 }
             }
-        }
+        });
     }
     let valid = |row: &PosEvent| row.flags() & POS_VALID != 0;
     // The purchases come in any order and leave in slot order: a bit per slot that has one

@@ -3,6 +3,8 @@
 //! A feature here marks a swap point: an alternative layout becomes a sibling module behind
 //! its own feature, and the `pub mod` line below is where it is switched.
 
+#[cfg(feature = "pipe-positional")]
+pub mod chunks;
 pub mod ctx;
 pub mod env;
 #[cfg(feature = "hash-mul")]
