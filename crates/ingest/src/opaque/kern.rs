@@ -826,35 +826,42 @@ impl Kern for Narrow {
     }
 }
 
-/// One 128-bit multiply of `a` by the 16 bytes at `p`, written as the instruction it is: of
-/// two on a register's halves the compiler makes one 256-bit multiply, a licence-1
-/// instruction (`types::width`).
-macro_rules! narrow_mul {
-    ($name:ident, $op:literal) => {
-        /// # Safety
-        /// 16 bytes readable at `p`.
-        #[inline(always)]
-        unsafe fn $name(a: __m128i, p: *const u8) -> __m128i {
-            let out: __m128i;
-            // SAFETY: the caller's contract; one AVX instruction.
-            unsafe {
-                core::arch::asm!(
-                    concat!($op, " {out:x}, {a:x}, xmmword ptr [{p}]"),
-                    a = in(zmm_reg) a,
-                    p = in(reg) p,
-                    out = lateout(zmm_reg) out,
-                    options(pure, readonly, nostack, preserves_flags),
-                )
-            };
-            out
-        }
+/// One 128-bit multiply `op` of `a` by the 16 bytes of a `TsRow`'s field `field`, written as
+/// the instruction it is: of two on a register's halves the compiler makes one 256-bit
+/// multiply, a licence-1 instruction (`types::width`). The field is read at its offset from
+/// the row, not through a pointer of its own (one instruction a multiply less).
+macro_rules! row_mul {
+    ($op:literal, $a:expr, $row:expr, $field:ident) => {
+        row_mul!($op, $a, $row, $field, 0)
     };
+    ($op:literal, $a:expr, $row:expr, $field:ident, $more:expr) => {{
+        let out: __m128i;
+        // SAFETY: the row's field has 16 bytes at that offset; one AVX instruction.
+        #[allow(unused_unsafe)]
+        unsafe {
+            core::arch::asm!(
+                concat!($op, " {out:x}, {a:x}, xmmword ptr [{row} + {at}]"),
+                a = in(zmm_reg) $a,
+                row = in(reg) core::ptr::from_ref::<TsRow>($row),
+                at = const std::mem::offset_of!(TsRow, $field) + $more,
+                out = lateout(zmm_reg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            )
+        };
+        out
+    }};
 }
 
-narrow_mul!(maddubs_x, "vpmaddubsw");
-narrow_mul!(madd_x, "vpmaddwd");
-narrow_mul!(mul_epu32_x, "vpmuludq");
-narrow_mul!(mul_epi32_x, "vpmuldq");
+/// `_mm_packus_epi16(a, b)` for words that are bytes already, as the one instruction it is:
+/// the intrinsic comes out with a clamp of each operand before it, four more instructions
+/// a line (as `pack_words` says of its own).
+#[inline(always)]
+fn pack_bytes(a: __m128i, b: __m128i) -> __m128i {
+    let packed: __m128i;
+    // SAFETY: one AVX instruction on registers.
+    unsafe { core::arch::asm!("vpackuswb {o:x}, {a:x}, {b:x}", o = lateout(zmm_reg) packed, a = in(zmm_reg) a, b = in(zmm_reg) b, options(pure, nomem, nostack, preserves_flags)) };
+    packed
+}
 
 /// `_mm256_mul_epu32(x, _mm256_broadcastsi128_si256(by))` as two 128-bit multiplies, as
 /// `mul_halves` is two 256-bit ones.
@@ -1113,13 +1120,15 @@ unsafe fn tail_narrow(t: *const u8, gap: usize, end: *const u8, days: *const u8,
         let bytes = _mm256_sub_epi8(_mm256_shuffle_epi8(raw, _mm256_load_si256(row.ctrl.as_ptr().cast())), _mm256_load_si256(row.base.as_ptr().cast()));
         let bytes_bad = _mm256_subs_epu8(bytes, _mm256_load_si256(row.lim.as_ptr().cast()));
         let (ts_half, ingest_half) = (_mm256_castsi256_si128(bytes), _mm256_extracti128_si256::<1>(bytes));
-        let words = _mm_packus_epi16(maddubs_x(ts_half, row.w1.as_ptr().cast()), maddubs_x(ingest_half, row.w1.as_ptr().add(16).cast()));
-        let parts = maddubs_x(words, row.nw2.as_ptr().cast());
+        // Words of digits and of literals' residues (none over 99 in a line `bytes_bad`
+        // passes), both halves' as bytes.
+        let words = pack_bytes(row_mul!("vpmaddubsw", ts_half, row, w1), row_mul!("vpmaddubsw", ingest_half, row, w1, 16));
+        let parts = row_mul!("vpmaddubsw", words, row, nw2);
         let parts_bad = _mm_cmpgt_epi16(parts, _mm_load_si128(row.nlim.as_ptr().cast()));
-        let both = madd_x(parts, row.nw3.as_ptr().cast());
-        let major = mul_epu32_x(both, row.nkme.as_ptr().cast());
+        let both = row_mul!("vpmaddwd", parts, row, nw3);
+        let major = row_mul!("vpmuludq", both, row, nkme);
         // Each half's sign in its first four bytes, as `tail` reads it.
-        let minor = mul_epi32_x(_mm_sign_epi32(_mm_srli_epi64::<32>(both), _mm_unpacklo_epi64(ts_half, ingest_half)), row.nkmf.as_ptr().cast());
+        let minor = row_mul!("vpmuldq", _mm_sign_epi32(_mm_srli_epi64::<32>(both), _mm_unpacklo_epi64(ts_half, ingest_half)), row, nkmf);
 
         // Their dates.
         let ts_date = t.add(row.tq as usize);
@@ -1377,8 +1386,8 @@ unsafe fn finish(
     }
 }
 
-/// `finish` in 256-bit registers, four rows a step (`types::width::Narrow`): the same
-/// records, a group's in the order `finish` makes them.
+/// `finish` in 256-bit registers (`types::width::Narrow`): eight rows a step, as two groups
+/// of four. The same records as `finish`'s.
 ///
 /// # Safety
 /// As `finish`.
@@ -1397,7 +1406,7 @@ unsafe fn finish_narrow(
     long_events: &mut Chunks<EvL>,
     slow: &mut usize,
 ) {
-    // SAFETY: as `finish`, with `first + 4 <= BATCH`.
+    // SAFETY: as `finish`.
     unsafe {
         let batch = &mut *batch;
         let rows = std::mem::take(&mut batch.count);
@@ -1405,42 +1414,80 @@ unsafe fn finish_narrow(
         let all = |value: i64| _mm256_set1_epi64x(value);
         let mut first = 0;
         while first < rows {
-            if held.len + 4 > HELD {
+            if held.len + 8 > HELD {
                 held.flush(events);
             }
-            let live: __mmask8 = if rows - first >= 4 { 0xF } else { (1u8 << (rows - first)) - 1 };
-            // A row a register: event, ts, user, ingest. Two rows' pairs of words, then
-            // their halves: the four events, the four `ts`, the four `ingest_ts`.
-            let at = batch.rows.as_ptr().add(first).cast::<__m256i>();
-            let (r0, r1, r2, r3) = (_mm256_load_si256(at), _mm256_load_si256(at.add(1)), _mm256_load_si256(at.add(2)), _mm256_load_si256(at.add(3)));
-            let (low_a, low_b) = (_mm256_unpacklo_epi64(r0, r1), _mm256_unpacklo_epi64(r2, r3));
-            let (high_a, high_b) = (_mm256_unpackhi_epi64(r0, r1), _mm256_unpackhi_epi64(r2, r3));
-            let event = _mm256_permute2x128_si256::<0x20>(low_a, low_b);
-            let ts = _mm256_permute2x128_si256::<0x20>(high_a, high_b);
-            let ingest = _mm256_permute2x128_si256::<0x31>(high_a, high_b);
-
-            // As `finish`.
-            let valid = _mm256_cmpge_epi64_mask(ts, consts.event_lo) & _mm256_cmplt_epi64_mask(ts, consts.ts_end) & _mm256_cmple_epi64_mask(_mm256_sub_epi64(ingest, ts), all(DAY));
-            let seconds = _mm256_srli_epi64::<38>(mul_quarters(_mm256_sub_epi64(ingest, consts.first_ms), _mm_set1_epi64x(274_877_907)));
-            let ingest_rel = _mm256_add_epi64(seconds, consts.ingest_add);
-            let place = _mm256_cvtepu32_epi64(_mm_loadu_si128(batch.users.as_ptr().add(first).cast()));
-            let user_ts = _mm256_or_si256(place, _mm256_slli_epi64::<32>(_mm256_maskz_mov_epi64(valid, ts)));
-            let key = _mm256_add_epi64(event, all(1));
-
-            let class = _mm256_loadu_si256(batch.class.as_ptr().add(first).cast());
-            let fast = live & _mm256_testn_epi64_mask(class, all(!(LONG_USER as i64)));
+            let live = _bzhi_u32(0xFF, (rows - first) as u32) as __mmask8;
+            // Nothing set but, perhaps, a long user: a record as it stands.
+            let fast = live & clean_rows(batch.class.as_ptr().add(first));
+            // A row a register: event, ts, user, ingest. Two rows' pairs of words, then their
+            // halves: four events, four `ts`, four `ingest_ts`.
+            let group = |at: usize| {
+                let rows = batch.rows.as_ptr().add(at).cast::<__m256i>();
+                let (r0, r1, r2, r3) = (_mm256_load_si256(rows), _mm256_load_si256(rows.add(1)), _mm256_load_si256(rows.add(2)), _mm256_load_si256(rows.add(3)));
+                let (low_a, low_b) = (_mm256_unpacklo_epi64(r0, r1), _mm256_unpacklo_epi64(r2, r3));
+                let (high_a, high_b) = (_mm256_unpackhi_epi64(r0, r1), _mm256_unpackhi_epi64(r2, r3));
+                let event = _mm256_permute2x128_si256::<0x20>(low_a, low_b);
+                let ts = _mm256_permute2x128_si256::<0x20>(high_a, high_b);
+                let ingest = _mm256_permute2x128_si256::<0x31>(high_a, high_b);
+                // As `finish`.
+                let valid = _mm256_cmpge_epi64_mask(ts, consts.event_lo) & _mm256_cmplt_epi64_mask(ts, consts.ts_end) & _mm256_cmple_epi64_mask(_mm256_sub_epi64(ingest, ts), all(DAY));
+                let seconds = _mm256_srli_epi64::<38>(mul_quarters(_mm256_sub_epi64(ingest, consts.first_ms), _mm_set1_epi64x(274_877_907)));
+                let ingest_rel = _mm256_add_epi64(seconds, consts.ingest_add);
+                let place = _mm256_cvtepu32_epi64(_mm_loadu_si128(batch.users.as_ptr().add(at).cast()));
+                let user_ts = _mm256_or_si256(place, _mm256_slli_epi64::<32>(_mm256_maskz_mov_epi64(valid, ts)));
+                (_mm256_add_epi64(event, all(1)), user_ts, ingest_rel)
+            };
+            let (key_a, user_ts_a, ingest_a) = group(first);
+            let (key_b, user_ts_b, ingest_b) = group(first + 4);
+            // Compressed in a register and stored whole, as in `finish`.
+            let (fast_a, fast_b) = (fast & 0xF, fast >> 4);
             let to = held.len;
-            _mm256_storeu_si256(held.key.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast, key));
-            _mm256_storeu_si256(held.user_ts.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast, user_ts));
-            _mm256_storeu_si256(held.ingest_pay.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast, ingest_rel));
-            held.len = to + fast.count_ones() as usize;
+            _mm256_storeu_si256(held.key.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_a, key_a));
+            _mm256_storeu_si256(held.user_ts.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_a, user_ts_a));
+            _mm256_storeu_si256(held.ingest_pay.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_a, ingest_a));
+            let to = to + fast_a.count_ones() as usize;
+            _mm256_storeu_si256(held.key.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_b, key_b));
+            _mm256_storeu_si256(held.user_ts.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_b, user_ts_b));
+            _mm256_storeu_si256(held.ingest_pay.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_b, ingest_b));
+            held.len = to + fast_b.count_ones() as usize;
 
             if fast != live {
-                others_narrow(batch, first, live & !fast, user_ts, ingest_rel, base, bytes, ctx, dates, plan, events, long_events, slow);
+                let (mut user_ts_of, mut ingest_of) = ([0u64; 8], [0u64; 8]);
+                _mm256_storeu_si256(user_ts_of.as_mut_ptr().cast(), user_ts_a);
+                _mm256_storeu_si256(user_ts_of.as_mut_ptr().add(4).cast(), user_ts_b);
+                _mm256_storeu_si256(ingest_of.as_mut_ptr().cast(), ingest_a);
+                _mm256_storeu_si256(ingest_of.as_mut_ptr().add(4).cast(), ingest_b);
+                others_narrow(batch, first, live & !fast, &user_ts_of, &ingest_of, base, bytes, ctx, dates, plan, events, long_events, slow);
             }
-            first += 4;
+            first += 8;
         }
     }
+}
+
+/// Of the eight classes at `class`, those with nothing set but perhaps a long user: two
+/// 256-bit tests written as the instructions they are (`types::width`).
+///
+/// # Safety
+/// 64 bytes readable at `class`.
+#[inline(always)]
+unsafe fn clean_rows(class: *const u64) -> __mmask8 {
+    let clean: __mmask8;
+    // SAFETY: the caller's contract; AVX-512F, VL and DQ are compiled in.
+    unsafe {
+        core::arch::asm!(
+            "vptestnmq {c}, {mask:y}, ymmword ptr [{p}]",
+            "vptestnmq {c2}, {mask:y}, ymmword ptr [{p} + 32]",
+            "kshiftlb {c2}, {c2}, 4",
+            "korb {c}, {c}, {c2}",
+            p = in(reg) class,
+            mask = in(zmm_reg) _mm256_set1_epi64x(!(LONG_USER as i64)),
+            c = out(kreg) clean,
+            c2 = out(kreg) _,
+            options(pure, readonly, nostack, preserves_flags),
+        )
+    };
+    clean
 }
 
 /// Asks for the directory's lines of the users of a batch's rows `from..to`.
@@ -1502,33 +1549,85 @@ unsafe fn split(batch: &Batch, rows: usize, short: *mut u64, long: *mut u64) -> 
     }
 }
 
-/// `split` four rows a step, in 256-bit registers (`types::width::Narrow`).
+/// `split` in 256-bit registers (`types::width::Narrow`), the rows' numbers as `u32`s: eight
+/// classes tested as two halves, and eight numbers compressed in one register.
 ///
 /// # Safety
 /// As `split`.
 #[inline(always)]
-unsafe fn split_narrow(batch: &Batch, rows: usize, short: *mut u64, long: *mut u64) -> (usize, usize) {
+unsafe fn split_narrow(batch: &Batch, rows: usize, short: *mut u32, long: *mut u32) -> (usize, usize) {
     let rows = rows.min(BATCH);
-    // SAFETY: as `split`, four classes and four numbers at a time.
+    // SAFETY: as `split`.
     unsafe {
-        let all = |value: i64| _mm256_set1_epi64x(value);
         let (mut shorts, mut longs) = (0usize, 0usize);
-        let mut number = _mm256_setr_epi64x(0, 1, 2, 3);
+        let mut number = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
         let mut first = 0;
         while first < rows {
-            let live: __mmask8 = if rows - first >= 4 { 0xF } else { (1u8 << (rows - first)) - 1 };
-            let class = _mm256_loadu_si256(batch.class.as_ptr().add(first).cast());
-            let taken = live & _mm256_testn_epi64_mask(class, all(0xFFFF_FFFF));
-            let wide = _mm256_test_epi64_mask(class, all(LONG_USER as i64));
-            _mm256_storeu_si256(short.add(shorts).cast(), _mm256_maskz_compress_epi64(taken & !wide, number));
-            _mm256_storeu_si256(long.add(longs).cast(), _mm256_maskz_compress_epi64(taken & wide, number));
+            let (taken, wide) = classes(batch.class.as_ptr().add(first), _bzhi_u32(0xFF, (rows - first) as u32) as u8);
+            _mm256_storeu_si256(short.add(shorts).cast(), _mm256_maskz_compress_epi32(taken & !wide, number));
+            _mm256_storeu_si256(long.add(longs).cast(), _mm256_maskz_compress_epi32(taken & wide, number));
             shorts += (taken & !wide).count_ones() as usize;
             longs += (taken & wide).count_ones() as usize;
-            number = _mm256_add_epi64(number, all(4));
-            first += 4;
+            number = _mm256_add_epi32(number, _mm256_set1_epi32(8));
+            first += 8;
         }
         (shorts, longs)
     }
+}
+
+/// Of the eight classes at `class`, those of `live`'s rows that are records with nothing
+/// set but perhaps a long user (`split`'s `taken`), and those with a long user: two
+/// compares of each half, written as the instructions they are (`types::width`).
+///
+/// # Safety
+/// 64 bytes readable at `class`.
+#[inline(always)]
+unsafe fn classes(class: *const u64, live: __mmask8) -> (__mmask8, __mmask8) {
+    let (taken, wide): (__mmask8, __mmask8);
+    // SAFETY: the caller's contract; AVX-512F, VL and DQ are compiled in.
+    unsafe {
+        core::arch::asm!(
+            "vptestnmq {t}, {low:y}, ymmword ptr [{p}]",
+            "vptestnmq {t2}, {low:y}, ymmword ptr [{p} + 32]",
+            "vptestmq {w}, {long:y}, ymmword ptr [{p}]",
+            "vptestmq {w2}, {long:y}, ymmword ptr [{p} + 32]",
+            "kshiftlb {t2}, {t2}, 4",
+            "kshiftlb {w2}, {w2}, 4",
+            "korb {t2}, {t2}, {t}",
+            "korb {w}, {w}, {w2}",
+            "kandb {t}, {t2}, {live}",
+            p = in(reg) class,
+            low = in(zmm_reg) _mm256_set1_epi64x(0xFFFF_FFFF),
+            long = in(zmm_reg) _mm256_set1_epi64x(LONG_USER as i64),
+            live = in(kreg) live,
+            t = out(kreg) taken,
+            t2 = out(kreg) _,
+            w = out(kreg) wide,
+            w2 = out(kreg) _,
+            options(pure, readonly, nostack, preserves_flags),
+        )
+    };
+    (taken, wide)
+}
+
+/// `split` or `split_narrow`, into lists of room for `BATCH + 8` words each.
+///
+/// # Safety
+/// As `split`.
+#[inline(always)]
+unsafe fn split_rows<W: Width>(batch: &Batch, rows: usize, short: *mut u64, long: *mut u64) -> (usize, usize) {
+    // SAFETY: the caller's contract; a list of `u32`s fits in the room for words.
+    unsafe { if W::NARROW { split_narrow(batch, rows, short.cast(), long.cast()) } else { split(batch, rows, short, long) } }
+}
+
+/// Number `at` of a list `split_rows` made.
+///
+/// # Safety
+/// `at` is below the list's length.
+#[inline(always)]
+unsafe fn row_of<W: Width>(list: *const u64, at: usize) -> usize {
+    // SAFETY: the caller's contract.
+    unsafe { if W::NARROW { *list.cast::<u32>().add(at) as usize } else { *list.add(at) as usize } }
 }
 
 /// Asks for the directory's lines of a batch's users (`Batch::count` rows).
@@ -1540,13 +1639,13 @@ fn ask<W: Width>(batch: &Batch, plan: &Plan) {
     // SAFETY: the lists have `BATCH + 8` numbers' room, and `split` wrote the first `shorts`
     // and `longs` of them: rows of the batch.
     unsafe {
-        let (shorts, longs) = if W::NARROW { split_narrow(batch, batch.count, short, long) } else { split(batch, batch.count, short, long) };
+        let (shorts, longs) = split_rows::<W>(batch, batch.count, short, long);
         for at in 0..shorts {
-            let row = *short.add(at) as usize;
+            let row = row_of::<W>(short, at);
             users.prefetch_short(batch.rows.get_unchecked(row)[2] + 1);
         }
         for at in 0..longs {
-            let row = *long.add(at) as usize;
+            let row = row_of::<W>(long, at);
             users.prefetch_long(batch.rows.get_unchecked(row)[2], batch.lows.get_unchecked(row)[1]);
         }
     }
@@ -1562,16 +1661,16 @@ fn look<W: Width>(batch: &mut Batch, rows: usize, plan: &Plan) {
     let (short, long) = (short.as_mut_ptr().cast::<u64>(), long.as_mut_ptr().cast::<u64>());
     // SAFETY: as `ask`; a list's numbers are rows below `rows`.
     unsafe {
-        let (shorts, longs) = if W::NARROW { split_narrow(batch, rows, short, long) } else { split(batch, rows, short, long) };
+        let (shorts, longs) = split_rows::<W>(batch, rows, short, long);
         // A row for the row code is in neither list and has no user here: its bytes are
         // read again.
         batch.users[..rows].fill(NO_USER);
         for at in 0..shorts {
-            let row = *short.add(at) as usize;
+            let row = row_of::<W>(short, at);
             *batch.users.get_unchecked_mut(row) = users.short::<W>(batch.rows.get_unchecked(row)[2] + 1);
         }
         for at in 0..longs {
-            let row = *long.add(at) as usize;
+            let row = row_of::<W>(long, at);
             *batch.users.get_unchecked_mut(row) = users.long(batch.rows.get_unchecked(row)[2], batch.lows.get_unchecked(row)[1]);
         }
     }
@@ -1614,7 +1713,7 @@ unsafe fn others(
     }
 }
 
-/// `others` for a group of four rows of `finish_narrow`.
+/// `others` for eight rows of `finish_narrow`, their records' words in memory.
 ///
 /// # Safety
 /// As `others`.
@@ -1624,8 +1723,8 @@ unsafe fn others_narrow(
     batch: &Batch,
     first: usize,
     rest: __mmask8,
-    user_ts: __m256i,
-    ingest_rel: __m256i,
+    user_ts_of: &[u64; 8],
+    ingest_of: &[u64; 8],
     base: *const u8,
     bytes: usize,
     ctx: &Ctx,
@@ -1637,10 +1736,7 @@ unsafe fn others_narrow(
 ) {
     // SAFETY: the caller's contract.
     unsafe {
-        let (mut user_ts_of, mut ingest_of) = ([0u64; 4], [0u64; 4]);
-        _mm256_storeu_si256(user_ts_of.as_mut_ptr().cast(), user_ts);
-        _mm256_storeu_si256(ingest_of.as_mut_ptr().cast(), ingest_rel);
-        let mut left = rest & 0xF;
+        let mut left = rest;
         while left != 0 {
             let lane = left.trailing_zeros() as usize;
             left &= left - 1;
