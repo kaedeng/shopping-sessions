@@ -164,6 +164,13 @@ impl Ctx {
         (self.origin_day + ((u64::from(ts) + self.origin_in_day) / DAY as u64) as i64) as i32
     }
 
+    /// The day `origin` falls on (days since 1970) and the milliseconds of that day gone
+    /// by then: `day_of(ts)` is the first plus the whole days in `ts` plus the second.
+    #[inline(always)]
+    pub fn day_split(&self) -> (i64, u64) {
+        (self.origin_day, self.origin_in_day)
+    }
+
     /// The epoch second `ingest_rel` counts from.
     #[inline(always)]
     pub fn ingest_base(&self) -> i64 {

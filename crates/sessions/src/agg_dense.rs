@@ -93,6 +93,11 @@ pub struct Counters {
     /// More assists, `[campaign * 16 + day]`: `attr-wide`'s, which adds a campaign's days at
     /// once. Empty for a window of more than 16 days, where that slot does not run.
     wide: Vec<u32>,
+    /// More credited sessions, laid out the same way, with a row past the campaigns for
+    /// sessions that are nobody's to count: the positional pipeline's, which counts a
+    /// partition's sessions in one pass and adds revenue for the few that have any (`paid`).
+    /// Empty with `wide`.
+    counted: Vec<u32>,
 }
 
 /// Days a campaign has in `Counters::wide`.
@@ -102,7 +107,8 @@ impl Counters {
     pub fn new(ctx: &Ctx) -> Counters {
         let cells = ctx.campaigns.len() * ctx.n_days;
         let wide = if ctx.n_days <= WIDE_DAYS { ctx.campaigns.len() * WIDE_DAYS } else { 0 };
-        Counters { campaigns: ctx.campaigns.len(), credited: vec![Credited::default(); cells], assisted: vec![0; cells], wide: vec![0; wide] }
+        let counted = if wide > 0 { wide + WIDE_DAYS } else { 0 };
+        Counters { campaigns: ctx.campaigns.len(), credited: vec![Credited::default(); cells], assisted: vec![0; cells], wide: vec![0; wide], counted: vec![0; counted] }
     }
 
     /// The table `attr-wide` adds to, `[campaign * 16 + day]`.
@@ -110,6 +116,23 @@ impl Counters {
     #[inline(always)]
     pub(crate) fn wide(&mut self) -> &mut [u32] {
         &mut self.wide
+    }
+
+    /// The table of sessions counted apart, `[campaign * 16 + day]` with one row more;
+    /// empty when there is none.
+    #[cfg(feature = "pipe-positional")]
+    #[inline(always)]
+    pub(crate) fn counted(&mut self) -> &mut [u32] {
+        &mut self.counted
+    }
+
+    /// The revenue of a session counted in `counted`.
+    #[cfg(feature = "pipe-positional")]
+    #[inline(always)]
+    pub(crate) fn paid(&mut self, campaign: u32, day: usize, revenue: u64) {
+        let cell = &mut self.credited[day * self.campaigns + campaign as usize];
+        cell.purchasing += 1;
+        cell.revenue += revenue;
     }
 
     #[inline(always)]
@@ -154,11 +177,13 @@ pub fn campaign_daily_part<'a>(ctx: &Ctx, workers: impl Iterator<Item = &'a Coun
             sum[2] += credited.revenue as i64;
             sum[3] += i64::from(assisted);
         }
-        // The other table's assists, cell by cell: a cell is `day * campaigns + campaign`.
+        // The other tables' assists and sessions, cell by cell: a cell is
+        // `day * campaigns + campaign`.
         if !counters.wide.is_empty() {
             for (sum, cell) in sums.iter_mut().zip(from..to) {
                 let (day, campaign) = (cell / ctx.campaigns.len(), cell % ctx.campaigns.len());
                 sum[3] += i64::from(counters.wide[campaign * WIDE_DAYS + day]);
+                sum[0] += i64::from(counters.counted[campaign * WIDE_DAYS + day]);
             }
         }
     }

@@ -399,6 +399,8 @@ struct Cut {
     row_cat: Vec<u8>,
     /// The partition's fast-lane runs: the person's name and its sessions.
     fit: Vec<(Id, u32, u32)>,
+    /// The fast-lane sessions with revenue.
+    paid: Vec<u32>,
     /// Per category: the row its purchases were last summed for, and that sum.
     cat_row: Vec<u32>,
     cat_sum: Vec<u64>,
@@ -846,20 +848,9 @@ impl<'a> Fused<'a> {
         phases.lap(1);
 
         // Each session's day, and the rows: a run's sessions of one day.
-        let (mut nrow, mut last_day) = (0usize, u32::MAX);
-        for s in 0..ns {
-            let day = (ctx.day_of(c.s_ts[s]) - ctx.day0) as u32;
-            c.s_day[s] = day;
-            if c.s_ord[s] & RUN != 0 || day != last_day {
-                (c.row_day[nrow], c.row_s0[nrow], c.row_e0[nrow]) = (day, s as u32, c.s_ord[s] & !RUN);
-                nrow += 1;
-            }
-            c.s_row[s] = nrow as u32 - 1;
-            last_day = day;
-        }
-        (c.row_s0[nrow], c.row_e0[nrow]) = (ns as u32, events);
         let organic = ctx.organic();
-        c.s_camp[..ns].fill(organic);
+        let nrow = days_and_rows(ctx, c, ns, organic);
+        (c.row_s0[nrow], c.row_e0[nrow]) = (ns as u32, events);
         c.s_rev[..ns].fill(0);
         c.row_rev[..nrow].fill(0);
         c.row_cat[..nrow].fill(NO_CATEGORY);
@@ -925,6 +916,7 @@ impl<'a> Fused<'a> {
         c.cat_row.clear();
         c.cat_row.resize(256, u32::MAX);
         c.cat_sum.resize(256, 0);
+        c.paid.clear();
         let (mut row_now, mut best) = (u32::MAX, 0u64);
         for &(number, pay) in &pays {
             let slot = number as usize - base;
@@ -935,6 +927,9 @@ impl<'a> Fused<'a> {
             }
             let (price, category) = (u64::from(pay & PAY_PRICE_MASK), (pay >> PAY_CATEGORY_SHIFT) as usize);
             let row = c.s_row[session];
+            if c.s_rev[session] == 0 {
+                c.paid.push(session as u32);
+            }
             c.s_rev[session] += price;
             c.row_rev[row as usize] += price;
             // The row's top category so far: the largest sum, the smallest index among equals
@@ -952,36 +947,88 @@ impl<'a> Fused<'a> {
         }
 
         phases.lap(4);
-        // The credit of every fast-lane session, then the rows.
-        for &(_, s0, s1) in &c.fit {
-            for s in s0 as usize..s1 as usize {
-                agg.credit(c.s_camp[s], c.s_day[s] as usize, c.s_rev[s]);
+        // The credit of every fast-lane session, then the rows. A session is one more in its
+        // campaign's count for its day, the sessions that are not the fast lane's (`SKIP`)
+        // in a row no campaign has; revenue is added for the few sessions that have any.
+        // (Each session's cell of sessions, purchases and revenue at once was a cache line
+        // of a 450 KB table a session, 22 thread-ms at 20M.)
+        let trash = ctx.campaigns.len() as u32;
+        if let Some(counted) = agg.counted() {
+            debug_assert!(counted.len() >= (trash as usize + 1) * 16);
+            for s in 0..ns {
+                // SAFETY: a campaign is below `trash`, a day below 16 (the table is there
+                // only for windows of at most 16 days).
+                unsafe { *counted.get_unchecked_mut(c.s_camp.get_unchecked(s).min(&trash).to_owned() as usize * 16 + *c.s_day.get_unchecked(s) as usize) += 1 };
+            }
+            for &session in &c.paid {
+                let session = session as usize;
+                agg.paid(c.s_camp[session], c.s_day[session] as usize, c.s_rev[session]);
+            }
+        } else {
+            for &(_, s0, s1) in &c.fit {
+                for s in s0 as usize..s1 as usize {
+                    agg.credit(c.s_camp[s], c.s_day[s] as usize, c.s_rev[s]);
+                }
             }
         }
         phases.lap(5);
         // Room for every row of the partition once, then plain stores: extended run by run,
         // the six columns were 4 million calls for 2.2 million rows.
         let out = &mut agg.user_daily;
-        out.reserve(nrow);
+        // 16 rows at a time, so up to 15 past the last.
+        out.reserve(nrow + 16);
         let mut at = out.person.len();
         debug_assert!([out.day.len(), out.sessions.len(), out.events.len(), out.revenue_cents.len(), out.top_category.len()].iter().all(|&len| len == at));
         let (person, day, sessions, events, revenue, category) =
             (out.person.as_mut_ptr(), out.day.as_mut_ptr(), out.sessions.as_mut_ptr(), out.events.as_mut_ptr(), out.revenue_cents.as_mut_ptr(), out.top_category.as_mut_ptr());
-        for &(name, s0, s1) in &c.fit {
-            let (r0, r1) = (c.s_row[s0 as usize] as usize, if (s1 as usize) < ns { c.s_row[s1 as usize] as usize } else { nrow });
-            for row in r0..r1 {
-                // SAFETY: the fast-lane runs' rows are among the partition's `nrow`, each
-                // written once, inside the room reserved above in every column.
-                unsafe {
-                    person.add(at).write(name);
-                    day.add(at).write(ctx.day0 + c.row_day[row] as i32);
-                    sessions.add(at).write(i64::from(c.row_s0[row + 1] - c.row_s0[row]));
-                    events.add(at).write(i64::from(c.row_e0[row + 1] - c.row_e0[row]));
-                    revenue.add(at).write(c.row_rev[row] as i64);
-                    category.add(at).write(c.row_cat[row]);
+        // The fast-lane runs' rows are stretches of the partition's rows, most of them long
+        // (a run that is not the fast lane's ends one): a stretch's five columns of numbers
+        // are copied 16 rows a step, and the names filled run by run. (Row by row this was
+        // 46 thread-ms at 20M.)
+        //
+        // SAFETY: the fast-lane runs' rows are among the partition's `nrow`, each written
+        // once, inside the room reserved above in every column; a step may write up to 15
+        // rows past a stretch, which later stretches overwrite or the lengths leave out, and
+        // read as far past it in the rows' arrays, which have that room (`cut`).
+        unsafe {
+            use core::arch::x86_64::*;
+            let day0 = _mm512_set1_epi32(ctx.day0);
+            let (row_day, row_s0, row_e0, row_rev, row_cat) = (c.row_day.as_ptr(), c.row_s0.as_ptr(), c.row_e0.as_ptr(), c.row_rev.as_ptr(), c.row_cat.as_ptr());
+            let stretch = |from: usize, to: usize, at: usize| {
+                let mut row = from;
+                while row < to {
+                    let o = at + (row - from);
+                    _mm512_storeu_si512(day.add(o).cast(), _mm512_add_epi32(_mm512_loadu_si512(row_day.add(row).cast()), day0));
+                    let counts = _mm512_sub_epi32(_mm512_loadu_si512(row_s0.add(row + 1).cast()), _mm512_loadu_si512(row_s0.add(row).cast()));
+                    _mm512_storeu_si512(sessions.add(o).cast(), _mm512_cvtepu32_epi64(_mm512_castsi512_si256(counts)));
+                    _mm512_storeu_si512(sessions.add(o + 8).cast(), _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(counts)));
+                    let counts = _mm512_sub_epi32(_mm512_loadu_si512(row_e0.add(row + 1).cast()), _mm512_loadu_si512(row_e0.add(row).cast()));
+                    _mm512_storeu_si512(events.add(o).cast(), _mm512_cvtepu32_epi64(_mm512_castsi512_si256(counts)));
+                    _mm512_storeu_si512(events.add(o + 8).cast(), _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(counts)));
+                    _mm512_storeu_si512(revenue.add(o).cast(), _mm512_loadu_si512(row_rev.add(row).cast()));
+                    _mm512_storeu_si512(revenue.add(o + 8).cast(), _mm512_loadu_si512(row_rev.add(row + 8).cast()));
+                    _mm_storeu_si128(category.add(o).cast(), _mm_loadu_si128(row_cat.add(row).cast()));
+                    row += 16;
                 }
-                at += 1;
+            };
+            // The stretch being gathered, and where the next name goes.
+            let (mut from, mut to, mut named) = (0usize, 0usize, at);
+            for &(name, s0, s1) in &c.fit {
+                let (r0, r1) = (c.s_row[s0 as usize] as usize, if (s1 as usize) < ns { c.s_row[s1 as usize] as usize } else { nrow });
+                if r0 != to {
+                    stretch(from, to, at);
+                    at += to - from;
+                    from = r0;
+                }
+                to = r1;
+                for row in 0..r1 - r0 {
+                    person.add(named + row).write(name);
+                }
+                named += r1 - r0;
             }
+            stretch(from, to, at);
+            at += to - from;
+            debug_assert_eq!(at, named);
         }
         // SAFETY: rows `..at` of every column are written, and the six had one length.
         unsafe {
@@ -1075,6 +1122,98 @@ impl<'a> Fused<'a> {
         let all: Vec<(u32, u32)> = if extra { with_extras(table, self.extras_of(person), 0) } else { table.collect() };
         sessions::positional::person_pairs(self.ctx, name, &all, clicks, agg);
     }
+}
+
+/// How many of a byte's bits are set at or below each bit: eight counts, a byte each.
+static UP_TO: [u64; 256] = {
+    let mut table = [0u64; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        let (mut bit, mut count) = (0, 0u64);
+        while bit < 8 {
+            count += (byte >> bit & 1) as u64;
+            table[byte] |= count << (8 * bit);
+            bit += 1;
+        }
+        byte += 1;
+    }
+    table
+};
+
+/// Each session's day (`c.s_day`) and its row (`c.s_row`), the rows themselves (a run's
+/// sessions of one day: `c.row_day`, `c.row_s0`, `c.row_e0`), and `organic` as every
+/// session's campaign so far. Returns the rows.
+///
+/// 16 sessions a step: the day is a multiply for a division, a row starts where a run does
+/// or the day changes, and the rows' three columns are those lanes packed. (Session by
+/// session, with a division and a branch each, this was 35 thread-ms at 20M.)
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl",
+    target_feature = "bmi2"
+))]
+fn days_and_rows(ctx: &Ctx, c: &mut Cut, ns: usize, organic: u32) -> usize {
+    use core::arch::x86_64::*;
+    let (origin_day, in_day) = ctx.day_split();
+    let mut nrow = 0usize;
+    // A `ts` and the origin's time of day are milliseconds that must add up in 32 bits.
+    if u64::from(ctx.ts_end) + in_day >= 1 << 32 {
+        let mut last_day = u32::MAX;
+        for s in 0..ns {
+            let day = (ctx.day_of(c.s_ts[s]) - ctx.day0) as u32;
+            c.s_day[s] = day;
+            if c.s_ord[s] & RUN != 0 || day != last_day {
+                (c.row_day[nrow], c.row_s0[nrow], c.row_e0[nrow]) = (day, s as u32, c.s_ord[s] & !RUN);
+                nrow += 1;
+            }
+            c.s_row[s] = nrow as u32 - 1;
+            last_day = day;
+        }
+        c.s_camp[..ns].fill(organic);
+        return nrow;
+    }
+    let (s_ts, s_ord, s_day, s_row, s_camp) = (c.s_ts.as_ptr(), c.s_ord.as_ptr(), c.s_day.as_mut_ptr(), c.s_row.as_mut_ptr(), c.s_camp.as_mut_ptr());
+    let (row_day, row_s0, row_e0) = (c.row_day.as_mut_ptr(), c.row_s0.as_mut_ptr(), c.row_e0.as_mut_ptr());
+    // SAFETY: every column has room for 16 entries past the partition's sessions (`cut`),
+    // and a step reads and writes at most that far.
+    unsafe {
+        // A day is 2^10 * 84375 ms, and for x below 2^22, x / 84375 is x * 6515625 >> 39.
+        let (add, magic) = (_mm512_set1_epi32(in_day as i32), _mm512_set1_epi64(6_515_625));
+        // `day_of` less `day0`: the days from the origin's to the window's first.
+        let behind = _mm512_set1_epi32((i64::from(ctx.day0) - origin_day) as i32);
+        let lanes = _mm512_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let (run_flag, organic) = (_mm512_set1_epi32(RUN as i32), _mm512_set1_epi32(organic as i32));
+        // The day of the session before, in the last lane.
+        let mut before = _mm512_set1_epi32(-1);
+        let mut s = 0;
+        while s < ns {
+            let live = if ns - s >= 16 { 0xFFFF } else { (1u16 << (ns - s)) - 1 };
+            let x = _mm512_srli_epi32::<10>(_mm512_add_epi32(_mm512_loadu_si512(s_ts.add(s).cast()), add));
+            let even = _mm512_srli_epi64::<39>(_mm512_mul_epu32(x, magic));
+            let odd = _mm512_srli_epi64::<39>(_mm512_mul_epu32(_mm512_srli_epi64::<32>(x), magic));
+            let day = _mm512_sub_epi32(_mm512_or_si512(even, _mm512_slli_epi64::<32>(odd)), behind);
+            _mm512_storeu_si512(s_day.add(s).cast(), day);
+            let ord = _mm512_loadu_si512(s_ord.add(s).cast());
+            // A row starts with a run (`RUN` is the sign bit) and where the day changes.
+            let starts = (_mm512_movepi32_mask(ord) | _mm512_cmpneq_epi32_mask(day, _mm512_alignr_epi32::<15>(day, before))) & live;
+            _mm512_storeu_si512(row_day.add(nrow).cast(), _mm512_maskz_compress_epi32(starts, day));
+            _mm512_storeu_si512(row_s0.add(nrow).cast(), _mm512_maskz_compress_epi32(starts, _mm512_add_epi32(_mm512_set1_epi32(s as i32), lanes)));
+            _mm512_storeu_si512(row_e0.add(nrow).cast(), _mm512_maskz_compress_epi32(starts, _mm512_andnot_si512(run_flag, ord)));
+            // A session's row: the rows before the step, and the starts up to its lane.
+            let (low, high) = (starts as u8, (starts >> 8) as u8);
+            let up_to = _mm512_cvtepu8_epi32(_mm_set_epi64x(UP_TO[high as usize] as i64, UP_TO[low as usize] as i64));
+            let row = _mm512_add_epi32(_mm512_set1_epi32(nrow as i32 - 1), up_to);
+            _mm512_storeu_si512(s_row.add(s).cast(), _mm512_mask_add_epi32(row, 0xFF00, row, _mm512_set1_epi32(low.count_ones() as i32)));
+            _mm512_storeu_si512(s_camp.add(s).cast(), organic);
+            nrow += starts.count_ones() as usize;
+            before = day;
+            s += 16;
+        }
+    }
+    nrow
 }
 
 /// A person's table events (in time order) with its extras merged in: a few rows, sorted

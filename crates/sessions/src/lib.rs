@@ -137,6 +137,22 @@ impl Agg {
     pub fn credit(&mut self, campaign: u32, day: usize, revenue: u64) {
         self.counters.credit(campaign, day, revenue);
     }
+
+    /// Credited sessions counted apart: a table `[campaign * 16 + day]` to add one to per
+    /// session, with a row past the campaigns (`Ctx::campaigns`' length) for sessions that
+    /// are not to be counted; each such session with revenue then goes to `paid`. `None` for
+    /// a window of more than 16 days: `credit` then.
+    #[inline(always)]
+    pub fn counted(&mut self) -> Option<&mut [u32]> {
+        let counted = self.counters.counted();
+        (!counted.is_empty()).then_some(counted)
+    }
+
+    /// The revenue of a session counted through `counted`.
+    #[inline(always)]
+    pub fn paid(&mut self, campaign: u32, day: usize, revenue: u64) {
+        self.counters.paid(campaign, day, revenue);
+    }
 }
 
 /// A gap between two of a person's events over this many ms starts a session.
