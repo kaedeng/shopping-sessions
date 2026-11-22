@@ -131,6 +131,79 @@ fn code(allowed: &[usize]) -> u64 {
     ((cpu * 4 + threads) * 4 + huge) * 2 + compacts
 }
 
+/// Whether this process can have 2 MB pages where the machine's setting is `never` (what the
+/// first probe read on the scorer): by `MADV_COLLAPSE` (Linux 6.1, and it does not ask the
+/// setting) on a range with one page written, and by a `MAP_HUGETLB` mapping (which needs
+/// pages the machine's owner set aside).
+#[cfg(target_os = "linux")]
+fn huge_pages() -> (bool, bool) {
+    unsafe extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+        fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+    }
+    const HUGE: usize = 2 << 20;
+    const READ_WRITE: i32 = 1 | 2;
+    const PRIVATE_ANONYMOUS: i32 = 0x02 | 0x20;
+    const MAP_HUGETLB: i32 = 0x40000;
+    const MADV_COLLAPSE: i32 = 25;
+    let huge_kb = || read("/proc/self/smaps_rollup").unwrap_or_default().lines().find_map(|line| line.strip_prefix("AnonHugePages:")).and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse::<u64>().ok()).unwrap_or(0);
+    // SAFETY: fresh mappings of this function's own, unmapped before it returns; the one
+    // write is inside the first.
+    unsafe {
+        let mut collapsed = false;
+        let before = huge_kb();
+        let block = mmap(std::ptr::null_mut(), 2 * HUGE, READ_WRITE, PRIVATE_ANONYMOUS, -1, 0);
+        if block as isize != -1 && !block.is_null() {
+            let aligned = ((block as usize + HUGE - 1) & !(HUGE - 1)) as *mut u8;
+            aligned.write_volatile(1);
+            // Said to have worked, and seen in the process's own count of huge pages.
+            collapsed = madvise(aligned, HUGE, MADV_COLLAPSE) == 0 && huge_kb() >= before + 2048;
+            munmap(block, 2 * HUGE);
+        }
+        let reserved = mmap(std::ptr::null_mut(), HUGE, READ_WRITE, PRIVATE_ANONYMOUS | MAP_HUGETLB, -1, 0);
+        let set_aside = reserved as isize != -1 && !reserved.is_null();
+        if set_aside {
+            munmap(reserved, HUGE);
+        }
+        (collapsed, set_aside)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn huge_pages() -> (bool, bool) {
+    (false, false)
+}
+
+/// `SS_PROBE=sleep2`: four more facts, in steps of 200 ms. A step is far more than a switch
+/// moves a run (tens of milliseconds), so the number can ride on a submission that tests
+/// something else and both are read from the one time. Read from the lowest:
+///
+/// - `% 2`, a `MAP_HUGETLB` mapping is granted (`huge_pages`): 1 yes;
+/// - `/ 2 % 2`, `MADV_COLLAPSE` makes a 2 MB page (`huge_pages`): 1 yes;
+/// - `/ 4 % 2`, speculative store bypass for this process (`Speculation_Store_Bypass` in
+///   `/proc/self/status`): 1 mitigated, so a load waits for the address of every store
+///   before it (`x86.md`); 0 allowed, not affected or unreadable;
+/// - `/ 8`, the kernel: 0 unreadable, 1 before 5.16 (a seccomp filter turns the store bypass
+///   off), 2 from 5.16 to 6.0, 3 from 6.1 to 6.3 (`MADV_COLLAPSE` exists), 4 from 6.4 on
+///   (page faults no longer queue behind the address-space lock).
+///
+/// At most 39: 7.8 s.
+fn code2() -> u64 {
+    let release = read("/proc/sys/kernel/osrelease").unwrap_or_default();
+    let mut parts = release.split(|letter: char| !letter.is_ascii_digit()).map(|part| part.parse::<u32>().ok());
+    let kernel = match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) if (major, minor) < (5, 16) => 1,
+        (Some(major), Some(minor)) if (major, minor) < (6, 1) => 2,
+        (Some(major), Some(minor)) if (major, minor) < (6, 4) => 3,
+        (Some(_), Some(_)) => 4,
+        _ => 0,
+    };
+    let mitigated = read("/proc/self/status").unwrap_or_default().lines().any(|line| line.starts_with("Speculation_Store_Bypass:") && line.contains("mitigated"));
+    let (collapsed, set_aside) = huge_pages();
+    ((kernel * 2 + u64::from(mitigated)) * 2 + u64::from(collapsed)) * 2 + u64::from(set_aside)
+}
+
 impl Probe {
     /// `Some` when `SS_PROBE` is set. Call before the workers are started.
     pub fn start() -> Option<Probe> {
@@ -145,6 +218,12 @@ impl Probe {
             let code = code(&self.allowed);
             eprintln!("probe: code {code}");
             std::thread::sleep(std::time::Duration::from_millis(100 * code));
+            return;
+        }
+        if std::env::var_os("SS_PROBE").is_some_and(|value| value == "sleep2") {
+            let code = code2();
+            eprintln!("probe: code2 {code}");
+            std::thread::sleep(std::time::Duration::from_millis(200 * code));
             return;
         }
         let mut out = String::new();
