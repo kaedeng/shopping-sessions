@@ -220,6 +220,20 @@ impl Users {
         crate::mem::touch(&self.long, piece, pieces, |slot| &slot[0]);
     }
 
+    /// Slot `free-early`: piece `piece` of `pieces` of the tables back to the kernel, once
+    /// every name has been read (`mem::Zeroed::release`).
+    ///
+    /// # Safety
+    /// Nothing looks a user up or reads a name afterwards.
+    pub unsafe fn release(&self, piece: usize, pieces: usize) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            self.short.release(piece, pieces);
+            self.long.release(piece, pieces);
+            self.slot_of.release(piece, pieces);
+        }
+    }
+
     /// A bound on the numbers: every user's is below this. Far more than the users there
     /// are; an array of this many entries is touched only where a user's number is.
     pub fn bound(&self) -> usize {

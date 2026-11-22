@@ -132,6 +132,32 @@ pub fn touch<T>(table: &Zeroed<T>, piece: usize, pieces: usize, word: impl Fn(&T
     }
 }
 
+impl<T> Zeroed<T> {
+    /// Slot `free-early`: piece `piece` of `pieces` of the memory back to the kernel
+    /// (`release`), so that the pieces go on as many threads at once and not on the one that
+    /// exits. A no-op under `SS_FREE=exit`.
+    ///
+    /// # Safety
+    /// As `release`: nothing reads the piece again for what it held (it reads as zeros).
+    pub unsafe fn release(&self, piece: usize, pieces: usize) {
+        if !free_early() {
+            return;
+        }
+        let bytes = self.layout.size();
+        let (from, to) = (bytes * piece / pieces, bytes * (piece + 1) / pieces);
+        // SAFETY: inside the allocation; the caller's contract.
+        unsafe { release(self.at.as_ptr().cast::<u8>().add(from), to - from) };
+    }
+}
+
+/// The process's resident memory in MB (`/proc/self/statm`), for `SS_TIMING`: what is still
+/// mapped when the output is written is unmapped by one thread at exit.
+pub fn resident_mb() -> Option<usize> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: usize = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4096 >> 20)
+}
+
 impl<T> std::ops::Deref for Zeroed<T> {
     type Target = [T];
 
@@ -166,6 +192,13 @@ pub fn free_early() -> bool {
         let options: &[&str] = if cfg!(feature = "free-early") { &["early", "exit"] } else { &["exit"] };
         options[crate::env::pick("SS_FREE", options)] == "early"
     })
+}
+
+/// Slot `free-early` for one kind of buffer: `SS_FREE_SKIP=links,dense,names,rows` leaves the
+/// releases of those out one by one (for measurements), `SS_FREE=exit` all of them. Read once.
+pub fn free_part(part: &str) -> bool {
+    static SKIP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    free_early() && !SKIP.get_or_init(|| std::env::var("SS_FREE_SKIP").unwrap_or_default()).split(',').any(|skipped| skipped == part)
 }
 
 /// Slot `free-early`: hands the whole pages inside `addr..addr + len` back to the kernel now

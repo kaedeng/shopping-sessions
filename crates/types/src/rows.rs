@@ -29,6 +29,26 @@ impl UserDaily {
         self.revenue_cents.reserve(rows);
         self.top_category.reserve(rows);
     }
+
+    /// Slot `free-early`: every column's pages back to the kernel once the rows are written,
+    /// on the writing worker, and not on the one thread that exits (`mem::release`).
+    ///
+    /// # Safety
+    /// Nothing reads the rows again.
+    pub unsafe fn release(&self) {
+        fn column<T>(values: &Vec<T>) {
+            // SAFETY: the vector's own allocation; the caller's contract.
+            unsafe { crate::mem::release(values.as_ptr().cast(), values.capacity() * size_of::<T>()) };
+        }
+        if crate::mem::free_part("rows") {
+            column(&self.person);
+            column(&self.day);
+            column(&self.sessions);
+            column(&self.events);
+            column(&self.revenue_cents);
+            column(&self.top_category);
+        }
+    }
 }
 
 /// All of `campaign_daily`.

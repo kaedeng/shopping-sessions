@@ -5,6 +5,7 @@
 # Extra arguments are VAR=value settings for the binary (for example SS_PART_BITS=4 NCPU=3).
 set -eu
 IMAGE="${IMAGE:-shopping-sessions:latest}"
+DEV="${DEV:-dev}"   # the dev set dev-answer/ is for (generator v5: seed 1, 1M events, 250K clicks)
 CHECK="${CHECK_IMAGE:-shopping-sessions:check}"
 # Git Bash on Windows: hand docker.exe Windows paths and stop MSYS rewriting /fixtures etc.
 export MSYS_NO_PATHCONV=1
@@ -19,5 +20,5 @@ docker run --rm $ENVS -v "$ROOT/fixtures":/fixtures:ro "$CHECK" \
   python /app/scripts/run_fixtures.py /fixtures -- /app/shopping-sessions
 echo "== dev against dev-answer"
 # shellcheck disable=SC2086
-docker run --rm $ENVS -v "$ROOT/dev":/dev-data:ro -v "$ROOT/dev-answer":/answer:ro "$CHECK" \
+docker run --rm $ENVS -v "$ROOT/$DEV":/dev-data:ro -v "$ROOT/dev-answer":/answer:ro "$CHECK" \
   sh -c 'DATA_DIR=/dev-data OUTPUT_DIR=/tmp/out /app/shopping-sessions && python /app/scripts/compare.py /tmp/out /answer'

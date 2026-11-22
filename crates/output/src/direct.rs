@@ -370,7 +370,10 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
 
 pub fn user_daily(folder: &Path, worker: usize, ctx: &Ctx, rows: UserDaily, text_of: Option<Names>) -> Result<(), String> {
     let path = folder.join(format!("part-{worker}.parquet"));
-    write(&path, ctx, &rows, text_of).map_err(|error| format!("{}: {error}", path.display()))
+    let written = write(&path, ctx, &rows, text_of).map_err(|error| format!("{}: {error}", path.display()));
+    // SAFETY: the rows are written; they are dropped below.
+    unsafe { rows.release() };
+    written
 }
 
 /// Appends, for each key of a list, the name it stands for as a dictionary entry: its

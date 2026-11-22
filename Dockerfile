@@ -55,6 +55,12 @@ WORKDIR /app
 #                            one core share its 1 MB L2.
 # - SS_PROBE=sleep           the machine as a number: the run takes 0.1 s times it longer
 #                            (`probe::code` has the digits). The scorer shows no stderr.
+# - SS_PROBE=time:STAGE[:K]  the run sleeps K (10) times that stage's wall time before it
+#                            exits: (score - the plain score) / K is the stage on the scorer.
+#                            STAGE: inputs, parse, dedup, sessions, output, total.
+# - SS_DEDUP_ROOM=N, SS_DEDUP_AHEAD=N   dedup table slots a row (4) and its probes asked for
+#                            ahead (0): for two threads sharing a core's L2.
+# - SS_FREE_SKIP=links,dense,names,rows,sweep   leaves out the releases at the run's end.
 # `scripts/variant.sh NAME SWITCH...` makes the branch `runner/NAME` with the line below
 # rewritten and pushes it. SS_RUN is read by nothing: it keeps the line whole when every
 # switch is at its default.

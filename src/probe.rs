@@ -22,6 +22,34 @@ fn read(path: &str) -> Option<String> {
     std::fs::read_to_string(path).ok()
 }
 
+/// The stages `SS_PROBE=time:STAGE` can read out, in the order `main` laps them.
+const STAGES: [&str; 6] = ["inputs", "parse", "dedup", "sessions", "output", "total"];
+
+/// Each stage's wall time in microseconds, as `main` lapped it (0 before it ends).
+static LAPS: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// Records `stage` (one of `STAGES`) as having taken `micros`. Cheap enough for every run.
+pub fn lap(stage: &str, micros: u64) {
+    if let Some(at) = STAGES.iter().position(|name| *name == stage) {
+        LAPS[at].store(micros, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `SS_PROBE=time:STAGE[:FACTOR]`: the run sleeps FACTOR (default 10) times the stage's
+/// wall time before it exits, for a scorer that shows a run's time and nothing else. With
+/// the same commit's plain score beside it, `(score - plain) / FACTOR` is the stage's time
+/// on the scorer's machine, to about a millisecond (the scorer's median of three runs moves
+/// by about 10 ms). `total` is the process from `main` to the output written: set beside
+/// the plain score, it splits the score into this program and the container around it.
+fn timed_sleep(spec: &str) -> Option<(String, u64)> {
+    let mut words = spec.strip_prefix("time:")?.split(':');
+    let stage = words.next()?;
+    let factor: u64 = words.next().and_then(|word| word.parse().ok()).unwrap_or(10);
+    let at = STAGES.iter().position(|name| *name == stage)?;
+    let micros = LAPS[at].load(std::sync::atomic::Ordering::Relaxed);
+    Some((format!("probe: {stage} {:.1} ms, sleeping {factor} times that", micros as f64 / 1e3), micros * factor))
+}
+
 /// `path`'s text under its name, a line each.
 fn show(out: &mut String, path: &str) {
     if let Some(text) = read(path) {
@@ -214,6 +242,11 @@ impl Probe {
     /// The report. `data` is the input folder. With `SS_PROBE=sleep`, the machine's number
     /// (`code`) as a wait instead.
     pub fn finish(&self, data: &std::path::Path) {
+        if let Some((said, micros)) = std::env::var("SS_PROBE").ok().as_deref().and_then(timed_sleep) {
+            eprintln!("{said}");
+            std::thread::sleep(std::time::Duration::from_micros(micros));
+            return;
+        }
         if std::env::var_os("SS_PROBE").is_some_and(|value| value == "sleep") {
             let code = code(&self.allowed);
             eprintln!("probe: code {code}");

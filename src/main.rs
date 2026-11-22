@@ -125,10 +125,18 @@ fn run() -> Result<(), String> {
             par::limit(taking);
         }
         types::tl::mark(stage);
-        if timing {
-            let now = Instant::now();
-            eprintln!("{stage:<9}{:>8.1} ms", (now - last).as_secs_f64() * 1e3);
+        // For `SS_PROBE=time:STAGE` (`probe`), timed whether or not `SS_TIMING` is set.
+        let now = Instant::now();
+        probe::lap(stage, (now - last).as_micros() as u64);
+        if !timing {
             last = now;
+        }
+        if timing {
+            eprintln!("{stage:<9}{:>8.1} ms", (now - last).as_secs_f64() * 1e3);
+            if std::env::var_os("SS_TIMING").is_some_and(|value| value == "3") {
+                eprintln!("rss {stage:<9}{:>6} MB", types::mem::resident_mb().unwrap_or(0));
+            }
+            last = Instant::now();
         }
     };
 
@@ -279,7 +287,23 @@ fn run() -> Result<(), String> {
         let spilled_clicks = spilled(scattered.iter().map(|mine| mine.clicks.spilled()).sum(), buckets * ctx.workers);
 
         // Stage 3. Person buckets, largest first so a whale's bucket is not the last to start.
-        let mut aggs: Vec<Agg> = par::init(ctx.workers, parallel_alloc, |_| Agg::new(&ctx));
+        // A worker's `user_daily` columns have room from the start for half its share of the
+        // events (a row is a person's day, one for about eight events on generated data): grown
+        // by doubling, every block they outgrew stayed mapped, 300 MB at 20M events that were
+        // zeroed for nothing and unmapped by one thread at exit. The room is address space
+        // until a row is written.
+        #[allow(unused_mut)]
+        let mut survivors: usize = scattered.iter().map(|mine| mine.events.len()).sum();
+        #[cfg(feature = "pipe-positional")]
+        {
+            survivors += scattered.iter().filter_map(|mine| mine.dense.as_ref()).map(|dense| dense.keys.len()).sum::<usize>();
+        }
+        let rows_room = survivors / ctx.workers / 2 + 4096;
+        let mut aggs: Vec<Agg> = par::init(ctx.workers, parallel_alloc, |_| {
+            let mut agg = Agg::new(&ctx);
+            agg.user_daily.reserve(rows_room);
+            agg
+        });
         #[cfg(feature = "pipe-positional")]
         if let Some((shift, lists)) = dense_plan {
             // Buckets that are ranges of the persons' numbers: no hash, no lookup.
@@ -314,6 +338,11 @@ fn run() -> Result<(), String> {
             });
         }
         lap("sessions");
+        if std::env::var_os("SS_TIMING").is_some_and(|value| value == "3") {
+            let rows: usize = aggs.iter().map(|agg| agg.user_daily.person.len()).sum();
+            let room: usize = aggs.iter().map(|agg| agg.user_daily.person.capacity()).sum();
+            eprintln!("rows {rows} room {room} ({rows_room} a worker asked)");
+        }
         #[cfg(feature = "pipe-positional")]
         if opaque && !whole_clicks && sessions::ambiguous_tie() {
             if timing {
@@ -353,15 +382,41 @@ fn run() -> Result<(), String> {
         if free_early {
             mine.events.release();
             mine.clicks.release();
+            #[cfg(feature = "pipe-positional")]
+            if let Some(dense) = &mut mine.dense
+                && types::mem::free_part("dense")
+            {
+                dense.release();
+            }
         }
     });
     drop(outputs);
     if let Some(error) = failure.into_inner() {
         return Err(error);
     }
-    output::campaign_daily(&campaign_folder, 0, &ctx, sessions::campaign_daily(&ctx, &aggs))?;
+    // Slot `free-early`: the opaque pipeline's directory and persons, read for the names up
+    // to here, a piece a worker, while one of them writes `campaign_daily`.
+    let campaign_rows = std::sync::Mutex::new(Some(sessions::campaign_daily(&ctx, &aggs)));
+    let campaign_written = OnceLock::new();
+    par::each(&mut scattered, |worker, _| {
+        if let Some(rows) = campaign_rows.lock().expect("campaign rows").take() {
+            drop(campaign_written.set(output::campaign_daily(&campaign_folder, 0, &ctx, rows)));
+        }
+        #[cfg(feature = "pipe-positional")]
+        if let Some(names) = &names
+            && types::mem::free_part("names")
+        {
+            // SAFETY: every `user_daily` file is written; nothing reads a name again.
+            unsafe { names.release(worker, ctx.workers) };
+        }
+    });
+    campaign_written.into_inner().expect("a worker wrote campaign_daily")?;
     lap("output");
+    probe::lap("total", started.elapsed().as_micros() as u64);
     if timing {
+        if let Some(resident) = types::mem::resident_mb() {
+            eprintln!("resident {resident:>8} MB");
+        }
         eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
         eprintln!("spilled: {spilled_partitions} partitions, {spilled_events} event buckets, {spilled_clicks} click buckets");
     }
@@ -380,6 +435,20 @@ fn run() -> Result<(), String> {
     }
     // Slot `fast-exit`: the files are written, so skip the destructors and let the kernel reclaim.
     if cfg!(feature = "fast-exit") {
+        // Slot `free-early`: what is left of the large blocks (the sessions stage's buffers,
+        // the writers', the parse's own) goes back on every worker at once, not page by page
+        // on the one thread that exits (240 MB at 20M events, 12 ms of the run's end with
+        // huge pages off). `SS_FREE_SKIP=sweep` leaves it out.
+        #[cfg(feature = "alloc-region")]
+        if types::mem::free_part("sweep") && region::sweepable() {
+            let started_sweep = Instant::now();
+            let mut seats = vec![(); ctx.workers];
+            // SAFETY: the process exits next; nothing reads a large block again.
+            par::each(&mut seats, |worker, _| unsafe { region::release_large(worker, ctx.workers) });
+            if timing {
+                eprintln!("sweep    {:>8.1} ms, then {} MB resident", started_sweep.elapsed().as_secs_f64() * 1e3, types::mem::resident_mb().unwrap_or(0));
+            }
+        }
         std::process::exit(0);
     }
     Ok(())

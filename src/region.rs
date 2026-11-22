@@ -55,7 +55,21 @@ mod other {
             unsafe { System.realloc(ptr, layout, new_size) }
         }
     }
+
+    /// No reservation here: nothing to sweep.
+    pub fn sweepable() -> bool {
+        false
+    }
+
+    /// # Safety
+    /// None needed: a no-op.
+    pub unsafe fn release_large(_piece: usize, _pieces: usize) {}
 }
+#[cfg(not(target_os = "linux"))]
+pub use other::{release_large, sweepable};
+
+#[cfg(target_os = "linux")]
+pub use linux::{release_large, sweepable};
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -335,6 +349,37 @@ mod linux {
                 // SAFETY: as above.
                 (OWN.with(|own| give(unsafe { &mut *own.get() }, bytes, align)), false)
             }
+        }
+    }
+
+    /// Whether `release_large` may run: the reservation is the allocator's, and every small
+    /// block came from its zone (a thread gives out small blocks from its large chunk once the
+    /// zone is used up, and those would be swept with the large ones).
+    pub fn sweepable() -> bool {
+        STATE.load(SeqCst) == READY && SMALL_NEXT.load(SeqCst) + SMALL_CHUNK <= BASE.load(SeqCst) + SMALL_ZONE
+    }
+
+    /// Piece `piece` of `pieces` of every large block given out so far back to the kernel
+    /// (`MADV_DONTNEED`): the reservation past the small blocks' zone, up to its mark. For the
+    /// end of a run, by every worker at once: what is still mapped at exit is unmapped by one
+    /// thread, a page-table entry per 4 KB where huge pages are off.
+    ///
+    /// # Safety
+    /// `sweepable`, and no large block is read again for what it held (each reads as zeros);
+    /// in practice the process exits next. Small blocks, statics, stacks and thread-locals are
+    /// not touched.
+    pub unsafe fn release_large(piece: usize, pieces: usize) {
+        let (from, to) = (BASE.load(SeqCst) + SMALL_ZONE, NEXT.load(SeqCst));
+        if to <= from {
+            return;
+        }
+        // Pieces of whole pages.
+        let span = (to - from).div_ceil(PAGE);
+        let (start, end) = (from + span * piece / pieces * PAGE, (from + span * (piece + 1) / pieces * PAGE).min(to));
+        const MADV_DONTNEED: i32 = 4;
+        if end > start {
+            // SAFETY: whole pages of the reservation; the caller's contract.
+            unsafe { madvise(start as *mut u8, end - start, MADV_DONTNEED) };
         }
     }
 

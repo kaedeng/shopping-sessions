@@ -42,6 +42,15 @@ impl DenseBuckets {
         let share = |rows: usize, size: usize| rows / workers * size * 9 / 8 + buckets * 4096 + (2 << 20);
         DenseBuckets { keys: Chunks::new(buckets, share(events, 8)), pays: Chunks::new(buckets, share(events / 16, 16)), clicks: Chunks::new(buckets, share(clicks, 24)) }
     }
+
+    /// Slot `free-early`: the lists back to the kernel once the sessions stage has read them.
+    /// Left mapped, these were most of what one thread unmapped at exit (280 MB at 20M
+    /// events, 70,000 pages where huge pages are off).
+    pub fn release(&mut self) {
+        self.keys.release();
+        self.pays.release();
+        self.clicks.release();
+    }
 }
 
 
@@ -62,7 +71,7 @@ pub struct Persons {
 impl Persons {
     /// The persons the links make: a union-find over the users' numbers, each root keeping
     /// its component's smallest ID as the links come.
-    pub fn new(users: &Users, links: &[Vec<LinkRec>]) -> Persons {
+    pub fn new(users: &Users, links: &[&[LinkRec]]) -> Persons {
         // Zeroed lazily by the kernel, and touched only where a user's number is: the
         // numbers are dense, so that is the arrays' first few megabytes.
         // SAFETY: all zeros is a valid integer, and a valid pair of them.
@@ -90,7 +99,7 @@ impl Persons {
         // Whether the ID of `a` is the smaller: by the first 8 bytes, and by all of them
         // where those are the same.
         let less = |a: (u32, u64), b: (u32, u64)| if a.1 != b.1 { a.1 < b.1 } else { a.0 != b.0 && users.less(a.0, b.0) };
-        let all = || links.iter().flatten();
+        let all = || links.iter().flat_map(|links| links.iter());
         // The entries of the link a few on are asked for as each link is taken: the links
         // come in no order.
         let ahead = |up: &[u32], names: &[(u32, u64)], next: Option<&LinkRec>| {
@@ -216,26 +225,54 @@ pub struct Scratch {
     kept_long: Vec<EvL>,
 }
 
-/// Slots per row, rounded up to a power of two: the table ends a quarter full or less.
-const ROOM: usize = 4;
+/// How a list's dedup table is sized and read (`SS_DEDUP_ROOM`, `SS_DEDUP_AHEAD`), read once
+/// a run.
+#[derive(Clone, Copy)]
+struct DedupKnobs {
+    /// Slots per row, rounded up to a power of two: with 4 the table ends a quarter full or
+    /// less (512 KB of `u32` for a list of 18,000 rows); with 2 it is half that, between a
+    /// quarter and half full, for a core whose 1 MB L2 two threads share.
+    room: usize,
+    /// Rows a list's loop asks for the table slot of ahead of the row it is at (0: none): a
+    /// list's rows hash to slots in no order, and the probe's load is the hottest line of the
+    /// dedup stage. On the x86 box neither 16 ahead nor a room of 2 moved the stage (20M
+    /// events, alone and with two workers a core); they are here for the scorer's machine.
+    ahead: usize,
+}
+
+impl DedupKnobs {
+    fn from_env() -> DedupKnobs {
+        DedupKnobs { room: types::env::number("SS_DEDUP_ROOM", 4).next_power_of_two().max(1), ahead: types::env::number("SS_DEDUP_AHEAD", 0) }
+    }
+}
 
 /// List `list` of every worker deduplicated into `kept`: one record per `event_id`, the copy
 /// with the smallest `ingest`. `bits` are the hash bits that chose the list.
-fn dedup<'p, R: Row + 'p>(lists: impl Iterator<Item = &'p Chunks<R>> + Clone, list: usize, bits: u32, table: &mut Vec<u32>, kept: &mut Vec<R>) {
+fn dedup<'p, R: Row + 'p>(lists: impl Iterator<Item = &'p Chunks<R>> + Clone, list: usize, bits: u32, knobs: DedupKnobs, table: &mut Vec<u32>, kept: &mut Vec<R>) {
     kept.clear();
     let rows: usize = lists.clone().map(|chunks| chunks.len_of(list)).sum();
     if rows == 0 {
         return;
     }
-    let slot_bits = (ROOM * rows).next_power_of_two().max(1024).trailing_zeros();
+    let slot_bits = (knobs.room * rows).next_power_of_two().max(1024).trailing_zeros();
     assert!(bits + slot_bits <= 64 && rows < u32::MAX as usize);
     let (shift, mask) = (64 - bits - slot_bits, (1usize << slot_bits) - 1);
     table.clear();
     table.resize(mask + 1, 0);
     kept.reserve(rows);
+    let ahead = knobs.ahead;
     for chunks in lists {
         chunks.for_each(list, |piece| {
-            for row in piece {
+            let slots = table.as_ptr();
+            for row in piece.iter().take(ahead) {
+                types::mem::prefetch(slots.wrapping_add((row.slot() >> shift) as usize & mask));
+            }
+            for (index, row) in piece.iter().enumerate() {
+                if ahead != 0
+                    && let Some(coming) = piece.get(index + ahead)
+                {
+                    types::mem::prefetch(slots.wrapping_add((coming.slot() >> shift) as usize & mask));
+                }
                 let mut at = (row.slot() >> shift) as usize & mask;
                 loop {
                     // SAFETY: `at` is at most `mask`, and the table has `mask + 1` slots.
@@ -405,6 +442,21 @@ impl Names {
             }
         }
     }
+
+    /// Slot `free-early`: piece `piece` of `pieces` of the directory and the persons' arrays
+    /// back to the kernel, on as many threads, instead of at exit on one (about 130 MB at 20M
+    /// events).
+    ///
+    /// # Safety
+    /// Every name has been read: nothing calls `texts` afterwards.
+    pub unsafe fn release(&self, piece: usize, pieces: usize) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            self.plan.users.release(piece, pieces);
+            self.persons.up.release(piece, pieces);
+            self.persons.names.release(piece, pieces);
+        }
+    }
 }
 
 /// Names `Names::texts` reads together.
@@ -442,8 +494,17 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
                 std::hint::spin_loop();
             }
             types::tl::mark("links read");
-            let read: Vec<Vec<LinkRec>> = links.iter().map(|read| read.get().cloned().unwrap_or_default()).collect();
+            // Borrowed, not copied: a copy was 21 MB of fresh memory at 20M events.
+            let read: Vec<&[LinkRec]> = links.iter().map(|read| read.get().map_or(&[][..], Vec::as_slice)).collect();
             drop(persons.set(Persons::new(&plan.users, &read)));
+            // Slot `free-early`: the links are dead once joined (only their counts are read
+            // again); left mapped, one thread unmaps them at exit.
+            if types::mem::free_part("links") {
+                for links in &read {
+                    // SAFETY: a vector's own elements; nothing reads them again.
+                    unsafe { types::mem::release(links.as_ptr().cast(), size_of_val(*links)) };
+                }
+            }
             types::tl::mark("links named");
         } else {
             ingest.opaque_parse(ctx, &plan, task - link_tasks - 1, out);
@@ -489,7 +550,7 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
         },
     });
     {
-        let (parsed, persons) = (&parsed[..], &persons);
+        let (parsed, persons, knobs) = (&parsed[..], &persons, DedupKnobs::from_env());
         // The clicks' tasks are taken first: each is a worker's whole list, as long as
         // hundreds of the lists' tasks, and taken last they were what the round ended on,
         // one thread at the longest while seven had nothing left (up to 7 ms of 120 at 20M
@@ -500,19 +561,19 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
             let Scattered { events, clicks, opaque: Scratch { table, kept, kept_long }, dense: ranges, .. } = mine;
             if let (Some(ranges), Some((shift, _))) = (ranges, dense) {
                 if task < parts {
-                    dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, table, kept);
+                    dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, knobs, table, kept);
                     scatter_dense(kept, persons, shift, ranges);
                 } else if task < parts + long_parts {
-                    dedup(parsed.iter().map(|out| &out.long_events), task - parts, plan.long_bits, table, kept_long);
+                    dedup(parsed.iter().map(|out| &out.long_events), task - parts, plan.long_bits, knobs, table, kept_long);
                     scatter_dense(kept_long, persons, shift, ranges);
                 } else {
                     scatter_clicks_dense(&parsed[task - parts - long_parts], persons, shift, ranges);
                 }
             } else if task < parts {
-                dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, table, kept);
+                dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, knobs, table, kept);
                 if events.combining() { scatter::<_, Combine>(kept, persons, ctx.bucket_bits, events) } else { scatter::<_, Plain>(kept, persons, ctx.bucket_bits, events) }
             } else if task < parts + long_parts {
-                dedup(parsed.iter().map(|out| &out.long_events), task - parts, plan.long_bits, table, kept_long);
+                dedup(parsed.iter().map(|out| &out.long_events), task - parts, plan.long_bits, knobs, table, kept_long);
                 if events.combining() { scatter::<_, Combine>(kept_long, persons, ctx.bucket_bits, events) } else { scatter::<_, Plain>(kept_long, persons, ctx.bucket_bits, events) }
             } else {
                 let from = &parsed[task - parts - long_parts];
@@ -523,6 +584,9 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     lap("dedup");
     if types::mem::free_early() {
         par::each(&mut parsed, |_, out| out.release());
+        if std::env::var_os("SS_TIMING").is_some_and(|value| value == "3") {
+            eprintln!("rss released {:>6} MB", types::mem::resident_mb().unwrap_or(0));
+        }
     }
     // The exit path skips destructors (`fast-exit`), and these are large.
     std::mem::forget(parsed);
