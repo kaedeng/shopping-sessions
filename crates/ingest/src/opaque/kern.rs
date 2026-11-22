@@ -919,10 +919,14 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                     class.add(k + 8 * BATCH).cast::<*const u8>().write(line);
                     k += 8;
                     line = end.add(1);
+                    // The directory's lines of the last eight rows' users: asked for as the
+                    // rows are decoded, a few at a time, and not a batch's 64 at once.
+                    if k & 63 == 0 {
+                        ask_rows(batch, k / 8 - 8, k / 8, plan);
+                    }
                     if k == 8 * BATCH {
                         (*batch).count = BATCH;
                         (*batch).line[BATCH] = line;
-                        ask(&*batch, plan);
                         batch = other(pair, batch);
                         finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
                         (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
@@ -936,7 +940,7 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 if k != 0 {
                     (*batch).count = k / 8;
                     (*batch).line[k / 8] = line;
-                    ask(&*batch, plan);
+                    ask_rows(batch, (k / 8) & !7, k / 8, plan);
                     batch = other(pair, batch);
                     finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
                     (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
@@ -1040,32 +1044,108 @@ unsafe fn finish(
     }
 }
 
-/// Asks for the directory's lines of a batch's users (`Batch::count` rows).
+/// Asks for the directory's lines of the users of a batch's rows `from..to`.
+///
+/// # Safety
+/// The rows are stored, `to <= BATCH`.
 #[inline(always)]
-fn ask(batch: &Batch, plan: &Plan) {
+unsafe fn ask_rows(batch: *const Batch, from: usize, to: usize, plan: &Plan) {
     let users = &plan.users;
-    for row in 0..batch.count {
-        let class = batch.class[row];
-        if class as u32 == 0 {
-            if class & LONG_USER != 0 { users.prefetch_long(batch.rows[row][2], batch.lows[row][1]) } else { users.prefetch_short(batch.rows[row][2] + 1) }
+    // SAFETY: the caller's contract.
+    unsafe {
+        for row in from..to {
+            let class = *(*batch).class.get_unchecked(row);
+            if class as u32 == 0 {
+                let user = (*batch).rows.get_unchecked(row)[2];
+                if class & LONG_USER != 0 { users.prefetch_long(user, (*batch).lows.get_unchecked(row)[1]) } else { users.prefetch_short(user + 1) }
+            }
         }
     }
 }
 
-/// The users' numbers of a batch's first `rows` rows, into `Batch::users`.
+/// The first `rows` rows of a batch in two lists, by the table their user is in: the rows'
+/// numbers at `short` and at `long`, and how many each got. A row for the row code is in
+/// neither.
+///
+/// Eight rows a step, by masks: which table a row's user is in is a coin's toss weighted one
+/// in eight, and row by row a jump on it was guessed wrong about that often, where the
+/// lines are asked for and again where they are read. A list is walked in a loop of its
+/// own instead.
+///
+/// # Safety
+/// `short` and `long` have room for `BATCH + 8` numbers each.
+#[inline(always)]
+unsafe fn split(batch: &Batch, rows: usize, short: *mut u64, long: *mut u64) -> (usize, usize) {
+    let rows = rows.min(BATCH);
+    // SAFETY: register arithmetic, loads of eight classes that begin below `BATCH` at a
+    // multiple of 8, and stores of eight numbers into a list at its length, which is at
+    // most the rows before the step's (56 at the most).
+    unsafe {
+        let all = |value: i64| _mm512_set1_epi64(value);
+        let (mut shorts, mut longs) = (0usize, 0usize);
+        let mut number = _mm512_setr_epi64(0, 1, 2, 3, 4, 5, 6, 7);
+        let mut first = 0;
+        while first < rows {
+            let live: __mmask8 = if rows - first >= 8 { 0xFF } else { (1u8 << (rows - first)) - 1 };
+            let class = _mm512_loadu_si512(batch.class.as_ptr().add(first).cast());
+            let taken = live & _mm512_testn_epi64_mask(class, all(0xFFFF_FFFF));
+            let wide = _mm512_test_epi64_mask(class, all(LONG_USER as i64));
+            // Compressed in a register and stored whole, as in `finish`: the lanes past the
+            // rows of a kind are overwritten by the next store.
+            _mm512_storeu_si512(short.add(shorts).cast(), _mm512_maskz_compress_epi64(taken & !wide, number));
+            _mm512_storeu_si512(long.add(longs).cast(), _mm512_maskz_compress_epi64(taken & wide, number));
+            shorts += (taken & !wide).count_ones() as usize;
+            longs += (taken & wide).count_ones() as usize;
+            number = _mm512_add_epi64(number, all(8));
+            first += 8;
+        }
+        (shorts, longs)
+    }
+}
+
+/// Asks for the directory's lines of a batch's users (`Batch::count` rows).
+#[inline(always)]
+fn ask(batch: &Batch, plan: &Plan) {
+    let users = &plan.users;
+    let (mut short, mut long) = (std::mem::MaybeUninit::<[u64; BATCH + 8]>::uninit(), std::mem::MaybeUninit::<[u64; BATCH + 8]>::uninit());
+    let (short, long) = (short.as_mut_ptr().cast::<u64>(), long.as_mut_ptr().cast::<u64>());
+    // SAFETY: the lists have `BATCH + 8` numbers' room, and `split` wrote the first `shorts`
+    // and `longs` of them: rows of the batch.
+    unsafe {
+        let (shorts, longs) = split(batch, batch.count, short, long);
+        for at in 0..shorts {
+            let row = *short.add(at) as usize;
+            users.prefetch_short(batch.rows.get_unchecked(row)[2] + 1);
+        }
+        for at in 0..longs {
+            let row = *long.add(at) as usize;
+            users.prefetch_long(batch.rows.get_unchecked(row)[2], batch.lows.get_unchecked(row)[1]);
+        }
+    }
+}
+
+/// The users' numbers of a batch's first `rows` rows, into `Batch::users`: the rows by
+/// their user's table first (`split`), then a loop a table.
 #[inline(always)]
 fn look(batch: &mut Batch, rows: usize, plan: &Plan) {
     let users = &plan.users;
-    for row in 0..rows {
-        let class = batch.class[row];
-        // A row for the row code has no user here: its bytes are read again.
-        batch.users[row] = if class as u32 != 0 {
-            NO_USER
-        } else if class & LONG_USER != 0 {
-            users.long(batch.rows[row][2], batch.lows[row][1])
-        } else {
-            users.short(batch.rows[row][2] + 1)
-        };
+    let rows = rows.min(BATCH);
+    let (mut short, mut long) = (std::mem::MaybeUninit::<[u64; BATCH + 8]>::uninit(), std::mem::MaybeUninit::<[u64; BATCH + 8]>::uninit());
+    let (short, long) = (short.as_mut_ptr().cast::<u64>(), long.as_mut_ptr().cast::<u64>());
+    // SAFETY: as `ask`; a list's numbers are rows below `rows`.
+    unsafe {
+        let (shorts, longs) = split(batch, rows, short, long);
+        // A row for the row code is in neither list and has no user here: its bytes are
+        // read again.
+        batch.users[..rows].fill(NO_USER);
+        for at in 0..shorts {
+            let row = *short.add(at) as usize;
+            *batch.users.get_unchecked_mut(row) = users.short(batch.rows.get_unchecked(row)[2] + 1);
+        }
+        for at in 0..longs {
+            let row = *long.add(at) as usize;
+            *batch.users.get_unchecked_mut(row) = users.long(batch.rows.get_unchecked(row)[2], batch.lows.get_unchecked(row)[1]);
+        }
     }
 }
 

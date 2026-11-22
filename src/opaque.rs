@@ -218,6 +218,8 @@ pub struct Scratch {
 
 /// Slots per row, rounded up to a power of two: the table ends a quarter full or less.
 const ROOM: usize = 4;
+/// Rows `dedup` asks for the slot of ahead of the row it is at.
+const AHEAD_SLOTS: usize = 8;
 
 /// List `list` of every worker deduplicated into `kept`: one record per `event_id`, the copy
 /// with the smallest `ingest`. `bits` are the hash bits that chose the list.
@@ -235,7 +237,12 @@ fn dedup<'p, R: Row + 'p>(lists: impl Iterator<Item = &'p Chunks<R>> + Clone, li
     kept.reserve(rows);
     for chunks in lists {
         chunks.for_each(list, |piece| {
-            for row in piece {
+            for (number, row) in piece.iter().enumerate() {
+                // The slot of the row a few on: at 60M events a list's table is half a
+                // megabyte and its kept rows more, past L2 together.
+                if let Some(coming) = piece.get(number + AHEAD_SLOTS) {
+                    types::mem::prefetch(table.as_ptr().wrapping_add((coming.slot() >> shift) as usize & mask));
+                }
                 let mut at = (row.slot() >> shift) as usize & mask;
                 loop {
                     // SAFETY: `at` is at most `mask`, and the table has `mask + 1` slots.

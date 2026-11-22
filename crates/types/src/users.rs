@@ -9,7 +9,8 @@
 //!
 //! Two tables, both open addressing with linear probes, filled by all workers at once:
 //!
-//! - `short`: two words a slot, the key and the user's number. The key of an ID spelled the
+//! - `short`: two words a slot, the key and the user's number, probed a cache line of four
+//!   slots at a time (`Users::short`). The key of an ID spelled the
 //!   short way is its digits (`short_key`); any other ID that is not spelled the long way
 //!   goes through the intern tables (`id::intern_any`) and its key is that `Id`, top bit set.
 //!   A slot is claimed by one compare-and-swap of the key, and then given its number.
@@ -41,6 +42,9 @@ const PROBES: usize = 1 << 10;
 /// A long slot being filled.
 const BUSY: u64 = 1;
 const ZEROS: u64 = 0x3030_3030_3030_3030;
+
+/// Short slots a cache line: a lookup compares a line's keys at once.
+const LINE: usize = 4;
 
 /// Numbers a thread takes from the counter at a time.
 const BLOCK: u32 = 1 << 10;
@@ -269,7 +273,7 @@ impl Users {
     /// Asks for the cache line a short key's lookup begins at.
     #[inline(always)]
     pub fn prefetch_short(&self, key: u64) {
-        crate::mem::prefetch(self.short.as_ptr().wrapping_add((mix(key) >> self.short_shift) as usize));
+        crate::mem::prefetch(self.short.as_ptr().wrapping_add((mix(key) >> self.short_shift) as usize & !(LINE - 1)));
     }
 
     /// Asks for the cache line a long key's lookup begins at.
@@ -284,28 +288,67 @@ impl Users {
     pub fn short(&self, key: u64) -> u32 {
         debug_assert!(key != 0);
         let mask = self.short.len() - 1;
-        let mut at = (mix(key) >> self.short_shift) as usize;
-        for _ in 0..PROBES {
-            // SAFETY: `at` is masked to the table.
-            let slot = unsafe { self.short.get_unchecked(at & mask) };
-            let held = slot[0].load(Relaxed);
-            if held == key {
-                return Self::numbered(&slot[1]);
-            }
-            if held == 0 {
-                match slot[0].compare_exchange(0, key, Relaxed, Relaxed) {
+        // A line of four slots at a time, from the key's own: its keys are compared at once,
+        // so another user's key in the way costs no wrong guess (slot by slot, in a table a
+        // third full, one lookup in six met one before its own, and the jump on "is this
+        // slot's key mine" was a quarter of the parse's wrong guesses). A key goes into the
+        // first empty slot of the first line that has one, and no key ever leaves: a lookup
+        // that meets an empty slot has seen every place its key could be.
+        let mut at = (mix(key) >> self.short_shift) as usize & !(LINE - 1);
+        for _ in 0..PROBES / LINE {
+            // SAFETY: `at` is masked to the table, whose slots are a multiple of `LINE`: the
+            // line's eight words, a key and a number in turn.
+            let line = unsafe { std::slice::from_raw_parts(self.short.as_ptr().add(at & mask).cast::<AtomicU64>(), 2 * LINE) };
+            loop {
+                // Bit `2 * n` for slot `n`.
+                let hit = Self::keys(line, key);
+                if hit != 0 {
+                    return Self::numbered(&line[(hit.trailing_zeros() as usize + 1) & (2 * LINE - 1)]);
+                }
+                let empty = Self::keys(line, 0);
+                if empty == 0 {
+                    break;
+                }
+                let word = empty.trailing_zeros() as usize & (2 * LINE - 2);
+                match line[word].compare_exchange(0, key, Relaxed, Relaxed) {
                     Ok(_) => {
-                        let number = self.number(at & mask);
-                        slot[1].store(u64::from(number) + 1, Release);
+                        let number = self.number((at & mask) + word / 2);
+                        line[word + 1].store(u64::from(number) + 1, Release);
                         return number;
                     }
-                    Err(other) if other == key => return Self::numbered(&slot[1]),
+                    Err(other) if other == key => return Self::numbered(&line[word + 1]),
+                    // Another key took the slot this instant: the line again.
                     Err(_) => {}
                 }
             }
-            at += 1;
+            at += LINE;
         }
         self.overflow()
+    }
+
+    /// Which of a line's four keys (its even words) are `key`: bit `2 * n` for slot `n`.
+    #[inline(always)]
+    fn keys(line: &[AtomicU64], key: u64) -> u32 {
+        debug_assert!(line.len() == 2 * LINE);
+        // The line's 64 bytes in one register (the table is aligned far above a line, and a
+        // line begins at a multiple of four slots).
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        // SAFETY: eight words are 64 readable bytes. Other threads store into them
+        // meanwhile, a word at a time, and an aligned word is read whole: each key read
+        // here is zero or a key some thread put there, as a relaxed load of it would be.
+        unsafe {
+            use core::arch::x86_64::*;
+            let slots = _mm512_load_si512(line.as_ptr().cast());
+            u32::from(_mm512_cmpeq_epi64_mask(slots, _mm512_set1_epi64(key as i64)) & 0x55)
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+        {
+            let mut hit = 0u32;
+            for slot in 0..LINE {
+                hit |= u32::from(line[2 * slot].load(Relaxed) == key) << (2 * slot);
+            }
+            hit
+        }
     }
 
     /// The number in a claimed slot's last word, waited for while the claiming thread is
