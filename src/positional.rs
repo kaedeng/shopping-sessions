@@ -29,7 +29,7 @@ use ingest::pos::{Link, PosOut, PosPlan};
 use sessions::{Agg, Click};
 use types::hash::person_hash;
 use types::par;
-use types::pos::{POS_ODD_USER, POS_VALID, PosEvent};
+use types::pos::{POS_ODD_USER, POS_VALID, PosEvent, click_key_id};
 use types::record::{ClickRec, PAY_CATEGORY_SHIFT, PAY_PRICE_MASK, PersonEvent, VALID};
 use types::rows::NO_CATEGORY;
 use types::rows::UserDaily;
@@ -534,6 +534,11 @@ pub fn run(
     for extra in &extras {
         flags[extra.person as usize] |= EXTRA;
     }
+    // A click of a numbered user whose `click_id` is spelled another way is not among the
+    // person's grouped clicks: the person takes the classic lane, where it meets them.
+    for click in parsed.iter().flat_map(|out| &out.odd_id_clicks) {
+        flags[(click.u >> ALIAS_BITS) as usize] |= UNFIT;
+    }
     let (click_aliases_at, flags_at) = (Shared(click_aliases.as_mut_ptr()), Shared(flags.as_mut_ptr()));
     let grouped = Grouped::new(plan, &parsed);
     let ends_at = grouped.ends;
@@ -563,6 +568,7 @@ pub fn run(
     let mut slow_clicks: Vec<ClickRec> = Vec::new();
     for out in &parsed {
         slow_clicks.extend(out.odd_clicks.iter().map(|click| ClickRec { user: links.general.person(click.user), ..*click }));
+        slow_clicks.extend(out.odd_id_clicks.iter().map(|click| ClickRec { user: links.person(click.u), click: click.click, ts: click.ts, campaign: click.campaign }));
     }
     lap("clicks");
 
@@ -1150,7 +1156,7 @@ fn fused_stages(shared: &Fused, works: &mut Vec<Work>, slow_events: &mut Vec<Per
                     // SAFETY: an unfit person's clicks are read here only, and written nowhere.
                     let (click, alias) = unsafe { (*group.clicks.0.add(i), *group.aliases.0.add(i)) };
                     let u = (person as u32) << ALIAS_BITS | u32::from(alias);
-                    work.slow_clicks.push(ClickRec { user: shared.links.person(u), click: click.id, ts: click.ts, campaign: click.campaign });
+                    work.slow_clicks.push(ClickRec { user: shared.links.person(u), click: click_key_id(click.id), ts: click.ts, campaign: click.campaign });
                 }
             }
         }
@@ -1343,7 +1349,7 @@ fn split_stages(
                         // SAFETY: an unfit person's clicks are read here only, and written nowhere.
                         let (click, alias) = unsafe { (*grouped.clicks.0.add(i), *grouped.aliases.0.add(i)) };
                         let u = (person as u32) << ALIAS_BITS | u32::from(alias);
-                        work.slow_clicks.push(ClickRec { user: links.person(u), click: click.id, ts: click.ts, campaign: click.campaign });
+                        work.slow_clicks.push(ClickRec { user: links.person(u), click: click_key_id(click.id), ts: click.ts, campaign: click.campaign });
                     }
                 }
             }
@@ -1590,14 +1596,14 @@ unsafe fn group_clicks_wide(
         masks.resize(persons, 0);
         over.clear();
         over.resize(persons, 0);
-        for piece in parsed[worker].clicks.pieces(range) {
+        parsed[worker].clicks.for_each(range, |piece| {
             for click in piece {
                 let (local, alias) = ((click.u() >> ALIAS_BITS) as usize - first, click.u() & ALIAS_MASK);
                 counts[local] += 1;
                 masks[local] |= 1 << (alias & (MASK_ALIASES - 1));
                 over[local] |= u8::from(alias >= MASK_ALIASES);
             }
-        }
+        });
     });
     // SAFETY: the caller's contract; the three arrays hold `plan.persons` entries.
     let (click_aliases, flags, ends) = unsafe {
@@ -1625,19 +1631,19 @@ unsafe fn group_clicks_wide(
         // The wrappers whole, not their pointers: those are what may cross threads.
         let (click_room, alias_room) = (click_room, alias_room);
         let counts = &mut work.share.counts;
-        for piece in parsed[worker].clicks.pieces(range) {
+        parsed[worker].clicks.for_each(range, |piece| {
             for click in piece {
                 let at = &mut counts[(click.u() >> ALIAS_BITS) as usize - first];
                 // SAFETY: a worker's positions for a person are its own stretch of the
                 // person's, by the counts of these same clicks: all workers' together are a
                 // permutation of the range's positions, inside the reserved room.
                 unsafe {
-                    click_room.0.add(*at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.click });
+                    click_room.0.add(*at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.key() });
                     alias_room.0.add(*at as usize).write((click.u() & ALIAS_MASK) as u16);
                 }
                 *at += 1;
             }
-        }
+        });
     });
 }
 
@@ -1804,7 +1810,7 @@ unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_al
         )
     };
     for out in parsed {
-        for piece in out.clicks.pieces(range) {
+        out.clicks.for_each(range, |piece| {
             for click in piece {
                 let (local, alias) = ((click.u() >> ALIAS_BITS) as usize - first, click.u() & ALIAS_MASK);
                 ends[local] += 1;
@@ -1813,7 +1819,7 @@ unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_al
                     flags[local] |= UNFIT;
                 }
             }
-        }
+        });
     }
     // Each person's first position; the scatter moves it to one past the last.
     let mut at = grouped.bases[range];
@@ -1823,17 +1829,17 @@ unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_al
     debug_assert_eq!(at, grouped.bases[range + 1]);
     let (click_room, alias_room) = (grouped.clicks.0, grouped.aliases.0);
     for out in parsed {
-        for piece in out.clicks.pieces(range) {
+        out.clicks.for_each(range, |piece| {
             for click in piece {
                 let at = &mut ends[(click.u() >> ALIAS_BITS) as usize - first];
                 // SAFETY: the counts above are of these same clicks, so the positions are a
                 // permutation of the range's, inside the room reserved for all the clicks.
                 unsafe {
-                    click_room.add(*at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.click });
+                    click_room.add(*at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.key() });
                     alias_room.add(*at as usize).write((click.u() & ALIAS_MASK) as u16);
                 }
                 *at += 1;
             }
-        }
+        });
     }
 }

@@ -85,28 +85,88 @@ pub struct PosPay {
     pub pay: u32,
 }
 
-/// One valid click whose `user_id` decodes to a number inside the dense arrays, in the list of
-/// its person's range. 24 bytes, as three words (see `PosEvent`).
+/// One valid click of a numbered user whose `click_id` has no key (`click_key_at`): the click
+/// as the classic lane takes it, with the user's number.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OddIdClick {
+    /// `person << 9 | alias`.
+    pub u: u32,
+    pub click: Id,
+    pub ts: u32,
+    pub campaign: u32,
+}
+
+/// Bits of a click's key (`click_key_at`); the campaign's index is above them.
+pub const CLICK_KEY_BITS: u32 = 52;
+/// Campaigns a `PosClick` can name.
+pub const CLICK_CAMPAIGNS: usize = 1 << (64 - CLICK_KEY_BITS);
+
+/// One valid click whose `user_id` decodes to a number inside the dense arrays and whose
+/// `click_id` has a key, in the list of its person's range. 16 bytes, as two words (see
+/// `PosEvent`).
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 #[repr(C)]
 pub struct PosClick {
-    /// `click_id`, for the tie-break among clicks of one `ts`.
-    pub click: Id,
     /// `u | ts << 32`.
     low: u64,
-    campaign: u64,
+    /// `key | campaign << CLICK_KEY_BITS`: the `click_id`'s key, for the tie-break among
+    /// clicks of one `ts`.
+    rest: u64,
+}
+
+/// The key of a `click_id` spelled as the generator spells one: `k`, then 1 to 8 of `0-9a-z`
+/// without a leading zero. The digits six bits each, the first highest, shorter IDs filled
+/// with zeros below, then the number of digits in the low four bits: two keys compare as
+/// their IDs' bytes do. `None` for any other spelling.
+///
+/// # Safety
+/// `len` bytes readable at `p`.
+#[inline]
+pub unsafe fn click_key_at(p: *const u8, len: usize) -> Option<u64> {
+    if !(2..=9).contains(&len) || unsafe { *p } != b'k' {
+        return None;
+    }
+    let digits = len - 1;
+    let mut sextets = 0u64;
+    for at in 0..digits {
+        let value = match unsafe { *p.add(1 + at) } {
+            byte @ b'0'..=b'9' => byte - b'0',
+            byte @ b'a'..=b'z' => byte - b'a' + 10,
+            _ => return None,
+        };
+        sextets |= u64::from(value) << (6 * (7 - at));
+    }
+    if digits > 1 && sextets >> 42 == 0 {
+        return None;
+    }
+    Some(sextets << 4 | digits as u64)
+}
+
+/// The `click_id` a key stands for, packed (`types::id`).
+pub fn click_key_id(key: u64) -> Id {
+    let (digits, sextets) = ((key & 15) as usize, key >> 4);
+    let mut text = vec![b'k'];
+    text.extend((0..digits).map(|at| b"0123456789abcdefghijklmnopqrstuvwxyz"[(sextets >> (6 * (7 - at)) & 63) as usize]));
+    crate::id::pack(&text)
 }
 
 impl PosClick {
+    /// `campaign` is below `CLICK_CAMPAIGNS`.
     #[inline(always)]
-    pub fn new(click: Id, u: u32, ts: u32, campaign: u32) -> PosClick {
-        PosClick { click, low: u64::from(u) | u64::from(ts) << 32, campaign: u64::from(campaign) }
+    pub fn new(key: u64, u: u32, ts: u32, campaign: u32) -> PosClick {
+        PosClick { low: u64::from(u) | u64::from(ts) << 32, rest: key | u64::from(campaign) << CLICK_KEY_BITS }
     }
 
-    /// A click from its three words: `click`, `u | ts << 32`, the campaign's index.
+    /// A click from its two words: `u | ts << 32`, `key | campaign << CLICK_KEY_BITS`.
     #[inline(always)]
-    pub fn from_words(click: Id, low: u64, campaign: u64) -> PosClick {
-        PosClick { click, low, campaign }
+    pub fn from_words(low: u64, rest: u64) -> PosClick {
+        PosClick { low, rest }
+    }
+
+    /// The `click_id`'s key (`click_key_at`).
+    #[inline(always)]
+    pub fn key(&self) -> u64 {
+        self.rest & ((1 << CLICK_KEY_BITS) - 1)
     }
 
     #[inline(always)]
@@ -121,8 +181,29 @@ impl PosClick {
 
     #[inline(always)]
     pub fn campaign(&self) -> u32 {
-        self.campaign as u32
+        (self.rest >> CLICK_KEY_BITS) as u32
     }
 }
 
-const _: () = assert!(size_of::<PosEvent>() == 16 && size_of::<PosPay>() == 12 && size_of::<PosClick>() == 24);
+const _: () = assert!(size_of::<PosEvent>() == 16 && size_of::<PosPay>() == 12 && size_of::<PosClick>() == 16);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn click_keys_order_as_the_ids_bytes() {
+        let ids: [&[u8]; 14] = [b"k0", b"k1", b"k10", b"k100", b"k1z", b"k2", b"k9", b"ka", b"ka0", b"kz", b"kzzzzzzzz", b"k10000000", b"kb1ni90tn", b"kc1ni90tn"];
+        let key = |id: &[u8]| unsafe { click_key_at(id.as_ptr(), id.len()) }.unwrap();
+        for a in ids {
+            assert_eq!(click_key_id(key(a)), crate::id::pack(a), "{:?}", std::str::from_utf8(a));
+            assert!(key(a) < 1 << CLICK_KEY_BITS);
+            for b in ids {
+                assert_eq!(key(a).cmp(&key(b)), a.cmp(b), "{:?} and {:?}", std::str::from_utf8(a), std::str::from_utf8(b));
+            }
+        }
+        for bad in [&b""[..], b"k", b"K1", b"k01", b"k00", b"kA", b"k1 ", b"u1", b"k123456789", b"k1\r", b"k\xffz", b"k1_"] {
+            assert_eq!(unsafe { click_key_at(bad.as_ptr(), bad.len()) }, None, "{:?}", std::str::from_utf8(bad));
+        }
+    }
+}

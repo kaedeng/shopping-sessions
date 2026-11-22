@@ -368,14 +368,13 @@ pub fn open(data: &Path, workers: usize, positional: Option<bool>, keep_open: bo
         // The worker's lists, as soon as the estimates say how large; then, while the round
         // still waits for the keys or the lookups, their pages (`PosOut::touch`).
         #[cfg(feature = "pipe-positional")]
-        if let Some((shape, event_rows)) = shape.wait() {
+        if let Some((shape, _)) = shape.wait() {
             let (events, pays) = pos::event_lists(workers, shape, scatter);
             let click_rows = folders[1].wait().as_ref().map_or(0, |folder| folder.rows);
-            let clicks = pos::click_lists(workers, shape, *event_rows, click_rows, scatter);
+            let clicks = pos::click_lists(workers, shape, click_rows);
             let out = _out.insert(pos::PosOut::new(events, pays, clicks, chunk));
             types::tl::mark("lists");
-            let click_lists = pos::lists_in_use(shape, *event_rows) * 5 / 4 + 1;
-            out.touch(click_lists, &|| keys.0.get().is_some() && base.0.get().is_some() && table.0.get().is_some() && folders[2].0.get().is_some());
+            out.touch(&|| keys.0.get().is_some() && base.0.get().is_some() && table.0.get().is_some() && folders[2].0.get().is_some());
             types::tl::mark("touched");
         }
     });

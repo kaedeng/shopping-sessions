@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use types::chunks::Chunks;
 use types::id::pack_at;
 use types::parts::{Combine, Mode, Parts, Plain};
-use types::pos::{POS_ODD_USER, POS_VALID, PosClick, PosEvent, PosPay};
+use types::pos::{CLICK_CAMPAIGNS, OddIdClick, POS_ODD_USER, POS_VALID, PosClick, PosEvent, PosPay, click_key_at};
 use types::record::{ClickRec, EventRec, PAY_CATEGORY_SHIFT, VALID};
 use types::scramble::{self, ALIAS_BITS};
 use types::time::DAY;
@@ -102,21 +102,17 @@ pub(crate) fn event_lists(workers: usize, shape: &PosShape, scatter: Option<usiz
 
 /// A worker's lists for the click lines (`PosOut::clicks`), for about `event_rows` event
 /// lines and `click_rows` click lines.
-pub(crate) fn click_lists(workers: usize, shape: &PosShape, event_rows: usize, click_rows: usize, scatter: Option<usize>) -> Parts<PosClick> {
-    let click_room = click_rows / workers / lists_in_use(shape, event_rows) * 5 / 4 + 64;
-    Parts::new(shape.click_parts, click_room, scatter)
-}
-
-/// The click lists expected to get clicks: the persons in use are about a 30th of the events,
-/// far fewer than the lists allow, and they are numbered from 0.
-pub(crate) fn lists_in_use(shape: &PosShape, event_rows: usize) -> usize {
-    ((event_rows / 30) >> shape.click_shift).max(1)
+pub(crate) fn click_lists(workers: usize, shape: &PosShape, click_rows: usize) -> Chunks<PosClick> {
+    // As the events' block (`event_lists`): four times a worker's share of the lines, a chunk
+    // a list and a huge page more.
+    let bytes = (click_rows + click_rows / 8) * size_of::<PosClick>() * 4 / workers.max(4) + shape.click_parts * 4096 + (2 << 20);
+    Chunks::new(shape.click_parts, bytes)
 }
 
 impl PosOut {
     /// A worker's buffers for the positional parse: its lists, and room to read a chunk of
     /// `chunk` bytes into.
-    pub(crate) fn new(events: Chunks<PosEvent>, pays: Parts<PosPay>, clicks: Parts<PosClick>, chunk: usize) -> PosOut {
+    pub(crate) fn new(events: Chunks<PosEvent>, pays: Parts<PosPay>, clicks: Chunks<PosClick>, chunk: usize) -> PosOut {
         PosOut {
             events,
             pays,
@@ -124,6 +120,7 @@ impl PosOut {
             odd_events: Vec::new(),
             odd_users: Vec::new(),
             odd_clicks: Vec::new(),
+            odd_id_clicks: Vec::new(),
             scratch: Scratch::new(),
             // What `Ingest::read` takes for a chunk: untouched until read into, or `touch`.
             input: vec![0; crate::READ_ROOM + chunk + crate::READ_SLACK + 1 + crate::PAD],
@@ -133,9 +130,8 @@ impl PosOut {
     }
 
     /// Has the kernel back the buffers now, until `stop` says so (`Parts::touch`): the chunk
-    /// buffer, the event lists, and the first `click_lists` click lists, those of the persons
-    /// expected (`lists_in_use`).
-    pub(crate) fn touch(&mut self, click_lists: usize, stop: &impl Fn() -> bool) {
+    /// buffer and a fair share of the events' and the clicks' blocks.
+    pub(crate) fn touch(&mut self, stop: &impl Fn() -> bool) {
         for page in self.input.chunks_mut(4096) {
             if stop() {
                 return;
@@ -144,7 +140,7 @@ impl PosOut {
         }
         // A fair share of the rows: a quarter of the block (`event_lists`).
         self.events.touch(self.events.capacity() / 4, stop);
-        self.clicks.touch(click_lists, stop);
+        self.clicks.touch(self.clicks.capacity() / 4, stop);
         self.pays.touch(usize::MAX, stop);
     }
 }
@@ -216,14 +212,18 @@ pub struct PosOut {
     pub events: Chunks<PosEvent>,
     /// The same lists: the `pay` of each valid purchase among them.
     pub pays: Parts<PosPay>,
-    /// List `person >> click_shift`: valid clicks whose `user_id` is a number.
-    pub clicks: Parts<PosClick>,
+    /// List `person >> click_shift`: valid clicks whose `user_id` is a number and whose
+    /// `click_id` has a key (`types::pos::click_key_at`).
+    pub clicks: Chunks<PosClick>,
     /// Every other well-formed event line with an `event_id`, as the classic record.
     pub odd_events: Vec<EventRec>,
     /// The `user_id` of each `PosEvent` flagged `POS_ODD_USER`, at its `u`.
     pub odd_users: Vec<Id>,
-    /// Every other valid click, as the classic record (`user` as read).
+    /// Every other valid click whose `user_id` is not such a number, as the classic record
+    /// (`user` as read).
     pub odd_clicks: Vec<ClickRec>,
+    /// The valid clicks of numbered users whose `click_id` has no key.
+    pub odd_id_clicks: Vec<OddIdClick>,
     scratch: Scratch,
     /// The chunk being parsed, when it is read and not mapped (`Ingest::read`), and the file
     /// it was read from, kept open for the next.
@@ -283,78 +283,45 @@ fn links_with<T: Tok>(ingest: &Ingest) -> Vec<Link> {
     links
 }
 
-/// The campaign IDs of at most 8 bytes by their bytes, for the fused click parse: a multiply
-/// and a probe, where the row code packs the ID (`pack_at`) and hashes it. An ID's bytes are a
-/// word with zeros after them and its length, so equal entries are equal IDs whatever the
-/// bytes are.
+/// The campaigns named `c_` and a number of at most four digits, by that number, for the click
+/// kernel: one load, where the row code packs the ID (`pack_at`) and hashes it. Any other
+/// campaign's clicks go through the row code.
 pub(crate) struct Campaigns {
-    /// (the ID's bytes, `len << 32 | index`); `NONE` as the second in a free slot.
-    slots: Box<[(u64, u64)]>,
-    shift: u32,
+    /// The index of campaign `c_<n>` at `n`, `NONE` for none; two entries more than numbers,
+    /// so that 8 bytes can be read at any of them.
+    #[cfg_attr(
+        not(all(
+            feature = "tok-shape",
+            target_arch = "x86_64",
+            target_feature = "avx512f",
+            target_feature = "avx512bw",
+            target_feature = "avx512dq",
+            target_feature = "avx512cd",
+            target_feature = "avx512vl",
+            target_feature = "bmi2",
+            target_feature = "lzcnt"
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) numbers: Box<[u32]>,
 }
 
-#[cfg_attr(
-    not(all(
-        feature = "tok-shape",
-        target_arch = "x86_64",
-        target_feature = "avx512f",
-        target_feature = "avx512bw",
-        target_feature = "avx512dq",
-        target_feature = "avx512cd",
-        target_feature = "bmi2"
-    )),
-    allow(dead_code)
-)]
 impl Campaigns {
-    pub(crate) const NONE: u64 = u64::MAX;
+    pub(crate) const NONE: u32 = u32::MAX;
+    /// Numbers the table holds: four digits' worth.
+    pub(crate) const NUMBERS: usize = 10_000;
 
     pub(crate) fn new(ctx: &Ctx) -> Campaigns {
-        let real = &ctx.campaigns[..ctx.organic() as usize];
-        let size = (4 * real.len()).next_power_of_two().max(16);
-        let mut table = Campaigns { slots: vec![(0, Self::NONE); size].into(), shift: 64 - size.trailing_zeros() };
-        for (name, _) in real {
+        let mut numbers = vec![Self::NONE; Self::NUMBERS + 2];
+        for (name, _) in &ctx.campaigns[..ctx.organic() as usize] {
+            // The number as its digits spell it, and only that spelling: `c_07` is not `c_7`.
+            let digits = name.strip_prefix(b"c_").filter(|digits| (1..=4).contains(&digits.len()) && digits.iter().all(u8::is_ascii_digit) && (digits.len() == 1 || digits[0] != b'0'));
             // The index the row code gives this ID: its first row's.
-            if let (1..=8, Some(index)) = (name.len(), ctx.campaign_index.get(types::id::pack(name))) {
-                let mut bytes = [0u8; 8];
-                bytes[..name.len()].copy_from_slice(name);
-                let entry = (u64::from_le_bytes(bytes), (name.len() as u64) << 32 | u64::from(index));
-                let mut at = table.home(entry.0);
-                while table.slots[at].1 != Self::NONE && table.slots[at] != entry {
-                    at = (at + 1) & (size - 1);
-                }
-                table.slots[at] = entry;
+            if let (Some(digits), Some(index)) = (digits, ctx.campaign_index.get(types::id::pack(name))) {
+                numbers[digits.iter().fold(0usize, |number, &digit| number * 10 + usize::from(digit - b'0'))] = index;
             }
         }
-        table
-    }
-
-    #[inline(always)]
-    fn home(&self, word: u64) -> usize {
-        (word.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> self.shift) as usize
-    }
-
-    /// The index of the campaign whose ID is the `len` bytes at `p`, or `NONE`: for an ID no
-    /// campaign has, and for any ID over 8 bytes, which the row code then looks up its way.
-    ///
-    /// # Safety
-    /// 8 bytes readable at `p`.
-    #[inline(always)]
-    pub(crate) unsafe fn get(&self, p: *const u8, len: usize) -> u64 {
-        let word = unsafe { rd(p) };
-        let word = if len >= 8 { word } else { word & ((1u64 << (8 * len)) - 1) };
-        let mut at = self.home(word);
-        loop {
-            // SAFETY: `at` is below the table's size, a power of two. The table is at most a
-            // quarter full, so a free slot ends the walk.
-            let (key, value) = unsafe { *self.slots.get_unchecked(at) };
-            if (key == word) & (value >> 32 == len as u64) {
-                return value & 0xFFFF_FFFF;
-            }
-            if value == Self::NONE {
-                return Self::NONE;
-            }
-            at = (at + 1) & (self.slots.len() - 1);
-        }
+        Campaigns { numbers: numbers.into() }
     }
 }
 
@@ -542,11 +509,7 @@ pub(crate) fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, plan: &PosPlan, tas
     // lines, the byte before them and `PAD` bytes after them readable.
     unsafe {
         if *click {
-            if out.clicks.combining() {
-                clicks::<T, Combine>(p, len, ctx, dates, &ingest.campaigns, plan, out);
-            } else {
-                clicks::<T, Plain>(p, len, ctx, dates, &ingest.campaigns, plan, out);
-            }
+            clicks::<T, Combine>(p, len, ctx, dates, &ingest.campaigns, plan, out);
         } else if out.pays.combining() {
             events::<T, Combine>(p, len, ctx, dates, plan, out);
         } else {
@@ -617,15 +580,18 @@ unsafe fn clicks<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &D
         target_feature = "avx512bw",
         target_feature = "avx512dq",
         target_feature = "avx512cd",
-        target_feature = "bmi2"
+        target_feature = "avx512vl",
+        target_feature = "bmi2",
+        target_feature = "lzcnt"
     ))]
-    if plan.fused {
-        return unsafe { wide::fused::clicks::<M>(p, len, ctx, dates, campaigns, plan, out) };
+    if plan.fused || plan.kernel {
+        let lead = out.lead;
+        return unsafe { wide::fused::kern::clicks::<M>(p, len, lead, ctx, dates, campaigns, plan, out) };
     }
     let _ = campaigns;
-    let PosOut { clicks, odd_clicks, scratch, .. } = out;
+    let PosOut { clicks, odd_clicks, odd_id_clicks, scratch, .. } = out;
     let mut pending = Pending::new();
-    unsafe { T::lines::<4>(p, len, scratch, |fields| click_row::<M>(ctx, dates, plan, fields, &mut pending, clicks, odd_clicks)) };
+    unsafe { T::lines::<4>(p, len, scratch, |fields| click_row::<M>(ctx, dates, plan, fields, &mut pending, clicks, odd_clicks, odd_id_clicks)) };
     pending.flush::<M>(clicks);
     clicks.fence();
 }
@@ -735,21 +701,28 @@ unsafe fn click_row<M: Mode>(
     plan: &PosPlan,
     fields: &[Field; 4],
     pending: &mut Pending<PosClick>,
-    clicks: &mut Parts<PosClick>,
+    clicks: &mut Chunks<PosClick>,
     odd_clicks: &mut Vec<ClickRec>,
+    odd_id_clicks: &mut Vec<OddIdClick>,
 ) {
     let [click, user, campaign, ts] = *fields;
+    let key = unsafe { click_key_at(click.p, click.len) };
     let click = unsafe { pack_at(click.p, click.len) };
     let (ok, ts) = unsafe { dates.ts(ts.p, ts.len) };
     if (click != 0) & (user.len != 0) & ok & (ts >= 0) & (ts < i64::from(ctx.ts_end))
         && let Some(campaign) = ctx.campaign_index.get(unsafe { pack_at(campaign.p, campaign.len) })
     {
         let number = unsafe { scramble::canonical_at(user.p, user.len, b'u') }.map(|scrambled| scramble::number(scrambled, plan.user_key));
-        match number {
-            Some(number) if number >> ALIAS_BITS < u64::from(plan.persons) => {
+        match (number, key) {
+            (Some(number), Some(key)) if number >> ALIAS_BITS < u64::from(plan.persons) && (campaign as usize) < CLICK_CAMPAIGNS => {
                 let list = (number >> ALIAS_BITS >> plan.click_shift) as usize;
                 // SAFETY: the person is below `persons`, so the list is below `click_parts`.
-                unsafe { pending.push::<M>(list, PosClick::new(click, number as u32, ts as u32, campaign), clicks) };
+                unsafe { pending.push::<M>(list, PosClick::new(key, number as u32, ts as u32, campaign), clicks) };
+            }
+            // A `click_id` spelled another way (or a campaign past the record's bits): the
+            // click as it is, and its person leaves the fast lane (`src/positional.rs`).
+            (Some(number), _) if number >> ALIAS_BITS < u64::from(plan.persons) => {
+                odd_id_clicks.push(OddIdClick { u: number as u32, click, ts: ts as u32, campaign });
             }
             _ => odd_clicks.push(ClickRec { user: unsafe { pack_at(user.p, user.len) }, click, ts: ts as u32, campaign }),
         }
@@ -825,6 +798,18 @@ pub(crate) mod wide {
             // SAFETY: `len <= HELD`, and every list here was in range when put.
             unsafe {
                 events.extend(self.len, |at| (*lists.get_unchecked(at) as usize, PosEvent::from_words(*low.get_unchecked(at), *high.get_unchecked(at))))
+            };
+            self.len = 0;
+        }
+
+        /// `flush` for clicks held the same way: list, then the click's two words.
+        #[cfg_attr(not(all(feature = "tok-shape", target_feature = "avx512vl", target_feature = "avx512cd", target_feature = "bmi2", target_feature = "lzcnt")), allow(dead_code))]
+        #[inline(never)]
+        fn flush_clicks(&mut self, clicks: &mut Chunks<PosClick>) {
+            let (lists, low, high) = (&self.lists, &self.low, &self.high);
+            // SAFETY: `len <= HELD`, and only lists of persons below `PosPlan::persons` are held.
+            unsafe {
+                clicks.extend(self.len, |at| (*lists.get_unchecked(at) as usize, PosClick::from_words(*low.get_unchecked(at), *high.get_unchecked(at))))
             };
             self.len = 0;
         }
@@ -1709,269 +1694,6 @@ pub(crate) mod wide {
             }
         }
 
-        /// The words of a click row, one array per word.
-        const K_AT: usize = 0;
-        /// The line's three commas and its newline, and the quotes before the newline.
-        const K_SEPS: usize = 1;
-        const K_QUOTES: usize = 2;
-        /// The raw bytes from a field's first (a wrapping quote included): 16 of the
-        /// `click_id`, 16 of the `user_id`, 32 of the `ts`.
-        const K_CLICK: usize = 3;
-        const K_USER: usize = 5;
-        const K_TS: usize = 7;
-        /// The campaign's index, or `Campaigns::NONE`.
-        const K_CAMPAIGN: usize = 11;
-        const K_WORDS: usize = 12;
-
-        struct RawClicks {
-            words: [[u64; ROWS]; K_WORDS],
-            rows: usize,
-            /// The clicks decoded and not yet scattered: list, then the record's three words.
-            lists: [u64; HELD],
-            click: [u64; HELD],
-            low: [u64; HELD],
-            campaign: [u64; HELD],
-            held: usize,
-        }
-
-        impl RawClicks {
-            #[inline(never)]
-            fn flush<M: Mode>(&mut self, clicks: &mut Parts<PosClick>) {
-                let (lists, click, low, campaign) = (&self.lists, &self.click, &self.low, &self.campaign);
-                // SAFETY: `held <= HELD`, and the decode put only lists of persons below
-                // `PosPlan::persons` here.
-                unsafe {
-                    clicks.extend_as::<M>(self.held, |at| {
-                        (*lists.get_unchecked(at) as usize, PosClick::from_words(*click.get_unchecked(at), *low.get_unchecked(at), *campaign.get_unchecked(at)))
-                    })
-                };
-                self.held = 0;
-            }
-        }
-
-        /// The click line at `line` into row `row`: its length with the newline, or 0 when
-        /// it has not the usual shape (three commas, then the newline, within 64 bytes) and
-        /// nothing was stored. The campaign is looked up here, by its bytes (`Campaigns`),
-        /// with the quote rule of its field alone; `pairs` judges the line's quotes after.
-        ///
-        /// # Safety
-        /// `row < ROWS`, `line` is a line's first byte in a segment.
-        #[inline(always)]
-        unsafe fn raw_click(words: &mut [[u64; ROWS]; K_WORDS], row: usize, line: *const u8, campaigns: &Campaigns) -> usize {
-            // SAFETY: 64 bytes are readable at any byte of a segment (`PAD`), and every word
-            // read starts at or before the line's newline.
-            unsafe {
-                let (commas, newlines, quotes) = masks(line);
-                let stops = commas | newlines;
-                let after_first = stops & stops.wrapping_sub(1);
-                let after_second = after_first & after_first.wrapping_sub(1);
-                let after_third = after_second & after_second.wrapping_sub(1);
-                let end = after_third & after_third.wrapping_neg();
-                let before = end.wrapping_sub(1);
-                if (newlines & end == 0) | (newlines & before != 0) {
-                    return 0;
-                }
-                let (p1, p2, p3) = (stops.trailing_zeros() as usize, after_first.trailing_zeros() as usize, after_second.trailing_zeros() as usize);
-                let mut set = |word: usize, value: u64| *words.get_unchecked_mut(word).get_unchecked_mut(row) = value;
-                set(K_SEPS, stops & (before | end));
-                set(K_QUOTES, quotes & before);
-                let (user, ts) = (line.add(p1 + 1), line.add(p3 + 1));
-                set(K_CLICK, rd(line));
-                set(K_CLICK + 1, rd(line.add(8)));
-                set(K_USER, rd(user));
-                set(K_USER + 1, rd(user.add(8)));
-                set(K_TS, rd(ts));
-                set(K_TS + 1, rd(ts.add(8)));
-                set(K_TS + 2, rd(ts.add(16)));
-                set(K_TS + 3, rd(ts.add(24)));
-                // The campaign between the second and third commas, less a quote at its
-                // first byte and the one that then ends it. A line whose quotes are not
-                // pairs gives any length here, and any answer: `pairs` rejects the row.
-                let wrapped = (quotes >> (p2 + 1)) as usize & 1;
-                set(K_CAMPAIGN, campaigns.get(line.add(p2 + 1 + wrapped), (p3 - p2 - 1).wrapping_sub(2 * wrapped)));
-                // `end` is the window's first newline (checked above). Taken from the newline
-                // bits, the next line's address waits for one compare and one count, not for
-                // the three steps through the separators before it.
-                newlines.trailing_zeros() as usize + 1
-            }
-        }
-
-        /// One click chunk, as `events`: per line the separators, the raw words of the
-        /// `click_id`, `user_id` and `ts`, and the campaign looked up by its bytes; per 8 rows
-        /// the quote rules, the fields, the `click_id` packed (`types::id::wide::pack`), and
-        /// the kernels. A row they recognise as an ordinary click (a `click_id` that packs, a
-        /// `user_id` that is a number inside the arrays, a `ts` in one of the usual forms, a
-        /// campaign of the table) becomes the record `click_row` makes, or nothing when its
-        /// `ts` is outside the window or it has no `click_id`, as there; every other row
-        /// goes to `click_row` itself.
-        ///
-        /// # Safety
-        /// `p, len` is a segment.
-        #[inline(never)]
-        pub(in super::super) unsafe fn clicks<M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, campaigns: &Campaigns, plan: &PosPlan, out: &mut PosOut) {
-            let PosOut { clicks, odd_clicks, .. } = out;
-            let mut raw = RawClicks { words: [[0; ROWS]; K_WORDS], rows: 0, lists: [0; HELD], click: [0; HELD], low: [0; HELD], campaign: [0; HELD], held: 0 };
-            // The clicks of the rows left to the row code.
-            let mut pending = Pending::new();
-            let (mut at, mut rows) = (0, 0);
-            // SAFETY: `at < len` is a line's first byte; `rows < ROWS` between decodes.
-            unsafe {
-                while at < len {
-                    *raw.words.get_unchecked_mut(K_AT).get_unchecked_mut(rows) = at as u64;
-                    let next = raw_click(&mut raw.words, rows, p.add(at), campaigns);
-                    if next != 0 {
-                        at += next;
-                    } else {
-                        // Not a line `pairs` could pass: a quote that is no field's.
-                        *raw.words.get_unchecked_mut(K_SEPS).get_unchecked_mut(rows) = 0;
-                        *raw.words.get_unchecked_mut(K_QUOTES).get_unchecked_mut(rows) = !0;
-                        at = line_end(p, len, at);
-                    }
-                    rows += 1;
-                    if rows == ROWS {
-                        raw.rows = rows;
-                        decode_clicks::<M>(&mut raw, p, len, ctx, dates, plan, &mut pending, clicks, odd_clicks);
-                        rows = 0;
-                    }
-                }
-                raw.rows = rows;
-                decode_clicks::<M>(&mut raw, p, len, ctx, dates, plan, &mut pending, clicks, odd_clicks);
-            }
-            raw.flush::<M>(clicks);
-            pending.flush::<M>(clicks);
-            clicks.fence();
-        }
-
-        /// Eight click rows as the kernels read them (see `Lanes`).
-        struct ClickLanes {
-            fit: __mmask8,
-            click_first: __m512i,
-            /// The `click_id`'s ninth byte in the low byte.
-            click_ninth: __m512i,
-            click_len: __m512i,
-            user_first: __m512i,
-            user_digits: __m512i,
-            user_len: __m512i,
-            ts_0: __m512i,
-            ts_8: __m512i,
-            ts_12: __m512i,
-            ts_19: __m512i,
-            ts_len: __m512i,
-            ts_date: __m512i,
-        }
-
-        /// Rows `first..first + 8` of `words` as the kernels read them.
-        ///
-        /// # Safety
-        /// `first + 8 <= ROWS`.
-        #[inline(always)]
-        unsafe fn click_lanes(words: &[[u64; ROWS]; K_WORDS], first: usize, live: __mmask8, dates: &Dates) -> ClickLanes {
-            // SAFETY: loads of 8 words at `first <= ROWS - 8`, then register arithmetic.
-            unsafe {
-                let word = |word: usize| _mm512_loadu_si512(words.get_unchecked(word).as_ptr().add(first).cast());
-                let (seps, quotes) = (word(K_SEPS), word(K_QUOTES));
-                let (p1, rest) = lowest(seps);
-                let (p2, rest) = lowest(rest);
-                let (p3, rest) = lowest(rest);
-                let (p4, _) = lowest(rest);
-                let one = all(1);
-                let (s1, s3) = (_mm512_add_epi64(p1, one), _mm512_add_epi64(p3, one));
-                let (q0, q1, q3) =
-                    (_mm512_and_si512(quotes, one), _mm512_and_si512(_mm512_srlv_epi64(quotes, s1), one), _mm512_and_si512(_mm512_srlv_epi64(quotes, s3), one));
-                let len = |end: __m512i, start: __m512i, q: __m512i| _mm512_sub_epi64(_mm512_sub_epi64(end, start), _mm512_slli_epi64::<1>(q));
-                let (b0, b1, b3) = (_mm512_slli_epi64::<3>(q0), _mm512_slli_epi64::<3>(q1), _mm512_slli_epi64::<3>(q3));
-                let more = |bits: __m512i, by: u64| _mm512_add_epi64(bits, all(by));
-                let (click0, click1, user0, user1) = (word(K_CLICK), word(K_CLICK + 1), word(K_USER), word(K_USER + 1));
-                let (ts0, ts1, ts2, ts3) = (word(K_TS), word(K_TS + 1), word(K_TS + 2), word(K_TS + 3));
-                let (ts_0, ts_8) = (cut(ts0, ts1, b3), cut(ts1, ts2, b3));
-                ClickLanes {
-                    fit: live & pairs(quotes, seps),
-                    click_first: cut(click0, click1, b0),
-                    click_ninth: _mm512_srlv_epi64(click1, b0),
-                    click_len: len(p1, _mm512_setzero_si512(), q0),
-                    user_first: cut(user0, user1, b1),
-                    user_digits: cut(user0, user1, more(b1, 8)),
-                    user_len: len(p2, s1, q1),
-                    ts_0,
-                    ts_8,
-                    ts_12: cut(ts1, ts2, more(b3, 32)),
-                    ts_19: cut(ts2, ts3, more(b3, 24)),
-                    ts_len: len(p4, s3, q3),
-                    ts_date: dates.date_wide(ts_0, ts_8),
-                }
-            }
-        }
-
-        /// Decodes the gathered click rows and leaves `raw` empty of rows.
-        ///
-        /// # Safety
-        /// `base, bytes` is the segment the rows' lines are in.
-        #[inline(never)]
-        #[allow(clippy::too_many_arguments)]
-        unsafe fn decode_clicks<M: Mode>(
-            raw: &mut RawClicks,
-            base: *const u8,
-            bytes: usize,
-            ctx: &Ctx,
-            dates: &Dates,
-            plan: &PosPlan,
-            pending: &mut Pending<PosClick>,
-            clicks: &mut Parts<PosClick>,
-            odd_clicks: &mut Vec<ClickRec>,
-        ) {
-            let rows = std::mem::take(&mut raw.rows);
-            let mut first = 0;
-            while first < rows {
-                if raw.held + 8 > HELD {
-                    raw.flush::<M>(clicks);
-                }
-                let live = live(rows, first);
-                // SAFETY: `first + 8 <= ROWS`. A lane past `rows` holds an older row's words
-                // or zeros, and `live` keeps it out of everything below.
-                unsafe {
-                    let lanes = click_lanes(&raw.words, first, live, dates);
-                    let (click, packs) = types::id::wide::pack(lanes.click_first, lanes.click_ninth, lanes.click_len);
-                    let (user, user_ok) = numbers(lanes.user_first, lanes.user_digits, lanes.user_len, b'u', plan.user_key);
-                    let (ts_ok, ts) = dates.ts_wide(lanes.ts_0, lanes.ts_8, lanes.ts_12, lanes.ts_19, lanes.ts_len, lanes.ts_date);
-                    let campaign = _mm512_loadu_si512(raw.words[K_CAMPAIGN].as_ptr().add(first).cast());
-                    let has_click = _mm512_test_epi64_mask(click, click);
-                    // `click_row`'s window, on a `ts` that is the one `Dates::ts` gives.
-                    let inside = _mm512_cmpge_epi64_mask(ts, _mm512_setzero_si512()) & _mm512_cmplt_epi64_mask(ts, all(u64::from(ctx.ts_end)));
-                    let person = _mm512_srli_epi64::<{ ALIAS_BITS }>(user);
-                    let fast = lanes.fit
-                        & packs
-                        & has_click
-                        & user_ok
-                        & _mm512_cmplt_epu64_mask(person, all(u64::from(plan.persons)))
-                        & ts_ok
-                        & inside
-                        & _mm512_cmpneq_epi64_mask(campaign, all(Campaigns::NONE));
-                    // No click whatever the rest says: a well-formed line with no
-                    // `click_id`, or with a well-formed `ts` outside the window.
-                    let dropped = lanes.fit & ((packs & !has_click) | (ts_ok & !inside));
-
-                    // `PosClick::new`: u | ts << 32.
-                    let low = _mm512_or_si512(_mm512_and_si512(user, all(0xFFFF_FFFF)), _mm512_slli_epi64::<32>(ts));
-                    let list = _mm512_srl_epi64(person, _mm_cvtsi32_si128(plan.click_shift as i32));
-                    let held = raw.held;
-                    _mm512_storeu_si512(raw.lists.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, list));
-                    _mm512_storeu_si512(raw.click.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, click));
-                    _mm512_storeu_si512(raw.low.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, low));
-                    _mm512_storeu_si512(raw.campaign.as_mut_ptr().add(held).cast(), _mm512_maskz_compress_epi64(fast, campaign));
-                    raw.held = held + fast.count_ones() as usize;
-
-                    // Every other row, through the row code.
-                    let mut rest = live & !fast & !dropped;
-                    while rest != 0 {
-                        let row = first + rest.trailing_zeros() as usize;
-                        rest &= rest - 1;
-                        slow_click::<M>(base, bytes, raw.words[K_AT][row] as usize, ctx, dates, plan, pending, clicks, odd_clicks);
-                    }
-                }
-                first += 8;
-            }
-        }
-
         /// A click row through the row code: the line at `at` tokenized again, then
         /// `click_row`.
         ///
@@ -1988,18 +1710,19 @@ pub(crate) mod wide {
             dates: &Dates,
             plan: &PosPlan,
             pending: &mut Pending<PosClick>,
-            clicks: &mut Parts<PosClick>,
+            clicks: &mut Chunks<PosClick>,
             odd_clicks: &mut Vec<ClickRec>,
+            odd_id_clicks: &mut Vec<OddIdClick>,
         ) {
             // SAFETY: one line of the segment, 64 bytes readable at its first; a shape's
             // fields are inside the line.
             unsafe {
                 let line = p.add(at);
                 if let Some(shape) = click_shape(line) {
-                    return click_row::<M>(ctx, dates, plan, &shape.fields(line), pending, clicks, odd_clicks);
+                    return click_row::<M>(ctx, dates, plan, &shape.fields(line), pending, clicks, odd_clicks, odd_id_clicks);
                 }
                 let bytes = line_end(p, len, at) - at;
-                Scalar::lines::<4>(line, bytes, &mut Scratch::new(), |fields| click_row::<M>(ctx, dates, plan, fields, pending, clicks, odd_clicks));
+                Scalar::lines::<4>(line, bytes, &mut Scratch::new(), |fields| click_row::<M>(ctx, dates, plan, fields, pending, clicks, odd_clicks, odd_id_clicks));
             }
         }
 
@@ -2087,124 +1810,6 @@ pub(crate) mod wide {
                     }
                 }
                 line
-            }
-
-            /// A click line much as the generator writes one, then perhaps spoiled.
-            fn click_line(rng: &mut Rng) -> Vec<u8> {
-                let digits = |rng: &mut Rng, letter: char| {
-                    let n = 1 + rng.below(9) as usize;
-                    let mut text = String::from(letter);
-                    text.extend((0..n).map(|_| char::from(b"0123456789abcdefghijklmnopqrstuvwxyz"[rng.below(36) as usize])));
-                    text
-                };
-                let clock = format!("{:02}:{:02}:{:02}", rng.below(25), rng.below(61), rng.below(61));
-                let fields = [
-                    match rng.below(12) {
-                        0 => rng.pick(&["", "K12ab", "k", "k123456789ab", "k\u{e9}1"]).to_string(),
-                        _ => digits(rng, 'k'),
-                    },
-                    match rng.below(12) {
-                        0 => rng.pick(&["", "U12ab", "u", "anonymous-user-17"]).to_string(),
-                        _ => digits(rng, 'u'),
-                    },
-                    rng.pick(&["c_1", "c_2", "c_17", "c_12345", "c_123456", "c_1234567", "", "c_9", "C_1", "c_3 "]).to_string(),
-                    match rng.below(8) {
-                        0..=3 => format!("2026-10-{:02}T{clock}Z", 1 + rng.below(31)),
-                        4 => format!("2026-1{}-{:02}T{clock}{}{:02}:{:02}", rng.below(3), 1 + rng.below(31), rng.pick(&["+", "-"]), rng.below(14), rng.below(60)),
-                        5 | 6 => format!("17{:011}", rng.below(100_000_000_000)),
-                        _ => rng.pick(&["", "0", "2026-10-03", "2026-10-03T10:00:00", "1791071890000.0"]).to_string(),
-                    },
-                ];
-                let mut line = Vec::new();
-                for (at, field) in fields.iter().enumerate() {
-                    if at > 0 {
-                        line.push(b',');
-                    }
-                    if rng.below(4) == 0 {
-                        line.push(b'"');
-                        line.extend_from_slice(field.as_bytes());
-                        line.push(b'"');
-                    } else {
-                        line.extend_from_slice(field.as_bytes());
-                    }
-                }
-                for _ in 0..[0, 0, 0, 1, 1, 2, 5][rng.below(7) as usize] {
-                    let at = rng.below(line.len() as u64 + 1) as usize;
-                    let byte = b"\"\",,\n a0Z"[rng.below(9) as usize];
-                    match rng.below(3) {
-                        0 if at < line.len() => line[at] = byte,
-                        1 if at < line.len() => drop(line.remove(at)),
-                        _ => line.insert(at, byte),
-                    }
-                }
-                line
-            }
-
-            #[test]
-            fn raw_clicks_are_the_scalar_fields() {
-                let campaigns: Vec<(Vec<u8>, Vec<u8>)> =
-                    ["c_1", "c_2", "c_17", "c_12345", "c_123456", "c_1234567", "c_2"].iter().map(|name| (name.as_bytes().to_vec(), b"email".to_vec())).collect();
-                let listed: Vec<(&[u8], &[u8])> = campaigns.iter().map(|(name, channel)| (&name[..], &channel[..])).collect();
-                let ctx = Ctx::new(parse_f1(b"2026-10-05T00:00:00Z").unwrap(), parse_f1(b"2026-11-02T00:00:00Z").unwrap(), &[], &listed).unwrap();
-                let (dates, table) = (Dates::new(&ctx), Campaigns::new(&ctx));
-                let mut rng = Rng(0xD6E8_FEB8_6659_FD93);
-                let (mut fits, mut rows, mut found) = (0, 0, 0);
-                for round in 0..60_000 {
-                    let mut buf = vec![b'\n'];
-                    buf.extend(click_line(&mut rng));
-                    buf.push(b'\n');
-                    for _ in 0..3 {
-                        buf.extend(click_line(&mut rng));
-                        buf.push(b'\n');
-                    }
-                    buf.resize(buf.len().max(200) + 64, b'"');
-                    // SAFETY: the buffer holds whole lines and at least 263 bytes after its
-                    // first, so every window and word below is inside it.
-                    unsafe {
-                        let p = buf.as_ptr().add(1);
-                        let end = buf[1..].iter().position(|&b| b == b'\n').unwrap() + 1;
-                        let mut want: Option<[Field; 4]> = None;
-                        Scalar::lines::<4>(p, end, &mut Scratch::new(), |fields| want = Some(*fields));
-
-                        let lane = round % 8;
-                        let mut words = [[0x2222_2222_2222_2222u64; ROWS]; K_WORDS];
-                        let next = raw_click(&mut words, lane, p, &table);
-                        if next == 0 {
-                            continue;
-                        }
-                        rows += 1;
-                        let text = String::from_utf8_lossy(&buf[1..end]);
-                        assert_eq!(next, end, "{text:?}");
-                        let lanes = click_lanes(&words, 0, 0xFF, &dates);
-                        let fit = lanes.fit >> lane & 1 == 1;
-                        assert_eq!(fit, want.is_some(), "{text:?}");
-                        let Some([click, user, campaign, ts]) = want else { continue };
-                        fits += 1;
-                        let got = |v: __m512i| {
-                            let mut out = [0u64; 8];
-                            _mm512_storeu_si512(out.as_mut_ptr().cast(), v);
-                            out[lane]
-                        };
-                        assert_eq!((got(lanes.click_first), got(lanes.click_ninth) as u8, got(lanes.click_len)), (rd(click.p), *click.p.add(8), click.len as u64), "click of {text:?}");
-                        assert_eq!((got(lanes.user_first), got(lanes.user_digits), got(lanes.user_len)), (rd(user.p), rd(user.p.add(1)), user.len as u64), "user of {text:?}");
-                        assert_eq!(
-                            (got(lanes.ts_0), got(lanes.ts_8), got(lanes.ts_12), got(lanes.ts_19), got(lanes.ts_len), got(lanes.ts_date)),
-                            (rd(ts.p), rd(ts.p.add(8)), rd(ts.p.add(12)), rd(ts.p.add(19)), ts.len as u64, dates.date_s(ts.p) as u64),
-                            "ts of {text:?}"
-                        );
-                        // The campaign by its bytes is the one the row code finds, where the
-                        // table has it; `NONE` only sends the row to the row code.
-                        let by_bytes = words[K_CAMPAIGN][lane];
-                        let packed = ctx.campaign_index.get(pack_at(campaign.p, campaign.len));
-                        if by_bytes != Campaigns::NONE {
-                            assert_eq!(Some(by_bytes as u32), packed, "campaign of {text:?}");
-                            found += 1;
-                        } else {
-                            assert!(packed.is_none() || campaign.len > 8, "campaign of {text:?} not found");
-                        }
-                    }
-                }
-                assert!(fits > 20_000 && rows > fits && found > 10_000, "{fits} well-formed of {rows} rows, {found} campaigns");
             }
 
             #[test]
