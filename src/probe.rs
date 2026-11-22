@@ -204,6 +204,22 @@ fn code2() -> u64 {
     ((kernel * 2 + u64::from(mitigated)) * 2 + u64::from(collapsed)) * 2 + u64::from(set_aside)
 }
 
+/// `SS_PROBE=stage:NAME`: the stage whose time the run reports by waiting, `NAME` one of
+/// `inputs`, `parse`, `dedup`, `sessions`, `output` (the laps of `SS_TIMING`) or `handback`
+/// (the round before the exit). When that stage ends the run sleeps `SS_PROBE_TIMES` (10)
+/// times what the stage took (`wait`), so on a scorer that shows nothing but a run's time,
+/// the time less the same build's time without the probe, divided by 10, is the stage's
+/// time there. A stage a submission; what the stages do not add up to is the process's
+/// start and its exit.
+pub fn stretched() -> Option<String> {
+    std::env::var("SS_PROBE").ok()?.strip_prefix("stage:").map(str::to_owned)
+}
+
+/// The wait of `stretched` for a stage that took `took`.
+pub fn wait(took: std::time::Duration) {
+    std::thread::sleep(took * types::env::number("SS_PROBE_TIMES", 10) as u32);
+}
+
 impl Probe {
     /// `Some` when `SS_PROBE` is set. Call before the workers are started.
     pub fn start() -> Option<Probe> {
@@ -214,6 +230,10 @@ impl Probe {
     /// The report. `data` is the input folder. With `SS_PROBE=sleep`, the machine's number
     /// (`code`) as a wait instead.
     pub fn finish(&self, data: &std::path::Path) {
+        // A stage's wait is all that probe does: no report, which would add its own time.
+        if stretched().is_some() {
+            return;
+        }
         if std::env::var_os("SS_PROBE").is_some_and(|value| value == "sleep") {
             let code = code(&self.allowed);
             eprintln!("probe: code {code}");

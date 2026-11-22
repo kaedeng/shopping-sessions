@@ -117,6 +117,7 @@ fn hand_back(workers: usize) {
     #[cfg(feature = "alloc-region")]
     if types::mem::free_early() && types::env::pick("SS_EXIT", &["release", "leave"]) == 0 {
         if let Some((from, to)) = region::large_used() {
+            let started = Instant::now();
             // A thread's chunk is 64 MB, mostly one worker's; smaller pieces so that the
             // workers come out even.
             const PIECE: usize = 8 << 20;
@@ -127,6 +128,14 @@ fn hand_back(workers: usize) {
                 // this (the caller exits, and the workers' own state is not in one).
                 unsafe { types::mem::release(start as *const u8, PIECE.min(to - start)) };
             });
+            // After `total`: the process's wall time has it, the stages' sum does not.
+            let took = started.elapsed();
+            if std::env::var_os("SS_TIMING").is_some() {
+                eprintln!("handback {:>8.1} ms", took.as_secs_f64() * 1e3);
+            }
+            if probe::stretched().as_deref() == Some("handback") {
+                probe::wait(took);
+            }
         }
     }
     #[cfg(not(feature = "alloc-region"))]
@@ -149,15 +158,24 @@ fn run() -> Result<(), String> {
     // `SS_W_PARSE`, `SS_W_DEDUP`, `SS_W_SESSIONS`: the workers that take a stage's tasks, all
     // of them when unset (`par::limit`). Each is set when the stage before it ends.
     let stage_workers = [("inputs", "SS_W_PARSE"), ("parse", "SS_W_DEDUP"), ("dedup", "SS_W_SESSIONS"), ("sessions", "")].map(|(after, var)| (after, if var.is_empty() { usize::MAX } else { types::env::number(var, usize::MAX) }));
+    // `SS_PROBE=stage:NAME`: the run waits ten times that stage's time when it ends
+    // (`probe::stretched`).
+    let stretched = probe::stretched();
     let mut lap = |stage: &'static str| {
         if let Some(&(_, taking)) = stage_workers.iter().find(|(after, _)| *after == stage) {
             par::limit(taking);
         }
         types::tl::mark(stage);
-        if timing {
+        if timing || stretched.is_some() {
             let now = Instant::now();
-            eprintln!("{stage:<9}{:>8.1} ms", (now - last).as_secs_f64() * 1e3);
-            last = now;
+            if timing {
+                eprintln!("{stage:<9}{:>8.1} ms", (now - last).as_secs_f64() * 1e3);
+            }
+            if stretched.as_deref() == Some(stage) {
+                probe::wait(now - last);
+            }
+            // After the wait: the next stage's time has none of it.
+            last = Instant::now();
         }
     };
 
@@ -386,6 +404,7 @@ fn run() -> Result<(), String> {
         }
     });
     drop(outputs);
+    types::tl::mark("user_daily written");
     if let Some(error) = failure.into_inner() {
         return Err(error);
     }
