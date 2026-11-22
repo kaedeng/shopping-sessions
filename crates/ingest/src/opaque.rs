@@ -536,4 +536,51 @@ e2,u1,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,refund,p1,\n";
         assert!(short.iter().any(|row| row.key & id::SLOW != 0), "`E1` is interned");
         assert!(!plan.users.overflowed());
     }
+
+    /// Every record of an input, as one worker parses it with the parse made for `narrow` or
+    /// not: the events, the long-keyed events, the clicks and the links, each sorted.
+    type Records = (Vec<(u64, u64, u64)>, Vec<(u64, u64, u64, u64)>, Vec<(Id, u64, u64)>, Vec<([u32; 2], [u64; 2])>, usize);
+
+    fn records(data: &std::path::Path, narrow: bool) -> Records {
+        let ctx = crate::load_ctx(data).unwrap();
+        let ingest = Ingest::open(data, &ctx).unwrap();
+        let mut plan = ingest.opaque_plan(0, false);
+        plan.narrow = narrow;
+        let mut out = ingest.opaque_out(&plan, 1);
+        let mut links: Vec<([u32; 2], [u64; 2])> = (0..ingest.link_tasks()).flat_map(|task| ingest.opaque_links(&plan, task, &mut out)).map(|link| (link.users, link.order)).collect();
+        for task in 0..ingest.tasks() {
+            ingest.opaque_parse(&ctx, &plan, task, &mut out);
+        }
+        let (mut events, mut long, mut clicks) = (Vec::new(), Vec::new(), Vec::new());
+        for list in 0..out.events.lists() {
+            out.events.for_each(list, |piece| events.extend(piece.iter().map(|e| (e.key, e.user_ts, e.ingest_pay))));
+        }
+        for list in 0..out.long_events.lists() {
+            out.long_events.for_each(list, |piece| long.extend(piece.iter().map(|e| (e.hi, e.lo, e.user_ts, e.ingest_pay))));
+        }
+        out.clicks.for_each(0, |piece| clicks.extend(piece.iter().map(|c| (c.click, c.user_ts, c.campaign))));
+        events.sort_unstable();
+        long.sort_unstable();
+        clicks.sort_unstable();
+        links.sort_unstable();
+        assert!(!plan.users.overflowed());
+        (events, long, clicks, links, out.slow)
+    }
+
+    /// `SS_PARSE_WIDTH`: the narrow parse (`types::width::Narrow`) makes the records the wide
+    /// one makes, users numbered alike, on every fixture and on `dev/` when it is there.
+    #[test]
+    fn both_widths_make_the_same_records() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut inputs: Vec<std::path::PathBuf> = std::fs::read_dir(root.join("fixtures")).unwrap().map(|entry| entry.unwrap().path().join("input")).filter(|input| input.join("manifest.json").exists()).collect();
+        inputs.sort();
+        if root.join("dev").join("manifest.json").exists() {
+            inputs.push(root.join("dev"));
+        }
+        assert!(inputs.len() > 30);
+        for input in &inputs {
+            let (wide, narrow) = (records(input, false), records(input, true));
+            assert!(wide == narrow, "{}: {} and {} events, {} and {} long, {} and {} clicks", input.display(), wide.0.len(), narrow.0.len(), wide.1.len(), narrow.1.len(), wide.2.len(), narrow.2.len());
+        }
+    }
 }
