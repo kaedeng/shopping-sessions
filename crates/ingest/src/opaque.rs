@@ -463,6 +463,10 @@ pub struct Plan {
     /// `batch` every bit, which no count of rows clears, and a batch's users are asked for
     /// when it is full.
     pub(crate) ask_step: usize,
+    /// The row code's single lines tokenized from masks (`SS_SLOW_TOK=mask|scalar`, `mask`
+    /// the pick; `kern::one_line`), not by `Scalar`'s byte loop.
+    #[allow(dead_code)]
+    pub(crate) slow_mask: bool,
 }
 
 impl Plan {
@@ -539,6 +543,7 @@ impl Ingest {
             placing: OnceLock::new(),
             wait_for_placing: false,
             ask_step: if types::env::pick("SS_ASK", &["rows", "batch"]) == 0 { 63 } else { usize::MAX },
+            slow_mask: types::env::pick("SS_SLOW_TOK", &["mask", "scalar"]) == 0,
         }
     }
 
@@ -828,7 +833,7 @@ mod tests {
     fn rows_go_by_their_ids_spelling() {
         let ctx = Ctx::new(parse_f1(b"2026-10-08T00:00:00Z").unwrap(), parse_f1(b"2026-10-22T00:00:00Z").unwrap(), &[], &[]).unwrap();
         let dates = Dates::new(&ctx);
-        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, lean: false, whole_clicks: false, narrow: false, placing: OnceLock::new(), wait_for_placing: false, ask_step: 63 };
+        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, lean: false, whole_clicks: false, narrow: false, placing: OnceLock::new(), wait_for_placing: false, ask_step: 63, slow_mask: true };
         let (mut narrow, mut events, mut long_events) = (Chunks::<EvN>::new(8, 1 << 16), Chunks::<Ev>::new(8, 1 << 16), Chunks::<EvL>::new(2, 1 << 16));
         let text = b"\ne1,u1,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,view,p1,\n\
 e02423c3d84ab053af78764ce49f23b5c,u02423c3d84ab053af78764ce49f23b5c,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,cart,p1,\n\
