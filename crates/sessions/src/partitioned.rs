@@ -9,7 +9,7 @@
 use std::cmp::Ordering;
 
 use types::hash::person_hash;
-use types::id::{self, Id};
+use types::id::Id;
 use types::record::{ClickRec, PersonEvent};
 use types::Ctx;
 
@@ -179,16 +179,7 @@ impl Scratch {
 
 /// By `ts`, and among equal `ts` the smallest `click_id` last: the credit is the window's last.
 fn click_order(a: &Click, b: &Click) -> Ordering {
-    a.ts.cmp(&b.ts).then_with(|| {
-        if id::less(a.id, b.id) {
-            Ordering::Greater
-        } else if id::less(b.id, a.id) {
-            Ordering::Less
-        } else {
-            crate::note_tie(a, b);
-            Ordering::Equal
-        }
-    })
+    a.ts.cmp(&b.ts).then_with(|| crate::id_order(b, a))
 }
 
 /// One person's clicks in `click_order`. A long run sorts `ts << 32 | position` as plain `u64`

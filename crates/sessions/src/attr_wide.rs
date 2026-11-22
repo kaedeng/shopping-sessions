@@ -24,7 +24,6 @@
 
 use core::arch::x86_64::*;
 
-use types::id;
 use types::time::WEEK;
 
 use crate::Click;
@@ -129,17 +128,7 @@ impl Attr {
         for at in 1..=n {
             if at == n || keys[at] >> 32 != keys[first] >> 32 {
                 if at - first > 1 {
-                    keys[first..at].sort_unstable_by(|&a, &b| {
-                        let (a, b) = (&clicks[a as u32 as usize], &clicks[b as u32 as usize]);
-                        if id::less(b.id, a.id) {
-                            std::cmp::Ordering::Less
-                        } else if id::less(a.id, b.id) {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            crate::note_tie(a, b);
-                            std::cmp::Ordering::Equal
-                        }
-                    });
+                    keys[first..at].sort_unstable_by(|&a, &b| crate::id_order(&clicks[b as u32 as usize], &clicks[a as u32 as usize]));
                 }
                 first = at;
             }
@@ -213,10 +202,8 @@ fn smallest(clicks: &[Click], lanes: u16) -> usize {
     while rest != 0 {
         let lane = rest.trailing_zeros() as usize;
         rest &= rest - 1;
-        if id::less(clicks[lane].id, clicks[best].id) {
+        if crate::id_order(&clicks[lane], &clicks[best]) == std::cmp::Ordering::Less {
             best = lane;
-        } else if !id::less(clicks[best].id, clicks[lane].id) {
-            crate::note_tie(&clicks[lane], &clicks[best]);
         }
     }
     best
@@ -224,34 +211,38 @@ fn smallest(clicks: &[Click], lanes: u16) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use types::Ctx;
+    use types::{Ctx, id};
     use types::time::{DAY, parse_f1};
 
     use super::*;
     use crate::attr_interval;
     use crate::partitioned::sort_clicks_for_test;
 
-    /// Two clicks at one instant under IDs that compare equal, for two campaigns: reported
-    /// wherever the tie is broken (the flag only ever goes up outside this test, so each
-    /// check is of the call before it).
+    /// Two clicks at one instant, for two campaigns, under IDs whose order is open: IDs that
+    /// compare equal, or 9 bytes and an ID kept whole that begins with them, either way
+    /// round. Reported wherever the tie is broken (the flag only ever goes up outside this
+    /// test, so each check is of the call before it).
     #[test]
     fn reports_a_tie_the_ids_cannot_break() {
-        let twins = |n: usize| -> Vec<Click> {
-            let mut clicks = vec![Click { ts: 100, campaign: 1, id: id::pack(b"k1") }, Click { ts: 100, campaign: 2, id: id::pack(b"k1") }];
+        let twins = |n: usize, ids: [&[u8]; 2]| -> Vec<Click> {
+            let mut clicks = vec![Click { ts: 100, campaign: 1, id: id::pack(ids[0]) }, Click { ts: 100, campaign: 2, id: id::pack(ids[1]) }];
             clicks.extend((2..n).map(|at| Click { ts: at as u32, campaign: 3, id: id::pack(format!("kx{at}").as_bytes()) }));
             clicks
         };
         let (starts, days) = ([200u32], [0u32]);
         let mut attr = Attr::new(8);
         let mut assisted = vec![0u32; 8 * DAYS];
-        for n in [2, LIGHT, LIGHT + 4] {
-            crate::reset_tie();
-            let mut credits = [7u32];
-            attr.person(&twins(n), &starts, &days, &mut credits, &mut assisted);
-            assert!(crate::ambiguous_tie(), "{n} clicks");
-            crate::reset_tie();
-            sort_clicks_for_test(&mut twins(n));
-            assert!(crate::ambiguous_tie(), "{n} clicks sorted");
+        let (nine, whole): (&[u8], &[u8]) = (b"k00000000", b"k0000000000000000000000000000000A");
+        for ids in [[&b"k1"[..], b"k1"], [nine, whole], [whole, nine]] {
+            for n in [2, LIGHT, LIGHT + 4] {
+                crate::reset_tie();
+                let mut credits = [7u32];
+                attr.person(&twins(n, ids), &starts, &days, &mut credits, &mut assisted);
+                assert!(crate::ambiguous_tie(), "{n} clicks");
+                crate::reset_tie();
+                sort_clicks_for_test(&mut twins(n, ids));
+                assert!(crate::ambiguous_tie(), "{n} clicks sorted");
+            }
         }
     }
 

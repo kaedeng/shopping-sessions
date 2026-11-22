@@ -47,22 +47,45 @@ pub struct Click {
 /// Set once a tie between two clicks could not be told apart: see `ambiguous_tie`.
 static AMBIGUOUS_TIE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Two clicks of one person with the same `ts` whose IDs compare equal, met where the smaller
-/// `click_id` decides: copies of one click (the same campaign) are no matter, but two campaigns
-/// under one ID mean the IDs as kept do not tell the clicks apart.
-#[cold]
-#[inline(never)]
-pub(crate) fn note_tie(a: &Click, b: &Click) {
-    if a.campaign != b.campaign {
-        AMBIGUOUS_TIE.store(true, std::sync::atomic::Ordering::Relaxed);
+/// The byte order of the IDs of two clicks of one person and one `ts`, where the smaller
+/// `click_id` decides. Every place such a tie is broken asks here (the classic click sort,
+/// whose order `attr-sweep` and `attr-interval` read, and `attr-wide`'s two kernels), and
+/// `ambiguous_tie` says whether any answer was one the IDs as kept cannot give.
+#[inline(always)]
+pub(crate) fn id_order(a: &Click, b: &Click) -> std::cmp::Ordering {
+    if (a.id | b.id) & types::id::SLOW == 0 && a.id != b.id {
+        return a.id.cmp(&b.id);
     }
+    open_order(a, b)
 }
 
-/// Whether any tie so far was between two clicks with IDs that compare equal and different
-/// campaigns: the credit of some session then rests on an order the IDs as kept cannot give
-/// (a long `click_id` kept by its first bytes), and the caller should run again with the IDs
-/// whole. Every place a tie is broken reports here: the classic click sort (`attr-sweep` and
-/// `attr-interval` read its order) and `attr-wide`'s two kernels.
+/// `id_order` for two IDs that compare equal, or with a slow-path ID among them. A long
+/// `click_id` may be kept by its first 9 bytes (`ingest::opaque::click_id_at`), so between
+/// two campaigns the order is open in two cases: the IDs compare equal, or one is 9 bytes
+/// that an ID kept whole begins with, which `less` puts first whatever followed them.
+/// Copies of one click (the same campaign) are no matter.
+#[cold]
+#[inline(never)]
+fn open_order(a: &Click, b: &Click) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    use types::id::{begins, less};
+    let order = if less(a.id, b.id) {
+        Ordering::Less
+    } else if less(b.id, a.id) {
+        Ordering::Greater
+    } else {
+        Ordering::Equal
+    };
+    if a.campaign != b.campaign && (order == Ordering::Equal || begins(a.id, b.id) || begins(b.id, a.id)) {
+        AMBIGUOUS_TIE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    order
+}
+
+/// Whether any tie so far was between two clicks of different campaigns whose IDs as kept
+/// leave their order open (`open_order`): the credit of some session then rests on an order
+/// the IDs as kept cannot give (a long `click_id` kept by its first bytes), and the caller
+/// should run again with the IDs whole.
 pub fn ambiguous_tie() -> bool {
     AMBIGUOUS_TIE.load(std::sync::atomic::Ordering::Relaxed)
 }

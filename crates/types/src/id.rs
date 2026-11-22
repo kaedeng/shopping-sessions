@@ -138,6 +138,18 @@ fn less_slow(a: Id, b: Id) -> bool {
     x < y
 }
 
+/// Whether `short` is a packed ID of 9 bytes and `long` a slow-path ID that begins with
+/// them. `less` puts `short` first, as it does any beginning; where `short` may be what was
+/// kept of a longer ID, its first 9 bytes, that is not known to be the two IDs' order.
+pub fn begins(long: Id, short: Id) -> bool {
+    if long & HASHED != SLOW || short & SLOW != 0 || short & 0x7F == 0 {
+        return false;
+    }
+    let mut first = Vec::new();
+    unpack(short, &mut first);
+    with_bytes(long, |bytes| bytes.starts_with(&first))
+}
+
 /// Eight IDs packed at once (AVX-512), for the positional parse's batches (`ingest::pos`).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw"))]
 pub mod wide {
@@ -360,5 +372,19 @@ mod tests {
         assert!(less(pack(b"u"), pack(b"u\0")));
         assert!(less(pack(b"u\0"), pack(b"u1")));
         assert!(!less(pack(b"u1"), pack(b"u\0")));
+    }
+
+    #[test]
+    fn nine_bytes_begin_an_interned_id() {
+        let (nine, whole) = (pack(b"k00000000"), pack(b"k0000000000000000000000000000000A"));
+        assert!(begins(whole, nine));
+        // Not the other way round, not other bytes, not fewer than 9, not two interned IDs.
+        assert!(!begins(nine, whole));
+        assert!(!begins(whole, pack(b"k00000001")));
+        assert!(!begins(whole, pack(b"k0000000")));
+        assert!(!begins(whole, pack(b"k00000000000000000000000000000000")));
+        assert!(!begins(whole, whole));
+        // `less` puts the 9 bytes first, as any beginning.
+        assert!(less(nine, whole) && !less(whole, nine));
     }
 }
