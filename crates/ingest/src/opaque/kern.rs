@@ -46,7 +46,7 @@ use types::users::NO_USER;
 use super::{ClickSink, Ev, EvL, EvN, NARROW_INGEST, Out, Plan, SIX, click_row, event_row};
 use crate::pos::Campaigns;
 use crate::price_cents;
-use crate::tok::{Scalar, Scratch, Tok};
+use crate::tok::{Field, Scalar, Scratch, Tok};
 use crate::ts::Dates;
 
 /// Bytes the kernel may read from a line's first byte.
@@ -1285,7 +1285,70 @@ pub(super) unsafe fn slow_line(p: *const u8, len: usize, at: usize, ctx: &Ctx, d
     // SAFETY: one line of the segment.
     unsafe {
         let bytes = line_end(p, len, at) - at;
-        Scalar::lines::<7>(p.add(at), bytes, &mut Scratch::new(), |fields| event_row(ctx, dates, plan, fields, narrow, events, long_events));
+        if plan.slow_mask {
+            one_line::<7>(p.add(at), bytes, |fields| event_row(ctx, dates, plan, fields, narrow, events, long_events));
+        } else {
+            Scalar::lines::<7>(p.add(at), bytes, &mut Scratch::new(), |fields| event_row(ctx, dates, plan, fields, narrow, events, long_events));
+        }
+    }
+}
+
+/// One line's fields as `Scalar::lines` gives them, from 32-byte masks (`SS_SLOW_TOK=mask`,
+/// the pick): the line the kernels leave to the row code. `Scalar`'s loop takes a branch on
+/// every byte, and on Cascade Lake it was about 1,800 cycles a line of the ~150 bytes that a
+/// long `event_id` and a long `user_id` make: 3.5% of all cycles at 20M for 1.2% of the rows.
+/// Bytes that are not one line ending in its only `\n` go to `Scalar` as they are.
+///
+/// A well-formed line has exactly `N` fields, each free of quotes or wrapped in one pair: a
+/// wrapped field holds at least its two, so the line's quotes number twice its wrapped
+/// fields exactly when every wrapped field holds two and every other none.
+///
+/// # Safety
+/// As `Tok::lines`.
+#[inline(always)]
+unsafe fn one_line<const N: usize>(p: *const u8, len: usize, mut row: impl FnMut(&[Field; N])) {
+    // SAFETY: masked loads of the `len` bytes at `p`; the separators found are below `len`.
+    unsafe {
+        let (comma, newline, quote) = (_mm256_set1_epi8(b',' as i8), _mm256_set1_epi8(b'\n' as i8), _mm256_set1_epi8(b'"' as i8));
+        let mut seps = [0usize; N];
+        let (mut count, mut quotes, mut newlines) = (0usize, 0u32, 0u32);
+        let mut at = 0;
+        while at < len {
+            let live: u32 = if len - at >= 32 { u32::MAX } else { (1u32 << (len - at)) - 1 };
+            let bytes = _mm256_maskz_loadu_epi8(live, p.add(at).cast());
+            let ends = _mm256_mask_cmpeq_epi8_mask(live, bytes, newline);
+            let mut sep = _mm256_mask_cmpeq_epi8_mask(live, bytes, comma) | ends;
+            quotes += _mm256_mask_cmpeq_epi8_mask(live, bytes, quote).count_ones();
+            newlines += ends.count_ones();
+            while sep != 0 {
+                if count < N {
+                    *seps.get_unchecked_mut(count) = at + sep.trailing_zeros() as usize;
+                }
+                count += 1;
+                sep &= sep - 1;
+            }
+            at += 32;
+        }
+        if newlines != 1 || len == 0 || *p.add(len - 1) != b'\n' {
+            Scalar::lines::<N>(p, len, &mut Scratch::new(), row);
+            return;
+        }
+        if count != N {
+            return;
+        }
+        let mut fields = [Field { p, len: 0 }; N];
+        let (mut start, mut wrapped_fields) = (0usize, 0u32);
+        for (field, &end) in fields.iter_mut().zip(seps.iter()) {
+            let size = end - start;
+            let wrapped = size >= 2 && *p.add(start) == b'"' && *p.add(end - 1) == b'"';
+            let strip = usize::from(wrapped);
+            wrapped_fields += u32::from(wrapped);
+            *field = Field { p: p.wrapping_add(start + strip), len: size - 2 * strip };
+            start = end + 1;
+        }
+        if quotes == 2 * wrapped_fields {
+            row(&fields);
+        }
     }
 }
 
@@ -1299,7 +1362,11 @@ unsafe fn slow_click(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dat
     // SAFETY: one line of the segment.
     unsafe {
         let bytes = line_end(p, len, at) - at;
-        Scalar::lines::<4>(p.add(at), bytes, &mut Scratch::new(), |fields| click_row(ctx, dates, plan, fields, clicks));
+        if plan.slow_mask {
+            one_line::<4>(p.add(at), bytes, |fields| click_row(ctx, dates, plan, fields, clicks));
+        } else {
+            Scalar::lines::<4>(p.add(at), bytes, &mut Scratch::new(), |fields| click_row(ctx, dates, plan, fields, clicks));
+        }
     }
 }
 
@@ -1690,6 +1757,57 @@ unsafe fn finish_clicks(
                 }
             }
             first += 8;
+        }
+    }
+}
+
+#[cfg(test)]
+mod one_line_tests {
+    use super::one_line;
+    use crate::tok::{Field, Scalar, Scratch, Tok};
+
+    /// The rows `Scalar` gives and the rows `one_line` gives, as bytes.
+    fn rows<const N: usize>(line: &[u8]) -> (Vec<Vec<Vec<u8>>>, Vec<Vec<Vec<u8>>>) {
+        // One byte readable before the line and 64 after it.
+        let mut buf = vec![b'x'; line.len() + 65];
+        buf[1..=line.len()].copy_from_slice(line);
+        let take = |fields: &[Field; N], to: &mut Vec<Vec<Vec<u8>>>| to.push(fields.iter().map(|f| unsafe { std::slice::from_raw_parts(f.p, f.len) }.to_vec()).collect());
+        let (mut scalar, mut mask) = (Vec::new(), Vec::new());
+        unsafe {
+            Scalar::lines::<N>(buf.as_ptr().add(1), line.len(), &mut Scratch::new(), |fields| take(fields, &mut scalar));
+            one_line::<N>(buf.as_ptr().add(1), line.len(), |fields| take(fields, &mut mask));
+        }
+        (scalar, mask)
+    }
+
+    #[test]
+    fn as_scalar() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let alphabet = [b'a', b'a', b'a', b'7', b',', b',', b'"', b'"', b' ', b'\r', b'\n'];
+        for round in 0..400_000 {
+            let len = (next() % 260) as usize;
+            let mut line: Vec<u8> = (0..len).map(|_| alphabet[(next() % alphabet.len() as u64) as usize]).collect();
+            // Mostly one line ending in its only newline, as the row code's lines are.
+            if round % 4 != 0 {
+                line.retain(|&b| b != b'\n');
+                line.push(b'\n');
+            }
+            let (scalar, mask) = rows::<7>(&line);
+            assert_eq!(scalar, mask, "{:?}", String::from_utf8_lossy(&line));
+            let (scalar, mask) = rows::<4>(&line);
+            assert_eq!(scalar, mask, "{:?}", String::from_utf8_lossy(&line));
+        }
+        for line in [&b"e1,u1,2026-10-03T23:58:10Z,2026-10-03T23:58:10Z,view,p1,\n"[..], b"\"e1\",\"\",\"a\"\"b\",x,y,z,w\n", b"a,b,c,d\n", b"\"\",\"x\",y,\"z\"\n", b"\n", b"", b"a,b,c,d"] {
+            let (scalar, mask) = rows::<7>(line);
+            assert_eq!(scalar, mask);
+            let (scalar, mask) = rows::<4>(line);
+            assert_eq!(scalar, mask);
         }
     }
 }
