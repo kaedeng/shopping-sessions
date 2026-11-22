@@ -298,6 +298,9 @@ pub struct Dense {
     /// events in `ts`, after it one past the last. The same for the clicks.
     ends: Vec<u32>,
     click_ends: Vec<u32>,
+    /// Four counters a person, for the events and then for the clicks: before a scatter the
+    /// first position of what the person has in each lane of a round, after it the last.
+    lanes: Vec<u32>,
     /// The events' times, a person's together; sorted person by person as they are walked.
     ts: Vec<u32>,
     clicks: Vec<Click>,
@@ -333,19 +336,34 @@ pub fn bucket_dense(
     // (`dense_walk`), or person by person.
     // `SS_SESS_WIDTH=512|256`: the kernels in 512-bit registers, or in 256-bit ones and
     // narrower with no 256-bit multiply (`dense_walk` says why).
-    static PICKS: std::sync::OnceLock<(bool, bool, bool)> = std::sync::OnceLock::new();
-    let (net, wide_walk, narrow) = *PICKS.get_or_init(|| {
-        (types::env::pick("SS_TIME_SORT", &["net", "std"]) == 0, types::env::pick("SS_DENSE_WALK", &["wide", "person"]) == 0, types::env::pick("SS_SESS_WIDTH", &["512", "256"]) == 1)
+    // `SS_SESS_LANES=1|4`: a counter a person in the grouping passes, or four (one per lane
+    // of a round modulo four).
+    // `SS_TIME_CUT=off|on`: the 512-bit walk's persons by `sort_times::sort`, or by
+    // `sort_times::cut` (the narrow walk keeps `sort_times::sort_narrow`).
+    static PICKS: std::sync::OnceLock<(bool, bool, bool, bool, bool)> = std::sync::OnceLock::new();
+    let (net, wide_walk, narrow, four, cut) = *PICKS.get_or_init(|| {
+        (
+            types::env::pick("SS_TIME_SORT", &["net", "std"]) == 0,
+            types::env::pick("SS_DENSE_WALK", &["wide", "person"]) == 0,
+            types::env::pick("SS_SESS_WIDTH", &["512", "256"]) == 1,
+            types::env::pick("SS_SESS_LANES", &["1", "4"]) == 1,
+            types::env::pick("SS_TIME_CUT", &["off", "on"]) == 1,
+        )
     });
-    bucket_dense_as(ctx, base, span, events, pays, clicks, placed, agg, net, wide_walk, narrow)
+    if four {
+        bucket_dense_as::<4>(ctx, base, span, events, pays, clicks, placed, agg, net, wide_walk, narrow, cut)
+    } else {
+        bucket_dense_as::<1>(ctx, base, span, events, pays, clicks, placed, agg, net, wide_walk, narrow, cut)
+    }
 }
 
-/// `bucket_dense` with its three choices given: `net` sorts a person's times by `sort_times`,
+/// `bucket_dense` with its choices given: `net` sorts a person's times by `sort_times`,
 /// `wide_walk` takes the bucket through `dense_walk` where it can run, `narrow` runs the
-/// kernels' 256-bit forms.
+/// kernels' 256-bit forms, `cut` has the 512-bit walk take a person's times by
+/// `sort_times::cut`, and `L` (1 or 4) is the grouping passes' counters a person.
 #[cfg(feature = "pipe-positional")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn bucket_dense_as(
+pub(crate) fn bucket_dense_as<const L: usize>(
     ctx: &Ctx,
     base: u32,
     span: usize,
@@ -357,7 +375,9 @@ pub(crate) fn bucket_dense_as(
     net: bool,
     wide_walk: bool,
     narrow: bool,
+    cut: bool,
 ) {
+    const { assert!(L == 1 || L == 4) };
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
     let Agg { user_daily, user_narrow, bucket: scratch, attr, wide, day, counters, dense, .. } = agg;
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd")))]
@@ -365,7 +385,7 @@ pub(crate) fn bucket_dense_as(
     // The walk's table; a build without the walk has no use for it.
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
     let _ = &user_narrow;
-    let Dense { ends, click_ends, ts, clicks: grouped, side, sorter, .. } = dense;
+    let Dense { ends, click_ends, lanes, ts, clicks: grouped, side, sorter, .. } = dense;
     let offset = u64::from(base) << 32;
     // A key's person as its place among the bucket's; checked where it is first met, in the
     // counting passes, so that the scatters may trust it.
@@ -383,55 +403,80 @@ pub(crate) fn bucket_dense_as(
     // A key's place is a `u32` (the key less the base, shifted right by 32): checked as eight
     // lanes of 64 bits, the compiler made the check one 512-bit compare, the one 512-bit
     // instruction of these passes (`SS_SESS_WIDTH` says why that matters).
+    //
+    // With `L` 4 (`SS_SESS_LANES=4`) a person has four counters, one for each of the round's
+    // lanes modulo four, so the counters two neighbours of a round add to are never the same
+    // one. Where store bypass
+    // is allowed, a processor that guesses which store a load will read from (AMD's since
+    // Zen 3) guessed wrong here again and again with one counter a person: a neighbour is
+    // now and then the same person, the pair is learnt, and the guesses that follow are
+    // undone at the cost of a mispredicted jump each. Counting the events was 23 cycles an
+    // event there, a quarter of the stage. `L` 1, the default, is a counter a person, as
+    // before. Every pass takes a record's lane from its place in its round, so a count pass
+    // and its scatter agree record by record, the clicks the parse places as the others.
+    let count = |lanes: &mut Vec<u32>| {
+        lanes.clear();
+        lanes.resize(L * span, 0);
+        lanes.as_mut_ptr()
+    };
+    // The counts to positions: each lane's first, person after person, and in `ends` one
+    // past each person's last. Returns how many there are.
+    fn place<const L: usize>(lanes: &mut [u32], ends: &mut Vec<u32>, span: usize) -> usize {
+        ends.clear();
+        ends.resize(span + 1, 0);
+        let mut n = 0u32;
+        for (person, counts) in lanes.chunks_exact_mut(L).enumerate() {
+            for count in counts {
+                (*count, n) = (n, n + *count);
+            }
+            ends[person] = n;
+        }
+        ends[span] = n;
+        n as usize
+    }
 
     // The events: counted per person, then each time to its person's stretch.
-    ends.clear();
-    ends.resize(span + 1, 0);
     {
-        let counts = ends.as_mut_ptr();
+        let counts = count(lanes);
         events(&mut |piece| {
             let (counts, offset, span) = (counts, offset, span);
             let mut chunks = piece.chunks_exact(8);
             for chunk in &mut chunks {
                 let at: [u32; 8] = std::array::from_fn(|k| (chunk[k].wrapping_sub(offset) >> 32) as u32);
                 assert!(at.iter().all(|&at| (at as usize) < span), "an event outside its bucket");
-                for at in at {
-                    // SAFETY: `at < span`, and `ends` has `span + 1` entries.
-                    unsafe { *counts.add(at as usize + 1) += 1 };
+                for (k, at) in at.into_iter().enumerate() {
+                    // SAFETY: `at < span`, and `lanes` has `L` entries for each.
+                    unsafe { *counts.add(L * at as usize + (k & (L - 1))) += 1 };
                 }
             }
-            for &key in chunks.remainder() {
+            for (k, &key) in chunks.remainder().iter().enumerate() {
                 let at = (key.wrapping_sub(offset) >> 32) as usize;
                 assert!(at < span, "an event outside its bucket");
                 // SAFETY: as above.
-                unsafe { *counts.add(at + 1) += 1 };
+                unsafe { *counts.add(L * at + (k & (L - 1))) += 1 };
             }
         });
     }
-    let mut n = 0u32;
-    for end in ends.iter_mut() {
-        n += *end;
-        *end = n;
-    }
-    let n = n as usize;
+    let n = place::<L>(lanes, ends, span);
     if n == 0 {
         return;
     }
     ts.clear();
     ts.reserve(n);
     {
-        let (out, next) = (ts.as_mut_ptr(), ends.as_mut_ptr());
+        let (out, next) = (ts.as_mut_ptr(), lanes.as_mut_ptr());
         events(&mut |piece| {
             let (out, next, offset) = (out, next, offset);
             let mut chunks = piece.chunks_exact(8);
             for chunk in &mut chunks {
                 let batch: [u64; 8] = chunk.try_into().expect("chunks of 8");
-                let place: [usize; 8] = std::array::from_fn(|k| (batch[k].wrapping_sub(offset) >> 32) as usize);
+                let lane: [usize; 8] = std::array::from_fn(|k| L * ((batch[k].wrapping_sub(offset) >> 32) as usize) + (k & (L - 1)));
                 let mut at = [0u32; 8];
-                for (at, place) in at.iter_mut().zip(place) {
-                    // SAFETY: the count pass indexed the same persons, below `span`.
+                for (at, lane) in at.iter_mut().zip(lane) {
+                    // SAFETY: the count pass indexed the same persons, below `span`, by
+                    // the same lanes (the pieces come as they did then).
                     unsafe {
-                        let slot = next.add(place);
+                        let slot = next.add(lane);
                         *at = *slot;
                         *slot = *at + 1;
                     }
@@ -442,10 +487,10 @@ pub(crate) fn bucket_dense_as(
                     unsafe { out.add(at as usize).write(key as u32) };
                 }
             }
-            for &key in chunks.remainder() {
+            for (k, &key) in chunks.remainder().iter().enumerate() {
                 // SAFETY: as above.
                 unsafe {
-                    let slot = next.add((key.wrapping_sub(offset) >> 32) as usize);
+                    let slot = next.add(L * ((key.wrapping_sub(offset) >> 32) as usize) + (k & (L - 1)));
                     out.add(*slot as usize).write(key as u32);
                     *slot += 1;
                 }
@@ -462,26 +507,24 @@ pub(crate) fn bucket_dense_as(
     side.push((u64::MAX, 0));
 
     // The clicks, grouped the same way; those of a person without events stay unread.
-    click_ends.clear();
-    click_ends.resize(span + 1, 0);
     {
-        let counts = click_ends.as_mut_ptr();
+        let counts = count(lanes);
         clicks(&mut |piece| {
             let (counts, base, span) = (counts, base, span);
             let mut chunks = piece.chunks_exact(8);
             for chunk in &mut chunks {
                 let at: [usize; 8] = std::array::from_fn(|k| (chunk[k].user as u32).wrapping_sub(base) as usize);
                 assert!(at.iter().all(|&at| at < span), "a click outside its bucket");
-                for at in at {
-                    // SAFETY: `at < span`, and `click_ends` has `span + 1` entries.
-                    unsafe { *counts.add(at + 1) += 1 };
+                for (k, at) in at.into_iter().enumerate() {
+                    // SAFETY: `at < span`, and `lanes` has `L` entries for each.
+                    unsafe { *counts.add(L * at + (k & (L - 1))) += 1 };
                 }
             }
-            for click in chunks.remainder() {
+            for (k, click) in chunks.remainder().iter().enumerate() {
                 let at = (click.user as u32).wrapping_sub(base) as usize;
                 assert!(at < span, "a click outside its bucket");
                 // SAFETY: as above.
-                unsafe { *counts.add(at + 1) += 1 };
+                unsafe { *counts.add(L * at + (k & (L - 1))) += 1 };
             }
         });
         // The clicks the parse placed: a person is its place already. The place is 16 bits,
@@ -493,37 +536,34 @@ pub(crate) fn bucket_dense_as(
             for chunk in &mut chunks {
                 let at: [u32; 8] = std::array::from_fn(|k| chunk[k].place() as u32);
                 assert!(at.iter().all(|&at| (at as usize) < span), "a click outside its bucket");
-                for at in at {
-                    // SAFETY: `at < span`, and `click_ends` has `span + 1` entries.
-                    unsafe { *counts.add(at as usize + 1) += 1 };
+                for (k, at) in at.into_iter().enumerate() {
+                    // SAFETY: `at < span`, and `lanes` has `L` entries for each.
+                    unsafe { *counts.add(L * at as usize + (k & (L - 1))) += 1 };
                 }
             }
-            for click in chunks.remainder() {
+            for (k, click) in chunks.remainder().iter().enumerate() {
                 let at = click.place();
                 assert!(at < span, "a click outside its bucket");
                 // SAFETY: as above.
-                unsafe { *counts.add(at + 1) += 1 };
+                unsafe { *counts.add(L * at + (k & (L - 1))) += 1 };
             }
         });
     }
-    let mut kept = 0u32;
-    for end in click_ends.iter_mut() {
-        kept += *end;
-        *end = kept;
-    }
+    let kept = place::<L>(lanes, click_ends, span);
     grouped.clear();
-    grouped.reserve(kept as usize);
+    grouped.reserve(kept);
     {
-        let (out, next) = (grouped.as_mut_ptr(), click_ends.as_mut_ptr());
+        let (out, next) = (grouped.as_mut_ptr(), lanes.as_mut_ptr());
         clicks(&mut |piece| {
             let (out, next, base) = (out, next, base);
             let mut chunks = piece.chunks_exact(8);
             for chunk in &mut chunks {
                 let mut at = [0u32; 8];
-                for (at, click) in at.iter_mut().zip(chunk) {
-                    // SAFETY: the count pass indexed the same persons, below `span`.
+                for (k, (at, click)) in at.iter_mut().zip(chunk).enumerate() {
+                    // SAFETY: the count pass indexed the same persons, below `span`, by
+                    // the same lanes.
                     unsafe {
-                        let slot = next.add((click.user as u32).wrapping_sub(base) as usize);
+                        let slot = next.add(L * ((click.user as u32).wrapping_sub(base) as usize) + (k & (L - 1)));
                         *at = *slot;
                         *slot = *at + 1;
                     }
@@ -534,10 +574,10 @@ pub(crate) fn bucket_dense_as(
                     unsafe { out.add(at as usize).write(Click { ts: click.ts, campaign: click.campaign, id: click.click }) };
                 }
             }
-            for click in chunks.remainder() {
+            for (k, click) in chunks.remainder().iter().enumerate() {
                 // SAFETY: as above.
                 unsafe {
-                    let slot = next.add((click.user as u32).wrapping_sub(base) as usize);
+                    let slot = next.add(L * ((click.user as u32).wrapping_sub(base) as usize) + (k & (L - 1)));
                     out.add(*slot as usize).write(Click { ts: click.ts, campaign: click.campaign, id: click.click });
                     *slot += 1;
                 }
@@ -548,10 +588,11 @@ pub(crate) fn bucket_dense_as(
             let mut chunks = piece.chunks_exact(8);
             for chunk in &mut chunks {
                 let mut at = [0u32; 8];
-                for (at, click) in at.iter_mut().zip(chunk) {
-                    // SAFETY: the count pass indexed the same persons, below `span`.
+                for (k, (at, click)) in at.iter_mut().zip(chunk).enumerate() {
+                    // SAFETY: the count pass indexed the same persons, below `span`, by
+                    // the same lanes.
                     unsafe {
-                        let slot = next.add(click.place());
+                        let slot = next.add(L * click.place() + (k & (L - 1)));
                         *at = *slot;
                         *slot = *at + 1;
                     }
@@ -562,22 +603,22 @@ pub(crate) fn bucket_dense_as(
                     unsafe { out.add(at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.click }) };
                 }
             }
-            for click in chunks.remainder() {
+            for (k, click) in chunks.remainder().iter().enumerate() {
                 // SAFETY: as above.
                 unsafe {
-                    let slot = next.add(click.place());
+                    let slot = next.add(L * click.place() + (k & (L - 1)));
                     out.add(*slot as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.click });
                     *slot += 1;
                 }
             }
         });
         // SAFETY: every position in `0..kept` was written once above.
-        unsafe { grouped.set_len(kept as usize) };
+        unsafe { grouped.set_len(kept) };
     }
 
     // The sessions, rows and counters a bucket at a time, where the build, the window and
     // the attribution allow it; person by person below otherwise.
-    let _ = wide_walk;
+    let _ = (wide_walk, cut);
     #[cfg(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512bw", target_feature = "avx512dq", target_feature = "avx512vl", target_feature = "avx512cd", target_feature = "bmi2"))]
     {
         if wide_walk
@@ -588,9 +629,11 @@ pub(crate) fn bucket_dense_as(
             // SAFETY: the scatters above left `ends` and `click_ends` as each person's end.
             unsafe {
                 if narrow {
-                    crate::dense_walk::walk::<true>(ctx, base, span, ends, click_ends, &mut ts[..], &mut grouped[..], &side[..], &mut dense.walk, sorter, wide, counters, user_narrow)
+                    crate::dense_walk::walk::<true, false>(ctx, base, span, ends, click_ends, &mut ts[..], &mut grouped[..], &side[..], &mut dense.walk, sorter, wide, counters, user_narrow)
+                } else if cut {
+                    crate::dense_walk::walk::<false, true>(ctx, base, span, ends, click_ends, &mut ts[..], &mut grouped[..], &side[..], &mut dense.walk, sorter, wide, counters, user_narrow)
                 } else {
-                    crate::dense_walk::walk::<false>(ctx, base, span, ends, click_ends, &mut ts[..], &mut grouped[..], &side[..], &mut dense.walk, sorter, wide, counters, user_narrow)
+                    crate::dense_walk::walk::<false, false>(ctx, base, span, ends, click_ends, &mut ts[..], &mut grouped[..], &side[..], &mut dense.walk, sorter, wide, counters, user_narrow)
                 }
             };
             return;
