@@ -56,12 +56,17 @@ pub(crate) struct Attr {
     /// Per session, and one more: the latest click whose stretch begins there.
     best_ts: Vec<u32>,
     best_at: Vec<u32>,
-    /// Per campaign, `words` words: the sessions it assists, a bit each. All zero between
-    /// persons.
+    /// Per campaign of the person in hand, in the order its clicks name them (`touched`), a
+    /// row of words: the sessions it assists, a bit each. All zero between persons.
+    ///
+    /// A row for every campaign there is, found by the campaign's number, was 176 KB at
+    /// 2,000 campaigns and eleven words of sessions, and a click's row anywhere in it: a
+    /// line from outside the caches a click. A person's clicks name a few dozen campaigns.
     cmask: Vec<u64>,
-    words: usize,
-    /// Per campaign: `stamp` once it is in `touched` for the person in hand.
-    seen: Vec<u32>,
+    /// Per campaign: `stamp << 32 | place` once it is in `touched` for the person in hand,
+    /// `place` being where. One word, read and written whole: a click of the campaign of the
+    /// click before reads what that one has just stored.
+    seen: Vec<u64>,
     stamp: u32,
     touched: Vec<u32>,
 }
@@ -126,10 +131,10 @@ impl Attr {
         self.best_at.clear();
         self.best_at.resize(sessions + 1, NO_CLICK);
         let words = sessions.div_ceil(64);
-        if words > self.words {
-            self.words = words;
-            self.cmask.clear();
-            self.cmask.resize(self.seen.len() * words, 0);
+        // A row for each campaign the clicks can name.
+        let rows = n.min(self.seen.len());
+        if self.cmask.len() < rows * words {
+            self.cmask.resize(rows * words, 0);
         }
         if self.stamp == u32::MAX {
             self.seen.fill(0);
@@ -156,16 +161,17 @@ impl Attr {
             }
             self.table[cap] = sessions as u16;
         }
-        let (stride, stamp) = (self.words, self.stamp);
+        let stamp = self.stamp;
         let (st, table, prefix) = (self.st.as_ptr(), self.table.as_ptr(), self.prefix.as_mut_ptr());
         let (best_ts, best_at) = (self.best_ts.as_mut_ptr(), self.best_at.as_mut_ptr());
         let (cmask, seen, touched) = (self.cmask.as_mut_ptr(), self.seen.as_mut_ptr(), self.touched.as_mut_ptr());
         // SAFETY: `st` holds the starts and `u32::MAX` after them, so a count stops at
         // `sessions` at the latest (no click is at `u32::MAX`, and a week's end is kept below
         // it); `table` has `cap + 1` entries; `best_*` and `prefix` have `sessions + 1`; a
-        // campaign is below the counters' count (the caller's contract), which is `seen`'s, and
-        // its `stride >= words` words of `cmask` hold bits below `sessions` only; `touched` has
-        // room for a campaign per click. AVX-512 F and BMI2 are compiled in.
+        // campaign is below the counters' count (the caller's contract), which is `seen`'s; its
+        // row of `cmask` is its place in `touched`, below the campaigns the clicks name, which
+        // `cmask` has rows for, and holds bits below `sessions` only; `touched` has room for a
+        // campaign per click. AVX-512 F and BMI2 are compiled in.
         unsafe {
             let mut before = _mm512_setzero_si512();
             let one = _mm512_set1_epi32(1);
@@ -209,12 +215,16 @@ impl Attr {
                         *best_at.add(lo) = k as u32;
                     }
                 }
-                // Its campaign's sessions.
+                // Its campaign's sessions: the campaign's row is its place among those the
+                // person's clicks have named so far.
                 let campaign = click.campaign as usize;
+                let held = *seen.add(campaign);
+                let new = (held >> 32) as u32 != stamp;
+                let place = if new { marked } else { held as u32 as usize };
+                *seen.add(campaign) = u64::from(stamp) << 32 | place as u64;
                 *touched.add(marked) = campaign as u32;
-                marked += usize::from(*seen.add(campaign) != stamp);
-                *seen.add(campaign) = stamp;
-                let row = cmask.add(campaign * stride);
+                marked += usize::from(new);
+                let row = cmask.add(place * words);
                 if words == 1 {
                     *row |= _bzhi_u64(!0, hi as u32) & !_bzhi_u64(!0, lo as u32);
                 } else {
@@ -242,8 +252,8 @@ impl Attr {
             }
 
             // The assists: each campaign's runs of sessions, a day's count each.
-            for &campaign in std::slice::from_raw_parts(touched, marked) {
-                let row = std::slice::from_raw_parts_mut(cmask.add(campaign as usize * stride), words);
+            for (place, &campaign) in std::slice::from_raw_parts(touched, marked).iter().enumerate() {
+                let row = std::slice::from_raw_parts_mut(cmask.add(place * words), words);
                 let cells = assisted.as_mut_ptr().add(campaign as usize * DAYS).cast::<__m512i>();
                 debug_assert!(campaign as usize * DAYS + DAYS <= assisted.len());
                 let mut sum = _mm512_loadu_si512(cells);

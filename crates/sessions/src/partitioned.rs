@@ -298,6 +298,9 @@ pub struct Dense {
     /// events in `ts`, after it one past the last. The same for the clicks.
     ends: Vec<u32>,
     click_ends: Vec<u32>,
+    /// Four counters a person, for the events and then for the clicks: before a scatter the
+    /// first position of what the person has in each lane of a round, after it the last.
+    lanes: Vec<u32>,
     /// The events' times, a person's together; sorted person by person as they are walked.
     ts: Vec<u32>,
     clicks: Vec<Click>,
@@ -354,7 +357,7 @@ pub(crate) fn bucket_dense_as(
     let Agg { user_daily, bucket: scratch, attr, wide, day, counters, dense, .. } = agg;
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd")))]
     let Agg { user_daily, bucket: scratch, attr, day, counters, dense, .. } = agg;
-    let Dense { ends, click_ends, ts, clicks: grouped, side, sorter, .. } = dense;
+    let Dense { ends, click_ends, lanes, ts, clicks: grouped, side, sorter, .. } = dense;
     let offset = u64::from(base) << 32;
     // A key's person as its place among the bucket's; checked where it is first met, in the
     // counting passes, so that the scatters may trust it.
@@ -368,55 +371,77 @@ pub(crate) fn bucket_dense_as(
     // event for a count. A pass also copies what it captured into locals first: a store
     // through a raw pointer may be to the closure's own fields for all the compiler knows,
     // and each one was followed by a load of the pointer it had just used.
+    //
+    // A person has four counters, one for each of the round's lanes modulo four, so the
+    // counters two neighbours of a round add to are never the same one. Where store bypass
+    // is allowed, a processor that guesses which store a load will read from (AMD's since
+    // Zen 3) guessed wrong here again and again with one counter a person: a neighbour is
+    // now and then the same person, the pair is learnt, and the guesses that follow are
+    // undone at the cost of a mispredicted jump each. Counting the events was 23 cycles an
+    // event there, a quarter of the stage.
+    let count = |lanes: &mut Vec<u32>| {
+        lanes.clear();
+        lanes.resize(4 * span, 0);
+        lanes.as_mut_ptr()
+    };
+    // The counts to positions: each lane's first, person after person, and in `ends` one
+    // past each person's last. Returns how many there are.
+    fn place(lanes: &mut [u32], ends: &mut Vec<u32>, span: usize) -> usize {
+        ends.clear();
+        ends.resize(span + 1, 0);
+        let mut n = 0u32;
+        for (person, counts) in lanes.chunks_exact_mut(4).enumerate() {
+            for count in counts {
+                (*count, n) = (n, n + *count);
+            }
+            ends[person] = n;
+        }
+        ends[span] = n;
+        n as usize
+    }
 
     // The events: counted per person, then each time to its person's stretch.
-    ends.clear();
-    ends.resize(span + 1, 0);
     {
-        let counts = ends.as_mut_ptr();
+        let counts = count(lanes);
         events(&mut |piece| {
             let (counts, offset, span) = (counts, offset, span);
             let mut chunks = piece.chunks_exact(8);
             for chunk in &mut chunks {
                 let at: [usize; 8] = std::array::from_fn(|k| (chunk[k].wrapping_sub(offset) >> 32) as usize);
                 assert!(at.iter().all(|&at| at < span), "an event outside its bucket");
-                for at in at {
-                    // SAFETY: `at < span`, and `ends` has `span + 1` entries.
-                    unsafe { *counts.add(at + 1) += 1 };
+                for (k, at) in at.into_iter().enumerate() {
+                    // SAFETY: `at < span`, and `lanes` has four entries for each.
+                    unsafe { *counts.add(4 * at + (k & 3)) += 1 };
                 }
             }
-            for &key in chunks.remainder() {
+            for (k, &key) in chunks.remainder().iter().enumerate() {
                 let at = (key.wrapping_sub(offset) >> 32) as usize;
                 assert!(at < span, "an event outside its bucket");
                 // SAFETY: as above.
-                unsafe { *counts.add(at + 1) += 1 };
+                unsafe { *counts.add(4 * at + (k & 3)) += 1 };
             }
         });
     }
-    let mut n = 0u32;
-    for end in ends.iter_mut() {
-        n += *end;
-        *end = n;
-    }
-    let n = n as usize;
+    let n = place(lanes, ends, span);
     if n == 0 {
         return;
     }
     ts.clear();
     ts.reserve(n);
     {
-        let (out, next) = (ts.as_mut_ptr(), ends.as_mut_ptr());
+        let (out, next) = (ts.as_mut_ptr(), lanes.as_mut_ptr());
         events(&mut |piece| {
             let (out, next, offset) = (out, next, offset);
             let mut chunks = piece.chunks_exact(8);
             for chunk in &mut chunks {
                 let batch: [u64; 8] = chunk.try_into().expect("chunks of 8");
-                let place: [usize; 8] = std::array::from_fn(|k| (batch[k].wrapping_sub(offset) >> 32) as usize);
+                let lane: [usize; 8] = std::array::from_fn(|k| 4 * ((batch[k].wrapping_sub(offset) >> 32) as usize) + (k & 3));
                 let mut at = [0u32; 8];
-                for (at, place) in at.iter_mut().zip(place) {
-                    // SAFETY: the count pass indexed the same persons, below `span`.
+                for (at, lane) in at.iter_mut().zip(lane) {
+                    // SAFETY: the count pass indexed the same persons, below `span`, by
+                    // the same lanes (the pieces come as they did then).
                     unsafe {
-                        let slot = next.add(place);
+                        let slot = next.add(lane);
                         *at = *slot;
                         *slot = *at + 1;
                     }
@@ -427,10 +452,10 @@ pub(crate) fn bucket_dense_as(
                     unsafe { out.add(at as usize).write(key as u32) };
                 }
             }
-            for &key in chunks.remainder() {
+            for (k, &key) in chunks.remainder().iter().enumerate() {
                 // SAFETY: as above.
                 unsafe {
-                    let slot = next.add((key.wrapping_sub(offset) >> 32) as usize);
+                    let slot = next.add(4 * ((key.wrapping_sub(offset) >> 32) as usize) + (k & 3));
                     out.add(*slot as usize).write(key as u32);
                     *slot += 1;
                 }
@@ -447,47 +472,42 @@ pub(crate) fn bucket_dense_as(
     side.push((u64::MAX, 0));
 
     // The clicks, grouped the same way; those of a person without events stay unread.
-    click_ends.clear();
-    click_ends.resize(span + 1, 0);
     {
-        let counts = click_ends.as_mut_ptr();
+        let counts = count(lanes);
         clicks(&mut |piece| {
             let (counts, base, span) = (counts, base, span);
             let mut chunks = piece.chunks_exact(8);
             for chunk in &mut chunks {
                 let at: [usize; 8] = std::array::from_fn(|k| (chunk[k].user as u32).wrapping_sub(base) as usize);
                 assert!(at.iter().all(|&at| at < span), "a click outside its bucket");
-                for at in at {
-                    // SAFETY: `at < span`, and `click_ends` has `span + 1` entries.
-                    unsafe { *counts.add(at + 1) += 1 };
+                for (k, at) in at.into_iter().enumerate() {
+                    // SAFETY: `at < span`, and `lanes` has four entries for each.
+                    unsafe { *counts.add(4 * at + (k & 3)) += 1 };
                 }
             }
-            for click in chunks.remainder() {
+            for (k, click) in chunks.remainder().iter().enumerate() {
                 let at = (click.user as u32).wrapping_sub(base) as usize;
                 assert!(at < span, "a click outside its bucket");
                 // SAFETY: as above.
-                unsafe { *counts.add(at + 1) += 1 };
+                unsafe { *counts.add(4 * at + (k & 3)) += 1 };
             }
         });
     }
-    let mut kept = 0u32;
-    for end in click_ends.iter_mut() {
-        kept += *end;
-        *end = kept;
-    }
+    let kept = place(lanes, click_ends, span);
     grouped.clear();
-    grouped.reserve(kept as usize);
+    grouped.reserve(kept);
     {
-        let (out, next) = (grouped.as_mut_ptr(), click_ends.as_mut_ptr());
+        let (out, next) = (grouped.as_mut_ptr(), lanes.as_mut_ptr());
         clicks(&mut |piece| {
             let (out, next, base) = (out, next, base);
             let mut chunks = piece.chunks_exact(8);
             for chunk in &mut chunks {
                 let mut at = [0u32; 8];
-                for (at, click) in at.iter_mut().zip(chunk) {
-                    // SAFETY: the count pass indexed the same persons, below `span`.
+                for (k, (at, click)) in at.iter_mut().zip(chunk).enumerate() {
+                    // SAFETY: the count pass indexed the same persons, below `span`, by
+                    // the same lanes.
                     unsafe {
-                        let slot = next.add((click.user as u32).wrapping_sub(base) as usize);
+                        let slot = next.add(4 * ((click.user as u32).wrapping_sub(base) as usize) + (k & 3));
                         *at = *slot;
                         *slot = *at + 1;
                     }
@@ -498,17 +518,17 @@ pub(crate) fn bucket_dense_as(
                     unsafe { out.add(at as usize).write(Click { ts: click.ts, campaign: click.campaign, id: click.click }) };
                 }
             }
-            for click in chunks.remainder() {
+            for (k, click) in chunks.remainder().iter().enumerate() {
                 // SAFETY: as above.
                 unsafe {
-                    let slot = next.add((click.user as u32).wrapping_sub(base) as usize);
+                    let slot = next.add(4 * ((click.user as u32).wrapping_sub(base) as usize) + (k & 3));
                     out.add(*slot as usize).write(Click { ts: click.ts, campaign: click.campaign, id: click.click });
                     *slot += 1;
                 }
             }
         });
         // SAFETY: every position in `0..kept` was written once above.
-        unsafe { grouped.set_len(kept as usize) };
+        unsafe { grouped.set_len(kept) };
     }
 
     // The sessions, rows and counters a bucket at a time, where the build, the window and

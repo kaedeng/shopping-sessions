@@ -163,7 +163,7 @@ pub(crate) unsafe fn walk(
     }
     for &p in people.iter() {
         let (from, end) = stretch(p as usize);
-        sort_times::sort(&mut ts[from..end], sorter);
+        sort_times::cut(&mut ts[from..end], sorter);
         first[from >> 6] |= 1 << (from & 63);
     }
 
