@@ -389,33 +389,67 @@ fn run() -> Result<(), String> {
         std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
     }
     let failure = OnceLock::new();
-    let mut outputs: Vec<(&mut Agg, &mut Scattered)> = aggs.iter_mut().zip(&mut scattered).collect();
-    par::each(&mut outputs, |worker, (agg, mine)| {
-        let rows = std::mem::take(&mut agg.user_daily);
-        // The opaque pipeline's persons are places in its directory: the writer asks for
-        // their names.
-        #[cfg(feature = "pipe-positional")]
-        let written = match &names {
-            Some(names) => output::user_daily_named(&user_folder, worker, &ctx, rows, &|keys, out| names.texts(keys, out)),
-            None => output::user_daily(&user_folder, worker, &ctx, rows),
-        };
-        #[cfg(not(feature = "pipe-positional"))]
-        let written = output::user_daily(&user_folder, worker, &ctx, rows);
-        if let Err(error) = written {
-            drop(failure.set(error));
+    // The opaque pipeline's persons are places in its directory: the writer asks for their
+    // names.
+    type TextOf<'a> = &'a (dyn Fn(&[types::Id], &mut Vec<u8>) + Sync);
+    #[cfg(feature = "pipe-positional")]
+    let texts = names.as_ref().map(|names| move |keys: &[types::Id], out: &mut Vec<u8>| names.texts(keys, out));
+    #[cfg(feature = "pipe-positional")]
+    let text_of: Option<TextOf> = texts.as_ref().map(|texts| texts as TextOf);
+    #[cfg(not(feature = "pipe-positional"))]
+    let text_of: Option<TextOf> = None;
+    // The stage's tasks, a file each, taken by whichever worker is free: every worker's
+    // `user_daily` rows, then `campaign_daily` in as many parts as there are workers (a
+    // part is an even share of the cells, summed over every worker's counters).
+    //
+    // The rows `sessions::dense_walk` left narrow go in `SS_OUT_PIECES` stretches a worker
+    // (3 unless set): one file a worker, written by that worker, ended the stage on the
+    // worker with the most rows (a third more than the one with the fewest, 2 ms of 7 at
+    // 20M events), and `campaign_daily`, summed and written whole by the one thread that
+    // was left after that, was 2 ms more. Rows of the other table are a file a worker,
+    // written also when a worker has no rows at all: a table needs a file.
+    let user_pieces = types::env::number("SS_OUT_PIECES", 3).clamp(1, 64);
+    enum File<'a> {
+        Narrow(types::rows::NarrowPiece<'a>),
+        Whole(types::rows::UserDaily),
+        Campaign(usize),
+    }
+    let mut tables: Vec<_> = aggs.iter_mut().map(|agg| (std::mem::take(&mut agg.user_daily), std::mem::take(&mut agg.user_narrow))).collect();
+    let (aggs, parts) = (&aggs, tables.len());
+    let mut files: Vec<std::sync::Mutex<Option<File>>> = Vec::new();
+    for (rows, narrow) in tables.iter_mut() {
+        let walked = !narrow.is_empty();
+        files.extend(narrow.pieces(user_pieces).into_iter().filter(|piece| !piece.is_empty()).map(|piece| std::sync::Mutex::new(Some(File::Narrow(piece)))));
+        if !(walked && rows.person.is_empty()) {
+            files.push(std::sync::Mutex::new(Some(File::Whole(std::mem::take(rows)))));
         }
+    }
+    files.extend((0..parts).map(|part| std::sync::Mutex::new(Some(File::Campaign(part)))));
+    let mut states: Vec<(&mut Scattered, bool)> = scattered.iter_mut().map(|mine| (mine, false)).collect();
+    par::run(&mut states, files.len(), |_, (mine, released), task| {
         // Slot `free-early`: the person buckets are dead since the sessions stage.
-        if free_early {
+        if free_early && !*released {
+            *released = true;
             mine.events.release();
             mine.clicks.release();
         }
+        let file = files[task].lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take().expect("a task is taken once");
+        let written = match file {
+            File::Narrow(piece) => output::user_daily_narrow(&user_folder, task, &ctx, piece, text_of),
+            File::Whole(rows) => match text_of {
+                Some(text_of) => output::user_daily_named(&user_folder, task, &ctx, rows, text_of),
+                None => output::user_daily(&user_folder, task, &ctx, rows),
+            },
+            File::Campaign(part) => output::campaign_daily(&campaign_folder, part, &ctx, sessions::campaign_daily_part(&ctx, aggs, part, parts)),
+        };
+        if let Err(error) = written {
+            drop(failure.set(error));
+        }
     });
-    drop(outputs);
-    types::tl::mark("user_daily written");
+    drop((states, files));
     if let Some(error) = failure.into_inner() {
         return Err(error);
     }
-    output::campaign_daily(&campaign_folder, 0, &ctx, sessions::campaign_daily(&ctx, &aggs))?;
     lap("output");
     if timing {
         eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);

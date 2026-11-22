@@ -47,6 +47,23 @@ pub fn user_daily_named(folder: &Path, worker: usize, ctx: &Ctx, mut rows: UserD
     arrow::user_daily(folder, worker, ctx, rows)
 }
 
+/// `user_daily`, or with `text_of` `user_daily_named`, for rows left narrow: a stretch of a
+/// `types::rows::UserDailyNarrow` (`pieces`) to `folder/part-{part}.parquet`. The same
+/// table, the file half as long and its columns written from where they lie
+/// (`direct::user_daily_narrow`). Through arrow-rs the rows are made whole first. Called
+/// concurrently, one call per part.
+pub fn user_daily_narrow(folder: &Path, part: usize, ctx: &Ctx, rows: types::rows::NarrowPiece, text_of: Option<&(dyn Fn(&[types::Id], &mut Vec<u8>) + Sync)>) -> Result<(), String> {
+    #[cfg(feature = "out-direct")]
+    if types::env::pick("SS_OUT", &["direct", "arrow"]) == 0 {
+        return direct::user_daily_narrow(folder, part, ctx, rows, text_of);
+    }
+    let whole = rows.widen(ctx.day0);
+    match text_of {
+        Some(text_of) => user_daily_named(folder, part, ctx, whole, text_of),
+        None => user_daily(folder, part, ctx, whole),
+    }
+}
+
 /// Writes `rows`, the whole table or a part of it, to `folder/part-{part}.parquet`, also when
 /// there are none. `folder` exists. Called concurrently, one call per part.
 ///

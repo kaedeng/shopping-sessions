@@ -351,9 +351,12 @@ pub(crate) fn bucket_dense_as(
     wide_walk: bool,
 ) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
-    let Agg { user_daily, bucket: scratch, attr, wide, day, counters, dense, .. } = agg;
+    let Agg { user_daily, user_narrow, bucket: scratch, attr, wide, day, counters, dense, .. } = agg;
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd")))]
     let Agg { user_daily, bucket: scratch, attr, day, counters, dense, .. } = agg;
+    // The walk's table; a build without the walk has no use for it.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
+    let _ = &user_narrow;
     let Dense { ends, click_ends, ts, clicks: grouped, side, sorter, .. } = dense;
     let offset = u64::from(base) << 32;
     // A key's person as its place among the bucket's; checked where it is first met, in the
@@ -522,7 +525,7 @@ pub(crate) fn bucket_dense_as(
             && let Some(wide) = wide.as_mut()
         {
             // SAFETY: the scatters above left `ends` and `click_ends` as each person's end.
-            unsafe { crate::dense_walk::walk(ctx, base, span, ends, click_ends, &mut ts[..], &mut grouped[..], &side[..], &mut dense.walk, sorter, wide, counters, user_daily) };
+            unsafe { crate::dense_walk::walk(ctx, base, span, ends, click_ends, &mut ts[..], &mut grouped[..], &side[..], &mut dense.walk, sorter, wide, counters, user_narrow) };
             return;
         }
     }

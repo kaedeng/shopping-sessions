@@ -182,7 +182,7 @@ fn main() {
             let campaign_rows = sessions::campaign_daily(&ctx, &aggs);
             let secs = t.elapsed().as_secs_f64();
             best = best.min(secs);
-            let user_rows: usize = aggs.iter().map(|agg| agg.user_daily.person.len()).sum();
+            let user_rows: usize = aggs.iter().map(|agg| agg.user_daily.person.len() + agg.user_narrow.len()).sum();
             let sessions: i64 = campaign_rows.sessions.iter().sum();
             let organic: i64 = campaign_rows
                 .campaign

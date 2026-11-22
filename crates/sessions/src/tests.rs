@@ -300,9 +300,12 @@ fn matches_the_reference_on_random_buckets() {
                     net,
                     wide_walk,
                 );
-                let rows = &agg.user_daily;
-                let mut user_rows: Vec<UserRow> = (0..rows.person.len())
-                    .map(|i| (everyone[(rows.person[i] as usize - base as usize) / step], rows.day[i], rows.sessions[i], rows.events[i], rows.revenue_cents[i], rows.top_category[i]))
+                // The rows of either table: the walk's are narrow.
+                let narrow = agg.user_narrow.widen(ctx.day0);
+                let mut user_rows: Vec<UserRow> = [&agg.user_daily, &narrow]
+                    .into_iter()
+                    .flat_map(|rows| (0..rows.person.len()).map(move |i| (rows.person[i], rows.day[i], rows.sessions[i], rows.events[i], rows.revenue_cents[i], rows.top_category[i])))
+                    .map(|(person, day, sessions, events, revenue, top)| (everyone[(person as usize - base as usize) / step], day, sessions, events, revenue, top))
                     .collect();
                 user_rows.sort();
                 let rows = campaign_daily(&ctx, std::slice::from_ref(&agg));
