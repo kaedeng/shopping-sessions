@@ -62,7 +62,7 @@ pub struct Persons {
 impl Persons {
     /// The persons the links make: a union-find over the users' numbers, each root keeping
     /// its component's smallest ID as the links come.
-    pub fn new(users: &Users, links: &[Vec<LinkRec>]) -> Persons {
+    pub fn new(users: &Users, links: &[&[LinkRec]]) -> Persons {
         // Zeroed lazily by the kernel, and touched only where a user's number is: the
         // numbers are dense, so that is the arrays' first few megabytes.
         // SAFETY: all zeros is a valid integer, and a valid pair of them.
@@ -90,7 +90,7 @@ impl Persons {
         // Whether the ID of `a` is the smaller: by the first 8 bytes, and by all of them
         // where those are the same.
         let less = |a: (u32, u64), b: (u32, u64)| if a.1 != b.1 { a.1 < b.1 } else { a.0 != b.0 && users.less(a.0, b.0) };
-        let all = || links.iter().flatten();
+        let all = || links.iter().copied().flatten();
         // The entries of the link a few on are asked for as each link is taken: the links
         // come in no order.
         let ahead = |up: &[u32], names: &[(u32, u64)], next: Option<&LinkRec>| {
@@ -326,28 +326,49 @@ fn scatter_dense<R: Row>(kept: &[R], persons: &Persons, shift: u32, out: &mut De
     out.keys.fence();
 }
 
-/// `scatter_clicks` into the same buckets.
+/// `scatter_clicks` into the same buckets. With `recycle`, a chunk of the worker's list goes
+/// to the buckets' lists once its clicks are placed (`Chunks::give`).
 #[inline(always)]
-fn scatter_clicks_dense(from: &Out, persons: &Persons, shift: u32, out: &mut DenseBuckets) {
-    let mut place = |piece: &[ingest::opaque::Ck]| {
+fn scatter_clicks_dense(from: &Out, persons: &Persons, shift: u32, recycle: bool, out: &mut DenseBuckets) {
+    #[inline(always)]
+    fn place(piece: &[ingest::opaque::Ck], persons: &Persons, shift: u32, out: &mut DenseBuckets) {
         for click in piece {
             let root = persons.of(click.user_ts as u32);
             let rec = ClickRec { user: u64::from(root) + 1, click: click.click, ts: (click.user_ts >> 32) as u32, campaign: click.campaign as u32 };
             out.clicks.push((root >> shift) as usize, rec);
         }
-    };
+    }
     // A piece is a chunk of the list, 168 clicks: its persons are asked for when it comes,
     // and placed is the piece before it, asked for a piece ago.
-    let mut asked: &[ingest::opaque::Ck] = &[];
-    from.clicks.for_each(0, |piece| {
+    let mut asked: (&[ingest::opaque::Ck], usize) = (&[], 0);
+    from.clicks.for_each_chunk(0, |piece, chunk| {
         for click in piece {
             persons.prefetch(click.user_ts as u32);
         }
-        place(asked);
-        asked = piece;
+        place(asked.0, persons, shift, out);
+        if recycle && asked.1 != 0 {
+            // SAFETY: the chunk's clicks are placed and the piece after it has come: the
+            // worker's list, which outlives the buckets, is not read there again.
+            unsafe { out.clicks.give(asked.1) };
+        }
+        asked = (piece, chunk);
     });
-    place(asked);
+    place(asked.0, persons, shift, out);
     out.clicks.fence();
+}
+
+/// The chunks of list `list` of every worker's parse, which the dedup has just read, to the
+/// buckets' lists of the worker that read them (`Chunks::give`): a few for the purchases'
+/// lists, the rest for the keys'.
+fn give_chunks<R: Copy>(parsed: &[Out], of: impl Fn(&Out) -> &Chunks<R>, list: usize, ranges: &mut DenseBuckets) {
+    for out in parsed {
+        of(out).chunks_of(list, |chunk| {
+            // SAFETY: the parse's lists outlive the buckets' (neither is dropped before the
+            // run ends), a list is read by the one task that deduplicates it, and that
+            // task has read it.
+            unsafe { if ranges.pays.spare() < 4 { ranges.pays.give(chunk) } else { ranges.keys.give(chunk) } };
+        });
+    }
 }
 
 /// A worker's clicks to their persons' buckets.
@@ -449,7 +470,9 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
                 std::hint::spin_loop();
             }
             types::tl::mark("links read");
-            let read: Vec<Vec<LinkRec>> = links.iter().map(|read| read.get().cloned().unwrap_or_default()).collect();
+            // The lists as they are: copied into one `Vec` each they were 21 MB at 20M events
+            // and 64 MB at 60M, written to fresh pages by the one task the persons wait for.
+            let read: Vec<&[LinkRec]> = links.iter().map(|read| read.get().map_or(&[][..], Vec::as_slice)).collect();
             drop(persons.set(Persons::new(&plan.users, &read)));
             types::tl::mark("links named");
         } else {
@@ -464,6 +487,10 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
 
     let (parts, long_parts, buckets) = (1usize << plan.part_bits, 1usize << plan.long_bits, 1usize << ctx.bucket_bits);
     let events: usize = parsed.iter().map(|out| out.events.len() + out.long_events.len()).sum();
+    // A worker's `user_daily` rows get their room once (`types::rows::expect`): generated
+    // data has a row for every 8 or 9 events, so a quarter of an even share of the events
+    // is twice a worker's rows.
+    types::rows::expect(events / ctx.workers / 4);
     let clicks: usize = parsed.iter().map(|out| out.clicks.len()).sum();
     let room = |rows: usize| rows / ctx.workers / buckets * 9 / 8 + 64;
     if std::env::var_os("SS_TIMING").is_some() {
@@ -495,6 +522,11 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
             dense: None,
         },
     });
+    // `SS_RECYCLE=on|off`: the buckets' lists written into the chunks of the parse's lists
+    // as the dedup has read them (`Chunks::give`), for buckets that are ranges of numbers.
+    // `off`: into fresh memory, and the parse's lists handed back to the kernel after the
+    // stage.
+    let recycle = dense.is_some() && types::env::pick("SS_RECYCLE", &["on", "off"]) == 0;
     {
         let (parsed, persons) = (&parsed[..], &persons);
         // The clicks' tasks are taken first: each is a worker's whole list, as long as
@@ -508,12 +540,18 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
             if let (Some(ranges), Some((shift, _))) = (ranges, dense) {
                 if task < parts {
                     dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, table, kept);
+                    if recycle {
+                        give_chunks(parsed, |out| &out.events, task, ranges);
+                    }
                     scatter_dense(kept, persons, shift, ranges);
                 } else if task < parts + long_parts {
                     dedup(parsed.iter().map(|out| &out.long_events), task - parts, plan.long_bits, table, kept_long);
+                    if recycle {
+                        give_chunks(parsed, |out| &out.long_events, task - parts, ranges);
+                    }
                     scatter_dense(kept_long, persons, shift, ranges);
                 } else {
-                    scatter_clicks_dense(&parsed[task - parts - long_parts], persons, shift, ranges);
+                    scatter_clicks_dense(&parsed[task - parts - long_parts], persons, shift, recycle, ranges);
                 }
             } else if task < parts {
                 dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, table, kept);
@@ -528,7 +566,9 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
         });
     }
     lap("dedup");
-    if types::mem::free_early() {
+    // The parse's lists are dead. Where their chunks went to the buckets' lists they stay,
+    // with those, to the end of the run; else each worker hands its own back now.
+    if types::mem::free_early() && !recycle {
         par::each(&mut parsed, |_, out| out.release());
     }
     // The exit path skips destructors (`fast-exit`), and these are large.

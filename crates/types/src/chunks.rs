@@ -72,6 +72,8 @@ pub struct Chunks<T> {
     next: usize,
     end: usize,
     arenas: Vec<Arena>,
+    /// Chunks of other lists that those are done with (`give`): taken before the block's.
+    spare: Vec<usize>,
     _records: PhantomData<T>,
 }
 
@@ -99,6 +101,7 @@ impl<T: Copy> Chunks<T> {
             next: arena.ptr as usize,
             end: arena.ptr as usize + arena.layout.size(),
             arenas: vec![arena],
+            spare: Vec::new(),
             _records: PhantomData,
         }
     }
@@ -188,6 +191,15 @@ impl<T: Copy> Chunks<T> {
     #[cold]
     #[inline(never)]
     fn chunk(&mut self, list: usize, link: usize) -> usize {
+        if let Some(new) = self.spare.pop() {
+            if link == NONE {
+                self.head[list] = new;
+            } else {
+                // SAFETY: `link` is the link of the list's last chunk.
+                unsafe { (link as *mut usize).write(new) };
+            }
+            return new;
+        }
         if self.next == self.end {
             // The worker took more of the rows than its block was sized for.
             let arena = Arena::new(16 << 20);
@@ -212,6 +224,73 @@ impl<T: Copy> Chunks<T> {
             unsafe { (link as *mut usize).write(new) };
         }
         new
+    }
+
+    /// Hands these lists a chunk to write that some other list was read from and is done
+    /// with: a list's next chunk is such a one before it is one of the block's.
+    ///
+    /// A chunk of the block is a page nothing has touched. Where the machine has no huge
+    /// pages (the scorer), the kernel makes it one of its own 4 KB pages, zeroed, when it is
+    /// first written, and takes it back, one more page under one lock, when the run ends: at
+    /// 20M events the lists the dedup stage writes were 80,000 of a run's 390,000 pages. A
+    /// chunk the stage has just read is a page the process already has.
+    ///
+    /// # Safety
+    /// `chunk` is the address of a whole chunk (`chunks_of`, `for_each_chunk`) of lists that
+    /// outlive these, that nothing reads again, and that is not given twice.
+    pub unsafe fn give(&mut self, chunk: usize) {
+        debug_assert!(chunk != 0 && chunk & (CHUNK - 1) == 0);
+        self.spare.push(chunk);
+    }
+
+    /// Chunks given and not yet taken.
+    pub fn spare(&self) -> usize {
+        self.spare.len()
+    }
+
+    /// The address of every chunk of list `list`, for `give` once the list has been read.
+    pub fn chunks_of(&self, list: usize, mut each: impl FnMut(usize)) {
+        let head = self.head[list];
+        if head != 0 {
+            let last = (self.cur[list] - 1) & !(CHUNK - 1);
+            let mut chunk = head;
+            while chunk != last {
+                // SAFETY: a chunk but the last is full and holds the next one's address.
+                let next = unsafe { ((chunk + LINK) as *const usize).read() };
+                each(chunk);
+                chunk = next;
+            }
+            each(last);
+        }
+    }
+
+    /// `for_each`, and with each piece the address of the chunk it is (0 for what is staged):
+    /// once `piece` has returned for the piece after it, nothing of these lists reads that
+    /// chunk again.
+    #[inline(always)]
+    pub fn for_each_chunk<'a>(&'a self, list: usize, mut piece: impl FnMut(&'a [T], usize)) {
+        let head = self.head[list];
+        // SAFETY: as `for_each`.
+        unsafe {
+            if head != 0 {
+                let cur = self.cur[list];
+                let last = (cur - 1) & !(CHUNK - 1);
+                let mut chunk = head;
+                while chunk != last {
+                    let next = ((chunk + LINK) as *const usize).read();
+                    crate::mem::prefetch(next as *const u8);
+                    crate::mem::prefetch((next + 64) as *const u8);
+                    crate::mem::prefetch((next + LINK) as *const u8);
+                    piece(std::slice::from_raw_parts(chunk as *const T, LINK / Self::SIZE), chunk);
+                    chunk = next;
+                }
+                piece(std::slice::from_raw_parts(last as *const T, (cur - last) / Self::SIZE), last);
+            }
+            let staged = self.fill[list] as usize;
+            if staged != 0 {
+                piece(std::slice::from_raw_parts(self.stage.ptr.add(list * STAGE).cast::<T>(), staged / Self::SIZE), 0);
+            }
+        }
     }
 
     /// Makes this thread's streamed lines visible to other threads: call it after a task's
@@ -296,6 +375,8 @@ impl<T: Copy> Chunks<T> {
         self.cur.fill(NONE);
         self.head.fill(0);
         self.blocks.fill(0);
+        // Chunks that were given are other lists' pages: not handed back here, and not kept.
+        self.spare.clear();
         // The first block's used part; any further block whole.
         let first = &self.arenas[0];
         let used = if self.arenas.len() == 1 { self.next - first.ptr as usize } else { first.layout.size() };
@@ -375,6 +456,58 @@ mod tests {
             chunks.for_each(lists - 1, |piece| got.extend_from_slice(piece));
             assert_eq!(got, (0..40).map(&make).collect::<Vec<_>>());
         }
+    }
+
+    /// Lists written into the chunks of lists that were read hold what was appended, take
+    /// those chunks before any of their own block, and take none twice.
+    #[test]
+    fn given_chunks_are_written_before_the_blocks_own() {
+        let mut from: Chunks<[u64; 3]> = Chunks::new(5, 1 << 20);
+        for n in 0..20_000u64 {
+            from.push((n % 5) as usize, [n, !n, n * 3]);
+        }
+        from.fence();
+        let mut to: Chunks<u64> = Chunks::new(3, 1 << 20);
+        let (mut given, mut read) = (Vec::new(), 0u64);
+        for list in 0..5 {
+            // Read with the chunks' addresses, and given once read.
+            let mut pieces = Vec::new();
+            from.for_each_chunk(list, |piece, chunk| {
+                read += piece.len() as u64;
+                pieces.push(chunk);
+            });
+            let mut chunks = Vec::new();
+            from.chunks_of(list, |chunk| chunks.push(chunk));
+            // The pieces are the chunks, then what is staged.
+            assert_eq!(pieces.iter().copied().filter(|&chunk| chunk != 0).collect::<Vec<_>>(), chunks);
+            for chunk in chunks {
+                // SAFETY: `from` outlives `to`, and its list is not read again.
+                unsafe { to.give(chunk) };
+                given.push(chunk);
+            }
+        }
+        assert_eq!(read, 20_000);
+        let had = to.spare();
+        assert_eq!(had, given.len());
+        let mut expected = vec![Vec::new(); 3];
+        for n in 0..30_000u64 {
+            to.push((n % 3) as usize, n ^ 0x55);
+            expected[(n % 3) as usize].push(n ^ 0x55);
+        }
+        to.fence();
+        let mut used = Vec::new();
+        for (list, want) in expected.iter().enumerate() {
+            let mut got = Vec::new();
+            to.for_each(list, |piece| got.extend_from_slice(piece));
+            assert_eq!(&got, want, "list {list}");
+            to.chunks_of(list, |chunk| used.push(chunk));
+        }
+        // 30,000 records of 8 bytes are 60 chunks: all of them given ones, none twice.
+        assert!(!used.is_empty() && used.len() <= had);
+        used.sort_unstable();
+        used.dedup();
+        assert_eq!(used.len() + to.spare(), had);
+        assert!(used.iter().all(|chunk| given.contains(chunk)));
     }
 
     #[test]
