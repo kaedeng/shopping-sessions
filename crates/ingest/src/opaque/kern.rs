@@ -38,7 +38,6 @@ use core::arch::x86_64::*;
 
 use types::Ctx;
 use types::chunks::Chunks;
-use types::hash::C2;
 use types::id::pack_at;
 use types::record::PAY_CATEGORY_SHIFT;
 use types::time::DAY;
@@ -593,27 +592,35 @@ unsafe fn other(pair: *mut Batch, batch: *mut Batch) -> *mut Batch {
 /// Records held before they are scattered; a group adds at most 8.
 const HELD: usize = 128;
 
-/// The short-keyed records made and not yet scattered: list, then the record's three words.
+/// The short-keyed records made and not yet scattered: the record's three words.
 struct Held {
-    lists: [u64; HELD],
     key: [u64; HELD],
     user_ts: [u64; HELD],
     ingest_pay: [u64; HELD],
     len: usize,
+    /// 64 less the lists' bits: a key's list is the top bits of its hash.
+    shift: u32,
 }
 
 impl Held {
-    fn new() -> Held {
-        Held { lists: [0; HELD], key: [0; HELD], user_ts: [0; HELD], ingest_pay: [0; HELD], len: 0 }
+    fn new(plan: &Plan) -> Held {
+        Held { key: [0; HELD], user_ts: [0; HELD], ingest_pay: [0; HELD], len: 0, shift: 64 - plan.part_bits }
     }
 
     /// A function of its own: inside the decode its loop had no registers left.
+    ///
+    /// A record's list is made here, one multiply a record in a general register. In
+    /// `finish` it was a 512-bit multiply for eight keys (`mul_halves` says what that
+    /// costs on the scorer's cores).
     #[inline(never)]
     fn flush(&mut self, events: &mut Chunks<Ev>) {
-        let (lists, key, user_ts, ingest_pay) = (&self.lists, &self.key, &self.user_ts, &self.ingest_pay);
+        let (key, user_ts, ingest_pay, shift) = (&self.key, &self.user_ts, &self.ingest_pay, self.shift);
         // SAFETY: `len <= HELD`, and every list here is the top bits of a hash.
         unsafe {
-            events.extend(self.len, |at| (*lists.get_unchecked(at) as usize, Ev { key: *key.get_unchecked(at), user_ts: *user_ts.get_unchecked(at), ingest_pay: *ingest_pay.get_unchecked(at) }))
+            events.extend(self.len, |at| {
+                let key = *key.get_unchecked(at);
+                ((types::hash::hash(key) >> shift) as usize, Ev { key, user_ts: *user_ts.get_unchecked(at), ingest_pay: *ingest_pay.get_unchecked(at) })
+            })
         };
         self.len = 0;
     }
@@ -625,12 +632,10 @@ struct Consts {
     ts_end: __m512i,
     first_ms: __m512i,
     ingest_add: __m512i,
-    /// 64 less the lists' bits: a key's list is the top bits of its hash.
-    shift: __m128i,
 }
 
 impl Consts {
-    fn new(ctx: &Ctx, plan: &Plan, memo: &Memo) -> Consts {
+    fn new(ctx: &Ctx, memo: &Memo) -> Consts {
         // SAFETY: register arithmetic; AVX-512F is compiled in.
         #[allow(unused_unsafe)]
         unsafe {
@@ -642,7 +647,6 @@ impl Consts {
                 // `Ctx::ingest_rel` of the table's first midnight: whole seconds, as every
                 // midnight is.
                 ingest_add: all((memo.first_ms + ctx.origin).div_euclid(1000) - ctx.ingest_base()),
-                shift: _mm_cvtsi32_si128(64 - plan.part_bits as i32),
             }
         }
     }
@@ -657,6 +661,25 @@ fn pack_words(parts: __m256i) -> __m256i {
     // SAFETY: one AVX2 instruction on registers.
     unsafe { core::arch::asm!("vpackusdw {o}, {a}, {a}", o = lateout(ymm_reg) packed, a = in(ymm_reg) parts, options(pure, nomem, nostack, preserves_flags)) };
     packed
+}
+
+/// `_mm512_mul_epu32(x, by)` as two 256-bit multiplies, each written as the instruction it
+/// is: given the intrinsic on the two halves, the compiler joins them into one 512-bit
+/// multiply again. A 512-bit multiply is what Intel's server cores of the scorer's
+/// generation (Skylake to Cascade Lake) answer by dropping to their lowest clock, the
+/// "AVX-512 heavy" licence, for every instruction of both threads of the core and for
+/// about a millisecond after the last one; a 256-bit multiply asks for the licence the line
+/// kernel's own multiplies already hold.
+#[inline(always)]
+fn mul_halves(x: __m512i, by: __m256i) -> __m512i {
+    let (low, high): (__m256i, __m256i);
+    // SAFETY: two AVX2 instructions on registers; `low` is written before `b` and `by` are
+    // read, so it is a register of its own (`out`, not `lateout`).
+    unsafe {
+        let (a, b) = (_mm512_castsi512_si256(x), _mm512_extracti64x4_epi64::<1>(x));
+        core::arch::asm!("vpmuludq {l}, {a}, {m}", "vpmuludq {h}, {b}, {m}", a = in(ymm_reg) a, b = in(ymm_reg) b, m = in(ymm_reg) by, l = out(ymm_reg) low, h = lateout(ymm_reg) high, options(pure, nomem, nostack, preserves_flags));
+        _mm512_inserti64x4::<1>(_mm512_castsi256_si512(low), high)
+    }
 }
 
 /// The registers every line's checks use.
@@ -827,9 +850,9 @@ unsafe fn tail(t: *const u8, gap: usize, end: *const u8, days: *const u8, lanes:
 pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, out: &mut Out) {
     let Out { events, long_events, slow, .. } = out;
     let memo = Memo::of(ctx, dates);
-    let consts = Consts::new(ctx, plan, memo);
+    let consts = Consts::new(ctx, memo);
     let lanes = Lanes::new();
-    let mut held = Held::new();
+    let mut held = Held::new(plan);
     // Two batches in turn: when one is full its users' lines of the directory are asked
     // for, and the one before it, asked for a batch ago, is finished. (Asked for and looked
     // up in one go, the first rows of a batch still waited for their lines: the directory
@@ -1014,15 +1037,14 @@ unsafe fn finish(
             let valid = _mm512_cmpge_epi64_mask(ts, consts.event_lo) & _mm512_cmplt_epi64_mask(ts, consts.ts_end) & _mm512_cmple_epi64_mask(_mm512_sub_epi64(ingest, ts), all(DAY));
             // `Ctx::ingest_rel`: whole seconds since the table's first midnight (under 2^32
             // ms, so the product's high bits are the quotient by 1000), then from its base.
-            let seconds = _mm512_srli_epi64::<38>(_mm512_mul_epu32(_mm512_sub_epi64(ingest, consts.first_ms), all(274_877_907)));
+            let seconds = _mm512_srli_epi64::<38>(mul_halves(_mm512_sub_epi64(ingest, consts.first_ms), _mm256_set1_epi64x(274_877_907)));
             let ingest_rel = _mm512_add_epi64(seconds, consts.ingest_add);
             // The record's words: user | ts << 32 with no `ts` for a row that is not valid,
             // then the ingest (a purchase's `pay` is put above it by `others`).
             let place = _mm512_cvtepu32_epi64(_mm256_loadu_si256(batch.users.as_ptr().add(first).cast()));
             let user_ts = _mm512_or_si512(place, _mm512_slli_epi64::<32>(_mm512_maskz_mov_epi64(valid, ts)));
-            // `short_key_at`: the digits and one. Its list: the top bits of its hash.
+            // `short_key_at`: the digits and one. (Its list: `Held::flush`.)
             let key = _mm512_add_epi64(event, all(1));
-            let list = _mm512_srl_epi64(_mm512_mullo_epi64(key, all(C2 as i64)), consts.shift);
 
             let class = _mm512_loadu_si512(batch.class.as_ptr().add(first).cast());
             // Nothing set but, perhaps, a long user: a record as it stands.
@@ -1030,7 +1052,6 @@ unsafe fn finish(
             // Compressed in a register and stored whole: the lanes past the fast ones are
             // overwritten by the next store.
             let to = held.len;
-            _mm512_storeu_si512(held.lists.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, list));
             _mm512_storeu_si512(held.key.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, key));
             _mm512_storeu_si512(held.user_ts.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, user_ts));
             _mm512_storeu_si512(held.ingest_pay.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, ingest_rel));

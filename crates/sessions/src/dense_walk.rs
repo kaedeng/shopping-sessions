@@ -61,6 +61,25 @@ pub(crate) struct Walk {
     cat_sum: Vec<u64>,
 }
 
+/// `_mm512_mul_epu32(x, by)` as two 256-bit multiplies, each written as the instruction it
+/// is: given the intrinsic on the two halves, the compiler joins them into one 512-bit
+/// multiply again. A 512-bit multiply is what Intel's server cores of the scorer's
+/// generation (Skylake to Cascade Lake) answer by dropping to their lowest clock, the
+/// "AVX-512 heavy" licence, for every instruction of both threads of the core and for
+/// about a millisecond after the last one; a 256-bit multiply asks for the licence the line
+/// kernel's own multiplies already hold.
+#[inline(always)]
+fn mul_halves(x: __m512i, by: __m256i) -> __m512i {
+    let (low, high): (__m256i, __m256i);
+    // SAFETY: two AVX2 instructions on registers; `low` is written before `b` and `by` are
+    // read, so it is a register of its own (`out`, not `lateout`).
+    unsafe {
+        let (a, b) = (_mm512_castsi512_si256(x), _mm512_extracti64x4_epi64::<1>(x));
+        core::arch::asm!("vpmuludq {l}, {a}, {m}", "vpmuludq {h}, {b}, {m}", a = in(ymm_reg) a, b = in(ymm_reg) b, m = in(ymm_reg) by, l = out(ymm_reg) low, h = lateout(ymm_reg) high, options(pure, nomem, nostack, preserves_flags));
+        _mm512_inserti64x4::<1>(_mm512_castsi256_si512(low), high)
+    }
+}
+
 /// How many of a byte's bits are set at or below each bit: eight counts, a byte each.
 static UP_TO: [u64; 256] = {
     let mut table = [0u64; 256];
@@ -191,7 +210,8 @@ pub(crate) unsafe fn walk(
         // Each session's day, and the rows: a person's sessions of one day.
         let (origin_day, in_day) = ctx.day_split();
         // A day is 2^10 * 84375 ms, and for x below 2^22, x / 84375 is x * 6515625 >> 39.
-        let (add, magic) = (_mm512_set1_epi32(in_day as i32), _mm512_set1_epi64(6_515_625));
+        // The two multiplies a half at a time (`mul_halves`).
+        let (add, magic) = (_mm512_set1_epi32(in_day as i32), _mm256_set1_epi64x(6_515_625));
         let behind = _mm512_set1_epi32((i64::from(ctx.day0) - origin_day) as i32);
         let organic = _mm512_set1_epi32(ctx.organic() as i32);
         let mut day_before = _mm512_set1_epi32(-1);
@@ -199,8 +219,8 @@ pub(crate) unsafe fn walk(
         while s < ns {
             let live: __mmask16 = if ns - s >= 16 { 0xFFFF } else { (1u16 << (ns - s)) - 1 };
             let x = _mm512_srli_epi32::<10>(_mm512_add_epi32(_mm512_loadu_si512(s_ts.as_ptr().add(s).cast()), add));
-            let even = _mm512_srli_epi64::<39>(_mm512_mul_epu32(x, magic));
-            let odd = _mm512_srli_epi64::<39>(_mm512_mul_epu32(_mm512_srli_epi64::<32>(x), magic));
+            let even = _mm512_srli_epi64::<39>(mul_halves(x, magic));
+            let odd = _mm512_srli_epi64::<39>(mul_halves(_mm512_srli_epi64::<32>(x), magic));
             let day = _mm512_sub_epi32(_mm512_or_si512(even, _mm512_slli_epi64::<32>(odd)), behind);
             _mm512_storeu_si512(s_day.as_mut_ptr().add(s).cast(), day);
             let position = _mm512_loadu_si512(s_at.as_ptr().add(s).cast());
