@@ -51,8 +51,10 @@ pub(crate) struct Attr {
     keys: Vec<u64>,
     ts: Vec<u32>,
     campaign: Vec<u32>,
-    /// `heavy` sorts the clicks (`SS_ATTR_HEAVY=sort`); `heavy_table` does not (the pick).
+    /// `heavy` sorts the clicks (`SS_ATTR_HEAVY=sort`); `heavy_table` does not (the pick), and
+    /// `flat` is its form without jumps on the data (`SS_ATTR_HEAVY=flat`).
     sorted: bool,
+    flat: bool,
     /// `heavy_table`: the person's starts with `u32::MAX` after them, and how many starts lie
     /// before each step of 2^`STEP` ms.
     st: Vec<u32>,
@@ -73,12 +75,15 @@ pub(crate) struct Attr {
 /// A step of `Attr::table`, as a shift of milliseconds: 17.5 minutes, under the 30 that part
 /// two sessions' starts.
 const STEP: u32 = 20;
+/// The same for `heavy_table::<_, true>`: 70 minutes, which hold at most three starts.
+const FLAT_STEP: u32 = 22;
 /// No click yet, in `Attr::best_at`.
 const NO_CLICK: u32 = u32::MAX;
 
 impl Attr {
     pub(crate) fn new(campaigns: usize) -> Attr {
-        Attr { last: vec![0; campaigns], seen: vec![0; campaigns], sorted: types::env::pick("SS_ATTR_HEAVY", &["table", "sort"]) == 1, ..Attr::default() }
+        let heavy = types::env::pick("SS_ATTR_HEAVY", &["table", "sort", "flat"]);
+        Attr { last: vec![0; campaigns], seen: vec![0; campaigns], sorted: heavy == 1, flat: heavy == 2, ..Attr::default() }
     }
 
     /// Credits one person's sessions and counts their assists. Session `i` starts at
@@ -96,8 +101,10 @@ impl Attr {
             self.light(clicks, starts, days, credits, assisted)
         } else if self.sorted || starts.len() >= usize::from(u16::MAX) {
             self.heavy::<false>(clicks, starts, days, credits, assisted)
+        } else if self.flat {
+            self.heavy_table::<false, true>(clicks, starts, days, credits, assisted)
         } else {
-            self.heavy_table::<false>(clicks, starts, days, credits, assisted)
+            self.heavy_table::<false, false>(clicks, starts, days, credits, assisted)
         }
     }
 
@@ -112,8 +119,10 @@ impl Attr {
             self.light_narrow(clicks, starts, days, credits, assisted)
         } else if self.sorted || starts.len() >= usize::from(u16::MAX) {
             self.heavy::<true>(clicks, starts, days, credits, assisted)
+        } else if self.flat {
+            self.heavy_table::<true, true>(clicks, starts, days, credits, assisted)
         } else {
-            self.heavy_table::<true>(clicks, starts, days, credits, assisted)
+            self.heavy_table::<true, false>(clicks, starts, days, credits, assisted)
         }
     }
 
@@ -133,7 +142,13 @@ impl Attr {
     ///   run of bits is a difference of two prefix sums, as in `heavy`.
     ///
     /// `NARROW`: a campaign's days in two 256-bit registers, the starts in two.
-    fn heavy_table<const NARROW: bool>(&mut self, clicks: &[Click], starts: &[u32], days: &[u32], credits: &mut [u32], assisted: &mut [u32]) {
+    ///
+    /// `FLAT`: no jump on the data where the steps above took one, about one a session and
+    /// one a click. The table is of steps of 2^`FLAT_STEP` ms from the first start's (a step
+    /// holds at most three starts, a count is three compares), made as a count per step and
+    /// the sums of the counts, where each start filled its stretch of the table; and the
+    /// latest click of a `lo` and so far are selects (the compiler made both jumps).
+    fn heavy_table<const NARROW: bool, const FLAT: bool>(&mut self, clicks: &[Click], starts: &[u32], days: &[u32], credits: &mut [u32], assisted: &mut [u32]) {
         let (n, sessions) = (clicks.len(), starts.len());
         let week = WEEK as u32;
         // Room for a 16-lane load, and two entries past the last start.
@@ -163,8 +178,22 @@ impl Attr {
         // The table: `table[g]` starts lie in the steps before step `g`; `cap` is the step
         // after the last start's, and stands for every later one.
         let wide = sessions > LIGHT;
-        let mut cap = 0usize;
-        if wide {
+        let (mut cap, mut first_step) = (0usize, 0u32);
+        if wide && FLAT {
+            // `table[g]` starts lie in the steps before step `first_step + g`.
+            first_step = starts[0] >> FLAT_STEP;
+            cap = ((starts[sessions - 1] >> FLAT_STEP) - first_step) as usize + 1;
+            self.table.clear();
+            self.table.resize(cap + 1, 0);
+            for &start in starts {
+                self.table[((start >> FLAT_STEP) - first_step) as usize + 1] += 1;
+            }
+            let mut sum = 0u16;
+            for entry in self.table.iter_mut() {
+                sum += *entry;
+                *entry = sum;
+            }
+        } else if wide {
             cap = (starts[sessions - 1] >> STEP) as usize + 1;
             self.table.clear();
             self.table.resize(cap + 1, 0);
@@ -195,7 +224,24 @@ impl Attr {
             for (k, click) in clicks.iter().enumerate() {
                 let ts = click.ts;
                 let end = ts.saturating_add(week).min(u32::MAX - 1);
-                let (lo, hi) = if wide {
+                let (lo, hi) = if wide && FLAT {
+                    let step = |at: u32| ((at >> FLAT_STEP).saturating_sub(first_step) as usize).min(cap);
+                    let mut lo = usize::from(*table.add(step(ts)));
+                    for _ in 0..3 {
+                        lo += usize::from(*st.add(lo) < ts);
+                    }
+                    while *st.add(lo) < ts {
+                        lo += 1;
+                    }
+                    let mut hi = usize::from(*table.add(step(end)));
+                    for _ in 0..3 {
+                        hi += usize::from(*st.add(hi) <= end);
+                    }
+                    while *st.add(hi) <= end {
+                        hi += 1;
+                    }
+                    (lo, hi)
+                } else if wide {
                     let mut lo = usize::from(*table.add(((ts >> STEP) as usize).min(cap)));
                     lo += usize::from(*st.add(lo) < ts);
                     while *st.add(lo) < ts {
@@ -213,8 +259,13 @@ impl Attr {
                 // The latest click of this `lo`.
                 let (held_ts, held) = (*best_ts.add(lo), *best_at.add(lo));
                 let take = (held == NO_CLICK) | (ts > held_ts);
-                *best_ts.add(lo) = if take { ts } else { held_ts };
-                *best_at.add(lo) = if take { k as u32 } else { held };
+                if FLAT {
+                    *best_ts.add(lo) = core::hint::select_unpredictable(take, ts, held_ts);
+                    *best_at.add(lo) = core::hint::select_unpredictable(take, k as u32, held);
+                } else {
+                    *best_ts.add(lo) = if take { ts } else { held_ts };
+                    *best_at.add(lo) = if take { k as u32 } else { held };
+                }
                 if !take && ts == held_ts {
                     let other = clicks.get_unchecked(held as usize);
                     if crate::id_order(click, other) == std::cmp::Ordering::Less {
@@ -245,8 +296,13 @@ impl Attr {
             for at in 0..sessions {
                 let here = *best_at.add(at);
                 let own = here != NO_CLICK;
-                latest_ts = if own { *best_ts.add(at) } else { latest_ts };
-                latest = if own { here } else { latest };
+                if FLAT {
+                    latest_ts = core::hint::select_unpredictable(own, *best_ts.add(at), latest_ts);
+                    latest = core::hint::select_unpredictable(own, here, latest);
+                } else {
+                    latest_ts = if own { *best_ts.add(at) } else { latest_ts };
+                    latest = if own { here } else { latest };
+                }
                 let any = latest != NO_CLICK;
                 let campaign = clicks.get_unchecked(if any { latest as usize } else { 0 }).campaign;
                 let credit = credits.get_unchecked_mut(at);
@@ -700,10 +756,13 @@ mod tests {
         let (mut wide, mut by_sort) = (Attr::new(ctx.campaigns.len()), Attr::new(ctx.campaigns.len()));
         (wide.sorted, by_sort.sorted) = (false, true);
         let mut by_sorted = vec![0u32; ctx.campaigns.len() * DAYS];
-        // And both in 256-bit registers.
+        // And both in 256-bit registers, and the table without jumps both ways.
         let (mut narrow, mut narrow_sort) = (Attr::new(ctx.campaigns.len()), Attr::new(ctx.campaigns.len()));
         (narrow.sorted, narrow_sort.sorted) = (false, true);
         let (mut by_narrow, mut by_narrow_sorted) = (vec![0u32; ctx.campaigns.len() * DAYS], vec![0u32; ctx.campaigns.len() * DAYS]);
+        let (mut flat, mut narrow_flat) = (Attr::new(ctx.campaigns.len()), Attr::new(ctx.campaigns.len()));
+        (flat.flat, narrow_flat.flat) = (true, true);
+        let (mut by_flat, mut by_narrow_flat) = (vec![0u32; ctx.campaigns.len() * DAYS], vec![0u32; ctx.campaigns.len() * DAYS]);
         let mut interval = attr_interval::Attr::new(&ctx);
         let cells = ctx.campaigns.len() * ctx.n_days;
         let (mut by_wide, mut by_interval) = (vec![0u32; ctx.campaigns.len() * DAYS], vec![0u32; cells]);
@@ -746,11 +805,14 @@ mod tests {
             let mut got_sorted = vec![organic; starts.len()];
             by_sort.person(&clicks, &starts, &days, &mut got_sorted, &mut by_sorted);
             assert_eq!(got, got_sorted, "person {person}: {clicks_n} clicks, {} sessions, table against sort", starts.len());
-            for (attr, assisted, what) in [(&mut narrow, &mut by_narrow, "narrow"), (&mut narrow_sort, &mut by_narrow_sorted, "narrow sort")] {
+            for (attr, assisted, what) in [(&mut narrow, &mut by_narrow, "narrow"), (&mut narrow_sort, &mut by_narrow_sorted, "narrow sort"), (&mut narrow_flat, &mut by_narrow_flat, "narrow flat")] {
                 let mut got_narrow = vec![organic; starts.len()];
                 attr.person_narrow(&clicks, &starts, &days, &mut got_narrow, assisted);
                 assert_eq!(got, got_narrow, "person {person}: {clicks_n} clicks, {} sessions, {what}", starts.len());
             }
+            let mut got_flat = vec![organic; starts.len()];
+            flat.person(&clicks, &starts, &days, &mut got_flat, &mut by_flat);
+            assert_eq!(got, got_flat, "person {person}: {clicks_n} clicks, {} sessions, flat", starts.len());
             let sorted = sort_clicks_for_test(&mut clicks);
             let want: Vec<u32> = starts.iter().zip(&days).map(|(&start, &day)| interval.session(&sorted, start, day as usize, organic, &mut by_interval)).collect();
             interval.end_person(&mut by_interval);
@@ -762,6 +824,8 @@ mod tests {
                 assert_eq!(by_sorted[campaign * DAYS + day], by_interval[day * ctx.campaigns.len() + campaign], "sorted: campaign {campaign}, day {day}");
                 assert_eq!(by_narrow[campaign * DAYS + day], by_interval[day * ctx.campaigns.len() + campaign], "narrow: campaign {campaign}, day {day}");
                 assert_eq!(by_narrow_sorted[campaign * DAYS + day], by_interval[day * ctx.campaigns.len() + campaign], "narrow sorted: campaign {campaign}, day {day}");
+                assert_eq!(by_flat[campaign * DAYS + day], by_interval[day * ctx.campaigns.len() + campaign], "flat: campaign {campaign}, day {day}");
+                assert_eq!(by_narrow_flat[campaign * DAYS + day], by_interval[day * ctx.campaigns.len() + campaign], "narrow flat: campaign {campaign}, day {day}");
             }
             assert!(by_wide[campaign * DAYS + ctx.n_days..(campaign + 1) * DAYS].iter().all(|&count| count == 0));
         }
