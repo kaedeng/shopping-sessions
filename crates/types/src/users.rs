@@ -34,7 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Acquire, Ord
 
 use crate::id::{self, Id, SLOW};
 use crate::mem::Zeroed;
-use crate::width::{Wide, Width};
+use crate::width::Width;
 
 /// No user: an empty `user_id`.
 pub const NO_USER: u32 = u32::MAX;
@@ -663,7 +663,7 @@ impl Users {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::width::Narrow;
+    use crate::width::{Narrow, Wide};
 
     fn short(text: &[u8]) -> Option<u64> {
         let mut bytes = [0u8; 48];
