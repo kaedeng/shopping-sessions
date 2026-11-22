@@ -43,7 +43,7 @@ use types::record::PAY_CATEGORY_SHIFT;
 use types::time::DAY;
 use types::users::NO_USER;
 
-use super::{ClickSink, Ev, EvL, Out, Plan, click_row, event_row};
+use super::{ClickSink, Ev, EvL, EvN, NARROW_INGEST, Out, Plan, SIX, click_row, event_row};
 use crate::pos::Campaigns;
 use crate::price_cents;
 use crate::tok::{Scalar, Scratch, Tok};
@@ -592,11 +592,12 @@ unsafe fn other(pair: *mut Batch, batch: *mut Batch) -> *mut Batch {
 /// Records held before they are scattered; a group adds at most 8.
 const HELD: usize = 128;
 
-/// The short-keyed records made and not yet scattered: the record's three words.
+/// The narrow records made and not yet scattered: each one's key as digits of six bits a
+/// byte, the ingest bits of its first word, and its second word (`EvN`).
 struct Held {
     key: [u64; HELD],
-    user_ts: [u64; HELD],
-    ingest_pay: [u64; HELD],
+    ingest: [u64; HELD],
+    second: [u64; HELD],
     len: usize,
     /// 64 less the lists' bits: a key's list is the top bits of its hash.
     shift: u32,
@@ -604,7 +605,7 @@ struct Held {
 
 impl Held {
     fn new(plan: &Plan) -> Held {
-        Held { key: [0; HELD], user_ts: [0; HELD], ingest_pay: [0; HELD], len: 0, shift: 64 - plan.part_bits }
+        Held { key: [0; HELD], ingest: [0; HELD], second: [0; HELD], len: 0, shift: 64 - plan.part_bits }
     }
 
     /// A function of its own: inside the decode its loop had no registers left.
@@ -613,13 +614,14 @@ impl Held {
     /// `finish` it was a 512-bit multiply for eight keys (`mul_halves` says what that
     /// costs on the scorer's cores).
     #[inline(never)]
-    fn flush(&mut self, events: &mut Chunks<Ev>) {
-        let (key, user_ts, ingest_pay, shift) = (&self.key, &self.user_ts, &self.ingest_pay, self.shift);
+    fn flush(&mut self, narrow: &mut Chunks<EvN>) {
+        let (key, ingest, second, shift) = (&self.key, &self.ingest, &self.second, self.shift);
         // SAFETY: `len <= HELD`, and every list here is the top bits of a hash.
         unsafe {
-            events.extend(self.len, |at| {
-                let key = *key.get_unchecked(at);
-                ((types::hash::hash(key) >> shift) as usize, Ev { key, user_ts: *user_ts.get_unchecked(at), ingest_pay: *ingest_pay.get_unchecked(at) })
+            narrow.extend(self.len, |at| {
+                // The six bits of each digit together: `ingest::opaque::canon` of the key.
+                let key = _pext_u64(*key.get_unchecked(at), SIX);
+                ((types::hash::hash(key) >> shift) as usize, EvN { a: key | *ingest.get_unchecked(at), b: *second.get_unchecked(at) })
             })
         };
         self.len = 0;
@@ -632,10 +634,13 @@ struct Consts {
     ts_end: __m512i,
     first_ms: __m512i,
     ingest_add: __m512i,
+    /// Whether a row may be a narrow record: the plan allows it, and every valid `ts` is
+    /// below 2^31.
+    narrow: bool,
 }
 
 impl Consts {
-    fn new(ctx: &Ctx, memo: &Memo) -> Consts {
+    fn new(ctx: &Ctx, plan: &Plan, memo: &Memo) -> Consts {
         // SAFETY: register arithmetic; AVX-512F is compiled in.
         #[allow(unused_unsafe)]
         unsafe {
@@ -647,6 +652,7 @@ impl Consts {
                 // `Ctx::ingest_rel` of the table's first midnight: whole seconds, as every
                 // midnight is.
                 ingest_add: all((memo.first_ms + ctx.origin).div_euclid(1000) - ctx.ingest_base()),
+                narrow: plan.narrow && u64::from(ctx.ts_end) <= 1 << 31,
             }
         }
     }
@@ -848,9 +854,9 @@ pub(super) unsafe fn tail(t: *const u8, gap: usize, end: *const u8, days: *const
 /// `p, len` is a segment, and `lead` bytes before `p` are readable.
 #[inline(never)]
 pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, out: &mut Out) {
-    let Out { events, long_events, slow, .. } = out;
+    let Out { narrow, events, long_events, slow, .. } = out;
     let memo = Memo::of(ctx, dates);
-    let consts = Consts::new(ctx, memo);
+    let consts = Consts::new(ctx, plan, memo);
     let lanes = Lanes::new();
     let mut held = Held::new(plan);
     // Two batches in turn: when one is full its users' lines of the directory are asked
@@ -960,7 +966,7 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                             ask(&*batch, plan);
                         }
                         batch = other(pair, batch);
-                        finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
+                        finish(batch, p, len, &consts, &mut held, ctx, dates, plan, narrow, events, long_events, slow);
                         (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
                         k = 0;
                     }
@@ -978,7 +984,7 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                         ask(&*batch, plan);
                     }
                     batch = other(pair, batch);
-                    finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
+                    finish(batch, p, len, &consts, &mut held, ctx, dates, plan, narrow, events, long_events, slow);
                     (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
                 }
             }
@@ -993,10 +999,11 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
             }
         }
         // The batch that was asked for last.
-        finish(other(pair, batch), p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
+        finish(other(pair, batch), p, len, &consts, &mut held, ctx, dates, plan, narrow, events, long_events, slow);
     }
-    held.flush(events);
+    held.flush(narrow);
     // Streamed lines become visible to the threads that read the lists.
+    narrow.fence();
     events.fence();
     long_events.fence();
 }
@@ -1018,6 +1025,7 @@ unsafe fn finish(
     ctx: &Ctx,
     dates: &Dates,
     plan: &Plan,
+    narrow: &mut Chunks<EvN>,
     events: &mut Chunks<Ev>,
     long_events: &mut Chunks<EvL>,
     slow: &mut usize,
@@ -1035,7 +1043,7 @@ unsafe fn finish(
         let mut first = 0;
         while first < rows {
             if held.len + 8 > HELD {
-                held.flush(events);
+                held.flush(narrow);
             }
             let live: __mmask8 = if rows - first >= 8 { 0xFF } else { (1u8 << (rows - first)) - 1 };
             let at = batch.rows.as_ptr().add(first).cast::<__m512i>();
@@ -1056,18 +1064,25 @@ unsafe fn finish(
             // then the ingest (a purchase's `pay` is put above it by `others`).
             let place = _mm512_cvtepu32_epi64(_mm256_loadu_si256(batch.users.as_ptr().add(first).cast()));
             let user_ts = _mm512_or_si512(place, _mm512_slli_epi64::<32>(_mm512_maskz_mov_epi64(valid, ts)));
-            // `short_key_at`: the digits and one. (Its list: `Held::flush`.)
-            let key = _mm512_add_epi64(event, all(1));
+            // The key's digits with 39 off every letter (`a-z` are 49 to 74 here, and 10 to
+            // 35 after): six bits a byte, which `Held::flush` puts together.
+            let key = _mm512_mask_sub_epi8(event, _mm512_cmpgt_epi8_mask(event, _mm512_set1_epi8(9)), event, _mm512_set1_epi8(39));
 
             let class = _mm512_loadu_si512(batch.class.as_ptr().add(first).cast());
-            // Nothing set but, perhaps, a long user: a record as it stands.
-            let fast = live & _mm512_testn_epi64_mask(class, all(!(LONG_USER as i64)));
+            // Nothing set but, perhaps, a long user, and an ingest a narrow record holds (a
+            // place and a `ts` it holds are the run's: `Consts::narrow`): a narrow record.
+            // Its ingest counts from `NARROW_INGEST`; the low 16 bits go above the key,
+            // the next 8 above the place and the `ts`.
+            let since = _mm512_sub_epi64(ingest_rel, all(i64::from(NARROW_INGEST)));
+            let fits = if consts.narrow { _mm512_cmplt_epu64_mask(since, all(1 << 24)) } else { 0 };
+            let fast = live & fits & _mm512_testn_epi64_mask(class, all(!(LONG_USER as i64)));
+            let second = _mm512_ternarylogic_epi64::<0xFE>(place, _mm512_slli_epi64::<25>(_mm512_maskz_mov_epi64(valid, ts)), _mm512_slli_epi64::<56>(_mm512_srli_epi64::<16>(since)));
             // Compressed in a register and stored whole: the lanes past the fast ones are
             // overwritten by the next store.
             let to = held.len;
             _mm512_storeu_si512(held.key.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, key));
-            _mm512_storeu_si512(held.user_ts.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, user_ts));
-            _mm512_storeu_si512(held.ingest_pay.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, ingest_rel));
+            _mm512_storeu_si512(held.ingest.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, _mm512_slli_epi64::<48>(since)));
+            _mm512_storeu_si512(held.second.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, second));
             held.len = to + fast.count_ones() as usize;
 
             if fast != live {
@@ -1243,8 +1258,8 @@ unsafe fn others(
                 let (hi, lo) = (batch.rows[row][0], batch.lows[row][0]);
                 long_events.push_at(plan.long_part(hi, lo), EvL { hi, lo, user_ts, ingest_pay });
             } else {
-                let key = batch.rows[row][0] + 1;
-                events.push_at(plan.part(key), Ev { key, user_ts, ingest_pay });
+                let key = super::canon(batch.rows[row][0] + 1);
+                events.push_at(plan.wide_part(key), Ev { key, user_ts, ingest_pay });
             }
         }
     }

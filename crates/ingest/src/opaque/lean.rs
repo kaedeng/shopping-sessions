@@ -19,7 +19,9 @@
 //!   as a long one only there.
 //! - **A record is written once.** What a record holds beside its user is made for eight
 //!   rows at a time in registers (`prepare`); the loop of a kind looks the user up and puts
-//!   the record in its list's staging block. No second batch, no held records.
+//!   the record in its list's staging block. No second batch, no held records. Five rows
+//!   in six become a narrow record of 16 bytes (`EvN`); a purchase, and a row whose ingest
+//!   a narrow record cannot hold, the wider one.
 //! - **One batch of 64 rows**, 7 KB with its lists (5 KB of it in use), where `kern` keeps two batches and the
 //!   held records (12 KB) in a first-level cache that two workers share on the scorer. A
 //!   short user's line of the directory is asked for eight rows at a time as they are
@@ -37,7 +39,7 @@ use types::time::DAY;
 use types::users::{ShortLines, Users};
 
 use super::kern::{Lanes, Memo, ONE_E, ONE_U, OneRow, PURCHASE, line_end, mul_halves, one_id, one_rows, purchase, slow_line, tail};
-use super::{Ev, EvL, Out, Plan};
+use super::{Ev, EvL, EvN, NARROW_INGEST, Out, Plan, SIX};
 use crate::ts::Dates;
 
 /// Bytes the kernel may read from a line's first byte: the second window of the search for
@@ -50,7 +52,7 @@ const BATCH: usize = 64;
 
 /// A row's word: bits 0 to 3 say which half of which ID left a residue (the `event_id`'s
 /// two, then the `user_id`'s), bits 4 to 7 the same for what follows the IDs; then `BUY`
-/// and `LATE`, and in the high half the residues of the last two fields.
+/// `LATE` and `WIDE`, and in the high half the residues of the last two fields.
 const E_BAD: u64 = 0x03;
 const U_BAD: u64 = 0x0C;
 const REST_BAD: u64 = 0xFFFF_FFFF_0000_00F0;
@@ -58,6 +60,8 @@ const REST_BAD: u64 = 0xFFFF_FFFF_0000_00F0;
 const BUY: u64 = PURCHASE >> 8;
 /// An ID that is neither short nor long: the row code's.
 const LATE: u64 = 1 << 25;
+/// The row is no narrow record (`prepare`): its ingest does not fit one, or no row may be.
+const WIDE: u64 = 1 << 26;
 const _: () = assert!(BUY == 1 << 24);
 
 /// The kinds of rows, in the order their lists are in.
@@ -94,11 +98,16 @@ struct Batch {
     words: [u64; BATCH],
     /// Where each row's line begins, and one more: where the last one ends.
     lines: [*const u8; BATCH + 8],
-    /// What `prepare` makes of a row: `short_key_at` of a short `event_id`, the `ts` above
-    /// the user's place when the row is valid, and `Ctx::ingest_rel`.
+    /// What `prepare` makes of a row: a short `event_id`'s digits of six bits a byte
+    /// (`_pext_u64` of them by `SIX` is `super::canon` of the key); as an `Ev` has them,
+    /// the `ts` above the user's place when the row is valid, and `Ctx::ingest_rel`; and
+    /// as an `EvN` has them, what is above the key in its first word, and its second
+    /// word without the user's place.
     keys: [u64; BATCH],
     stamps: [u64; BATCH],
     ingests: [u64; BATCH],
+    firsts: [u64; BATCH],
+    seconds: [u64; BATCH],
     /// The second words of a row's long IDs: the event's, the user's.
     lows: [[u64; 2]; BATCH],
     /// The rows of each kind, and how many.
@@ -123,6 +132,11 @@ struct Env<'a> {
     ingest_add: i64,
     /// 64 less the lists' bits: a key's list is the top bits of its hash.
     shift: u32,
+    /// The same for the lists of the wider records (`Plan::wide_part`).
+    wide_shift: u32,
+    /// Whether a row may be a narrow record: the plan allows it, and every valid `ts` is
+    /// below 2^31.
+    narrow: bool,
 }
 
 impl Env<'_> {
@@ -189,7 +203,7 @@ unsafe fn commas_of(line: *const u8) -> (usize, usize) {
 /// `p, len` is a segment, and `lead` bytes before `p` are readable.
 #[inline(never)]
 pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, out: &mut Out) {
-    let Out { events, long_events, slow, .. } = out;
+    let Out { narrow, events, long_events, slow, .. } = out;
     let memo = Memo::of(ctx, dates);
     let lanes = Lanes::new();
     let env = Env {
@@ -205,6 +219,8 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
         first_ms: memo.first_ms,
         ingest_add: (memo.first_ms + ctx.origin).div_euclid(1000) - ctx.ingest_base(),
         shift: 64 - plan.part_bits,
+        wide_shift: 64 - plan.wide_bits,
+        narrow: plan.narrow && u64::from(ctx.ts_end) <= 1 << 31,
     };
     // SAFETY: plain integers and pointers that are not read before they are written.
     let mut batch: Batch = unsafe { std::mem::zeroed() };
@@ -268,7 +284,7 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                         ask(&batch, k - 8, k, short);
                         if k == BATCH {
                             batch.lines[BATCH] = line;
-                            finish(&mut batch, BATCH, &env, &lanes, events, long_events, slow);
+                            finish(&mut batch, BATCH, &env, &lanes, narrow, events, long_events, slow);
                             k = 0;
                         }
                     }
@@ -280,7 +296,7 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 if k != 0 {
                     batch.lines[k] = line;
                     ask(&batch, k & !7, k, short);
-                    finish(&mut batch, k, &env, &lanes, events, long_events, slow);
+                    finish(&mut batch, k, &env, &lanes, narrow, events, long_events, slow);
                 }
             }
             if line < last {
@@ -293,6 +309,7 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
         }
     }
     // Streamed lines become visible to the threads that read the lists.
+    narrow.fence();
     events.fence();
     long_events.fence();
 }
@@ -315,8 +332,9 @@ unsafe fn ask(batch: &Batch, from: usize, to: usize, short: ShortLines) {
 }
 
 /// What the records of a batch's first `rows` rows hold beside their users, eight rows at a
-/// time: `Batch::keys`, `stamps`, `ingests`. A row that is no record gets what its bytes
-/// happen to give, and nothing reads it.
+/// time: `Batch::keys`, `stamps`, `ingests`, `firsts`, `seconds`, and `WIDE` in the word of
+/// a row that is no narrow record. A row that is no record gets what its bytes happen to
+/// give, and nothing reads it.
 #[inline(always)]
 unsafe fn prepare(batch: &mut Batch, rows: usize, env: &Env) {
     // SAFETY: register arithmetic; loads of eight rows that begin below `BATCH` at a
@@ -341,10 +359,22 @@ unsafe fn prepare(batch: &mut Batch, rows: usize, env: &Env) {
             // `Ctx::ingest_rel`: whole seconds since the table's first midnight (under 2^32
             // ms, so the product's high bits are the quotient by 1000), then from its base.
             let seconds = _mm512_srli_epi64::<38>(mul_halves(_mm512_sub_epi64(ingest, first_ms), _mm256_set1_epi64x(274_877_907)));
-            // `short_key_at`: the digits and one.
-            _mm512_store_si512(batch.keys.as_mut_ptr().add(first).cast(), _mm512_add_epi64(event, all(1)));
-            _mm512_store_si512(batch.stamps.as_mut_ptr().add(first).cast(), _mm512_maskz_slli_epi64::<32>(valid, ts));
-            _mm512_store_si512(batch.ingests.as_mut_ptr().add(first).cast(), _mm512_add_epi64(seconds, ingest_add));
+            let ingest_rel = _mm512_add_epi64(seconds, ingest_add);
+            // The key's digits with 39 off every letter (`a-z` are 49 to 74 here, and 10 to
+            // 35 after): six bits a byte, put together where the record is written.
+            let key = _mm512_mask_sub_epi8(event, _mm512_cmpgt_epi8_mask(event, _mm512_set1_epi8(9)), event, _mm512_set1_epi8(39));
+            let kept = _mm512_maskz_mov_epi64(valid, ts);
+            // A narrow record's ingest counts from `NARROW_INGEST`, in 24 bits: the low 16
+            // above the key, the next 8 above the place and the `ts`.
+            let since = _mm512_sub_epi64(ingest_rel, all(i64::from(NARROW_INGEST)));
+            let fits: __mmask8 = if env.narrow { _mm512_cmplt_epu64_mask(since, all(1 << 24)) } else { 0 };
+            _mm512_store_si512(batch.keys.as_mut_ptr().add(first).cast(), key);
+            _mm512_store_si512(batch.stamps.as_mut_ptr().add(first).cast(), _mm512_slli_epi64::<32>(kept));
+            _mm512_store_si512(batch.ingests.as_mut_ptr().add(first).cast(), ingest_rel);
+            _mm512_store_si512(batch.firsts.as_mut_ptr().add(first).cast(), _mm512_slli_epi64::<48>(since));
+            _mm512_store_si512(batch.seconds.as_mut_ptr().add(first).cast(), _mm512_or_si512(_mm512_slli_epi64::<25>(kept), _mm512_slli_epi64::<56>(_mm512_srli_epi64::<16>(since))));
+            let word = batch.words.as_mut_ptr().add(first).cast::<__m512i>();
+            _mm512_store_si512(word, _mm512_mask_or_epi64(_mm512_load_si512(word), !fits, _mm512_load_si512(word), all(WIDE as i64)));
             first += 8;
         }
     }
@@ -369,7 +399,8 @@ unsafe fn split(batch: &mut Batch, rows: usize) {
             let sound = live & _mm512_testn_epi64_mask(word, all(REST_BAD));
             let event_short = _mm512_testn_epi64_mask(word, all(E_BAD));
             let user_short = _mm512_testn_epi64_mask(word, all(U_BAD));
-            let buy = _mm512_test_epi64_mask(word, all(BUY));
+            // A purchase, or a row a narrow record does not hold: the wider record.
+            let buy = _mm512_test_epi64_mask(word, all(BUY | WIDE));
             let short = sound & event_short & user_short;
             let kinds = [short & !buy, short & buy, sound & event_short & !user_short, sound & !event_short & user_short, sound & !event_short & !user_short, live & !sound];
             for (kind, &mask) in kinds.iter().enumerate() {
@@ -408,13 +439,14 @@ unsafe fn row_code(batch: &Batch, row: usize, env: &Env, events: &mut Chunks<Ev>
 /// The rows are stored, their lines are in `env`'s segment, and `Batch::lines` holds where
 /// each row's line begins and where the last one ends.
 #[inline(never)]
-unsafe fn finish(batch: &mut Batch, rows: usize, env: &Env, lanes: &Lanes, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>, slow: &mut usize) {
+#[allow(clippy::too_many_arguments)]
+unsafe fn finish(batch: &mut Batch, rows: usize, env: &Env, lanes: &Lanes, narrow: &mut Chunks<EvN>, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>, slow: &mut usize) {
     // SAFETY: the caller's contract; a list holds rows of the batch, and a record's list is
     // the top bits of a hash.
     unsafe {
         prepare(batch, rows, env);
         split(batch, rows);
-        let (users, plan, shift) = (env.users, env.plan, env.shift);
+        let (users, plan, shift, wide_shift) = (env.users, env.plan, env.shift, env.wide_shift);
 
         // The IDs that are not short first: looked at as long ones, and a long user's line
         // of the directory asked for, which then has every other kind's work to arrive in.
@@ -460,17 +492,20 @@ unsafe fn finish(batch: &mut Batch, rows: usize, env: &Env, lanes: &Lanes, event
         for at in 0..batch.len[BOUGHT] {
             let row = *batch.of[BOUGHT].get_unchecked(at) as usize;
             let user = env.user(batch.rows.get_unchecked(row)[2] + 1);
-            let (stamp, ingest_pay) = bought(batch.lines[row + 1], batch.stamps[row], batch.ingests[row]);
-            let key = batch.keys[row];
-            events.push_at((types::hash::hash(key) >> shift) as usize, Ev { key, user_ts: stamp | u64::from(user), ingest_pay });
+            let (mut stamp, mut ingest_pay) = (batch.stamps[row], batch.ingests[row]);
+            if batch.words[row] & BUY != 0 {
+                (stamp, ingest_pay) = bought(batch.lines[row + 1], stamp, ingest_pay);
+            }
+            let key = _pext_u64(batch.keys[row], SIX);
+            events.push_at((types::hash::hash(key) >> wide_shift) as usize, Ev { key, user_ts: stamp | u64::from(user), ingest_pay });
         }
 
         // Three rows in four: nothing to decide.
         for at in 0..batch.len[SHORT] {
             let row = *batch.of[SHORT].get_unchecked(at) as usize;
             let user = env.user(batch.rows.get_unchecked(row)[2] + 1);
-            let key = *batch.keys.get_unchecked(row);
-            events.push_at((types::hash::hash(key) >> shift) as usize, Ev { key, user_ts: *batch.stamps.get_unchecked(row) | u64::from(user), ingest_pay: *batch.ingests.get_unchecked(row) });
+            let key = _pext_u64(*batch.keys.get_unchecked(row), SIX);
+            narrow.push_at((types::hash::hash(key) >> shift) as usize, EvN { a: key | *batch.firsts.get_unchecked(row), b: *batch.seconds.get_unchecked(row) | u64::from(user) });
         }
 
         for at in 0..batch.len[LONG_USER] {
@@ -481,12 +516,16 @@ unsafe fn finish(batch: &mut Batch, rows: usize, env: &Env, lanes: &Lanes, event
                 continue;
             }
             let user = users.long(batch.rows[row][2], batch.lows[row][1]);
+            let key = _pext_u64(batch.keys[row], SIX);
+            if word & (BUY | WIDE) == 0 {
+                narrow.push_at((types::hash::hash(key) >> shift) as usize, EvN { a: key | batch.firsts[row], b: batch.seconds[row] | u64::from(user) });
+                continue;
+            }
             let (mut stamp, mut ingest_pay) = (batch.stamps[row], batch.ingests[row]);
             if word & BUY != 0 {
                 (stamp, ingest_pay) = bought(batch.lines[row + 1], stamp, ingest_pay);
             }
-            let key = batch.keys[row];
-            events.push_at((types::hash::hash(key) >> shift) as usize, Ev { key, user_ts: stamp | u64::from(user), ingest_pay });
+            events.push_at((types::hash::hash(key) >> wide_shift) as usize, Ev { key, user_ts: stamp | u64::from(user), ingest_pay });
         }
         for kind in [LONG_EVENT, LONG_BOTH] {
             for at in 0..batch.len[kind] {

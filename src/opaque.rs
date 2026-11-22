@@ -16,7 +16,7 @@
 use std::sync::OnceLock;
 
 use ingest::Ingest;
-use ingest::opaque::{Ev, EvL, LinkRec, Out, Placing, Plan};
+use ingest::opaque::{Ev, EvL, EvN, LinkRec, Out, Placing, Plan};
 use types::chunks::Chunks;
 use types::hash::{hash, person_hash};
 use types::parts::{Combine, Mode, Parts, Plain};
@@ -190,6 +190,23 @@ impl Row for Ev {
     }
 }
 
+impl Row for EvN {
+    #[inline(always)]
+    fn slot(&self) -> u64 {
+        hash(self.key())
+    }
+
+    #[inline(always)]
+    fn same(&self, other: &EvN) -> bool {
+        self.key() == other.key()
+    }
+
+    #[inline(always)]
+    fn words(&self) -> (u64, u64) {
+        (self.user_ts(), u64::from(self.ingest()))
+    }
+}
+
 impl Row for EvL {
     #[inline(always)]
     fn slot(&self) -> u64 {
@@ -213,6 +230,7 @@ pub struct Scratch {
     /// Each slot 0 or 1 + an index into the kept rows.
     table: Vec<u32>,
     kept: Vec<Ev>,
+    kept_narrow: Vec<EvN>,
     kept_long: Vec<EvL>,
 }
 
@@ -268,6 +286,116 @@ fn dedup<'p, R: Row + 'p>(lists: impl Iterator<Item = &'p Chunks<R>> + Clone, li
                             *first = *row;
                         }
                         break;
+                    }
+                    at = (at + 1) & mask;
+                }
+            }
+        });
+    }
+}
+
+/// In a slot of `dedup_short`'s table: the row is one of the wider records kept.
+const WIDE: u32 = 1 << 31;
+
+/// `dedup` for the short-keyed events of list `list`: every worker's narrow records of that
+/// list into `kept`, and of the list of wider records that holds the list's
+/// (`Plan::wide_part`) those whose key's list it is into `wide`. One table for both, by the
+/// key as `canon` has it, which both kinds of record hold: a copy of an `event_id` is found whichever record
+/// its row became. Where a wider record wins over a narrow one that is kept, the narrow one
+/// loses its `ts`: no row any more for the placing loop.
+fn dedup_short(parsed: &[Out], list: usize, plan: &Plan, table: &mut Vec<u32>, kept: &mut Vec<EvN>, wide: &mut Vec<Ev>) {
+    kept.clear();
+    wide.clear();
+    let wide_list = list >> (plan.part_bits - plan.wide_bits);
+    let narrow_rows: usize = parsed.iter().map(|out| out.narrow.len_of(list)).sum();
+    // The wider list's records of this list, counted: the table is sized for the rows there
+    // are, whatever share of the wider list they turn out to be.
+    let mut wide_rows = 0;
+    for out in parsed {
+        out.events.for_each(wide_list, |piece| wide_rows += piece.iter().filter(|row| plan.part(row.key) == list).count());
+    }
+    let rows = narrow_rows + wide_rows;
+    if rows == 0 {
+        return;
+    }
+    let slot_bits = (ROOM * rows).next_power_of_two().max(1024).trailing_zeros();
+    assert!(plan.part_bits + slot_bits <= 64 && rows < WIDE as usize);
+    let (shift, mask) = (64 - plan.part_bits - slot_bits, (1usize << slot_bits) - 1);
+    table.clear();
+    table.resize(mask + 1, 0);
+    kept.reserve(narrow_rows);
+    wide.reserve(wide_rows);
+    let ahead = ahead_slots();
+    for out in parsed {
+        out.narrow.for_each(list, |piece| {
+            for (number, row) in piece.iter().enumerate() {
+                // `SS_DEDUP_AHEAD`: the slot of the row a few on.
+                if ahead != 0
+                    && let Some(coming) = piece.get(number + ahead)
+                {
+                    types::mem::prefetch(table.as_ptr().wrapping_add((hash(coming.key()) >> shift) as usize & mask));
+                }
+                let key = row.key();
+                let mut at = (hash(key) >> shift) as usize & mask;
+                loop {
+                    // SAFETY: `at` is at most `mask`, and the table has `mask + 1` slots.
+                    let slot = unsafe { table.get_unchecked_mut(at) };
+                    if *slot == 0 {
+                        kept.push(*row);
+                        *slot = kept.len() as u32;
+                        break;
+                    }
+                    // SAFETY: only narrow rows are in the table yet, and a slot is set to
+                    // the kept length right after a push.
+                    let first = unsafe { kept.get_unchecked_mut(*slot as usize - 1) };
+                    if first.key() == key {
+                        if row.ingest() < first.ingest() {
+                            *first = *row;
+                        }
+                        break;
+                    }
+                    at = (at + 1) & mask;
+                }
+            }
+        });
+    }
+    for out in parsed {
+        out.events.for_each(wide_list, |piece| {
+            for &row in piece {
+                let key = row.key;
+                let slot_hash = hash(key);
+                if (slot_hash >> (64 - plan.part_bits)) as usize != list {
+                    continue;
+                }
+                let mut at = (slot_hash >> shift) as usize & mask;
+                loop {
+                    // SAFETY: as above.
+                    let slot = unsafe { table.get_unchecked_mut(at) };
+                    if *slot == 0 {
+                        wide.push(row);
+                        *slot = WIDE | wide.len() as u32;
+                        break;
+                    }
+                    if *slot & WIDE != 0 {
+                        // SAFETY: a slot is set to the length right after a push.
+                        let first = unsafe { wide.get_unchecked_mut((*slot & !WIDE) as usize - 1) };
+                        if first.key == key {
+                            if (row.ingest_pay as u32) < (first.ingest_pay as u32) {
+                                *first = row;
+                            }
+                            break;
+                        }
+                    } else {
+                        // SAFETY: likewise.
+                        let first = unsafe { kept.get_unchecked_mut(*slot as usize - 1) };
+                        if first.key() == key {
+                            if (row.ingest_pay as u32) < first.ingest() {
+                                first.b &= !EvN::TS;
+                                wide.push(row);
+                                *slot = WIDE | wide.len() as u32;
+                            }
+                            break;
+                        }
                     }
                     at = (at + 1) & mask;
                 }
@@ -517,7 +645,7 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     lap("parse");
 
     let (parts, long_parts, buckets) = (1usize << plan.part_bits, 1usize << plan.long_bits, 1usize << ctx.bucket_bits);
-    let events: usize = parsed.iter().map(|out| out.events.len() + out.long_events.len()).sum();
+    let events: usize = parsed.iter().map(|out| out.narrow.len() + out.events.len() + out.long_events.len()).sum();
     // A worker's `user_daily` rows get their room once (`types::rows::expect`): generated
     // data has a row for every 8 or 9 events, so a quarter of an even share of the events
     // is twice a worker's rows.
@@ -577,13 +705,15 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
         let workers = parsed.len();
         par::run(&mut scattered, workers + parts + long_parts, |_, mine, task| {
             let task = if task < workers { parts + long_parts + task } else { task - workers };
-            let Scattered { events, clicks, opaque: Scratch { table, kept, kept_long }, dense: ranges, .. } = mine;
+            let Scattered { events, clicks, opaque: Scratch { table, kept, kept_narrow, kept_long }, dense: ranges, .. } = mine;
             if let (Some(ranges), Some((shift, _))) = (ranges, dense) {
                 if task < parts {
-                    dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, table, kept);
+                    dedup_short(parsed, task, &plan, table, kept_narrow, kept);
                     if recycle {
-                        give_chunks(parsed, |out| &out.events, task, ranges);
+                        // (The wider lists' chunks are read by several tasks: not given.)
+                        give_chunks(parsed, |out| &out.narrow, task, ranges);
                     }
+                    scatter_dense(kept_narrow, persons, shift, ranges);
                     scatter_dense(kept, persons, shift, ranges);
                 } else if task < parts + long_parts {
                     dedup(parsed.iter().map(|out| &out.long_events), task - parts, plan.long_bits, table, kept_long);
@@ -595,8 +725,14 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
                     scatter_clicks_dense(&parsed[task - parts - long_parts], persons, shift, recycle, ranges);
                 }
             } else if task < parts {
-                dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, table, kept);
-                if events.combining() { scatter::<_, Combine>(kept, persons, ctx.bucket_bits, events) } else { scatter::<_, Plain>(kept, persons, ctx.bucket_bits, events) }
+                dedup_short(parsed, task, &plan, table, kept_narrow, kept);
+                if events.combining() {
+                    scatter::<_, Combine>(kept_narrow, persons, ctx.bucket_bits, events);
+                    scatter::<_, Combine>(kept, persons, ctx.bucket_bits, events);
+                } else {
+                    scatter::<_, Plain>(kept_narrow, persons, ctx.bucket_bits, events);
+                    scatter::<_, Plain>(kept, persons, ctx.bucket_bits, events);
+                }
             } else if task < parts + long_parts {
                 dedup(parsed.iter().map(|out| &out.long_events), task - parts, plan.long_bits, table, kept_long);
                 if events.combining() { scatter::<_, Combine>(kept_long, persons, ctx.bucket_bits, events) } else { scatter::<_, Plain>(kept_long, persons, ctx.bucket_bits, events) }

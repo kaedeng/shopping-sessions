@@ -92,7 +92,8 @@ const DECODES: &[&str] = &["row"];
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 #[repr(C)]
 pub struct Ev {
-    /// The `event_id`: `short_key_at` of it, or the interned `Id` of its bytes (top bit set).
+    /// The `event_id`: `canon` of its `short_key_at`, or the interned `Id` of its bytes (top
+    /// bit set).
     pub key: u64,
     /// The user's place in the directory (`NO_USER` for none), and above it the `ts` in
     /// milliseconds after `Ctx::origin`, or 0 for a row that is not valid (a valid `ts` is at
@@ -100,6 +101,105 @@ pub struct Ev {
     pub user_ts: u64,
     /// `Ctx::ingest_rel` (the dedup keeps the smallest), and above it the `pay` of a purchase.
     pub ingest_pay: u64,
+}
+
+/// What a narrow record's ingest counts from, in `Ctx::ingest_rel`'s seconds: 2^20 seconds,
+/// 12 days, before the origin.
+pub const NARROW_INGEST: u32 = (1 << 30) - (1 << 20);
+
+/// Six bits of each byte of a word.
+pub const SIX: u64 = 0x3F3F_3F3F_3F3F_3F3F;
+
+/// The bits of `value` that `mask` names, together at the bottom.
+#[inline(always)]
+fn pext(value: u64, mask: u64) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+    // SAFETY: the instruction is compiled in.
+    #[allow(unused_unsafe)]
+    unsafe {
+        core::arch::x86_64::_pext_u64(value, mask)
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+    {
+        let (mut out, mut at, mut left) = (0u64, 0, mask);
+        while left != 0 {
+            out |= (value >> left.trailing_zeros() & 1) << at;
+            at += 1;
+            left &= left - 1;
+        }
+        out
+    }
+}
+
+/// A short key (`short_key_at`) in 48 bits, the form every short-keyed event is hashed and
+/// compared by: its digits six bits each (`0-9a-z` as 0 to 35), in their order, the last
+/// highest. An interned `Id` (top bit set) stays as it is: it is no short key's 48 bits.
+#[inline(always)]
+pub fn canon(key: u64) -> u64 {
+    if key & id::SLOW != 0 || key == 0 {
+        return key;
+    }
+    // The digits a byte each, `0-9` as 0 to 9 and `a-z` as 49 to 74: 39 off every letter
+    // (a byte is one when adding 79 sets its top bit, and no sum reaches the next byte).
+    let digits = key - 1;
+    let letters = ((digits + 0x4F4F_4F4F_4F4F_4F4F) >> 7) & 0x0101_0101_0101_0101;
+    pext(digits - letters * 39, SIX)
+}
+
+/// One short-keyed event line that is nothing but a key, a user and two times: 16 bytes.
+/// Five rows in six are such a row, and as an `Ev` each carried a `pay` of zero and a key
+/// of 42 bits in 64: a third of what the parse wrote to its lists, of the fresh pages under
+/// them, of what the dedup read back and of what it kept in cache.
+///
+/// - `a`: the key (`canon`) in the low 48 bits; above it the low 16 bits of the ingest.
+/// - `b`: the user's place (25 bits), the `ts` (31 bits; 0 for a row that is not valid), the
+///   ingest's next 8 bits.
+///
+/// The ingest is `Ctx::ingest_rel` less `NARROW_INGEST`, in 24 bits: 194 days from 12 days
+/// before the origin. A row that does not fit (a purchase, a key that is an interned `Id`, a
+/// place past 2^25, a `ts` past 2^31, an ingest outside those days) is an `Ev`.
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+#[repr(C)]
+pub struct EvN {
+    pub a: u64,
+    pub b: u64,
+}
+
+impl EvN {
+    /// The `ts` in `b`.
+    pub const TS: u64 = ((1 << 31) - 1) << 25;
+
+    /// The record of a row, or `None` for one that does not fit: `key`, `user_ts` and
+    /// `ingest_pay` as an `Ev` has them.
+    #[inline(always)]
+    pub fn pack(key: u64, user_ts: u64, ingest_pay: u64) -> Option<EvN> {
+        let (user, ts) = (user_ts as u32, (user_ts >> 32) as u32);
+        // A row that is not valid names no user that is read.
+        let user = if ts == 0 { 0 } else { user };
+        let ingest = (ingest_pay as u32).wrapping_sub(NARROW_INGEST);
+        if key & id::SLOW != 0 || key == 0 || ingest_pay >> 32 != 0 || user >= 1 << 25 || ts >= 1 << 31 || ingest >= 1 << 24 {
+            return None;
+        }
+        Some(EvN { a: canon(key) | u64::from(ingest & 0xFFFF) << 48, b: u64::from(user) | u64::from(ts) << 25 | u64::from(ingest >> 16) << 56 })
+    }
+
+    /// The key, as `canon` gives it.
+    #[inline(always)]
+    pub fn key(&self) -> u64 {
+        self.a & ((1 << 48) - 1)
+    }
+
+    /// The ingest, as `Ctx::ingest_rel` gives it.
+    #[inline(always)]
+    pub fn ingest(&self) -> u32 {
+        ((self.a >> 48) | (self.b >> 56) << 16) as u32 + NARROW_INGEST
+    }
+
+    /// `user | ts << 32`, as an `Ev` has them.
+    #[inline(always)]
+    pub fn user_ts(&self) -> u64 {
+        (self.b & ((1 << 25) - 1)) | ((self.b >> 25) & ((1 << 31) - 1)) << 32
+    }
 }
 
 /// One well-formed event line whose `event_id` is spelled the long way. 32 bytes.
@@ -135,7 +235,7 @@ pub struct LinkRec {
     pub order: [u64; 2],
 }
 
-const _: () = assert!(size_of::<Ev>() == 24 && size_of::<EvL>() == 32 && size_of::<Ck>() == 24 && size_of::<LinkRec>() == 24);
+const _: () = assert!(size_of::<Ev>() == 24 && size_of::<EvN>() == 16 && size_of::<EvL>() == 32 && size_of::<Ck>() == 24 && size_of::<LinkRec>() == 24);
 
 /// The first 8 bytes of the `len` bytes at `p` as `LinkRec::order` has them.
 ///
@@ -301,7 +401,7 @@ impl<'a> ClickSink<'a> {
 pub struct Plan {
     pub users: Users,
     /// Lists of short-keyed events = `1 << part_bits`: a record's is the top bits of
-    /// `types::hash::hash(key)`.
+    /// `types::hash::hash(canon(key))`.
     pub part_bits: u32,
     /// Lists of long-keyed events = `1 << long_bits`: the top bits of `mix_long(hi, lo)`.
     pub long_bits: u32,
@@ -311,6 +411,15 @@ pub struct Plan {
     lean: bool,
     /// Long `click_id`s kept whole (`click_id_at`).
     pub(crate) whole_clicks: bool,
+    /// Lists of the short-keyed events that are an `Ev` and not an `EvN` = `1 << wide_bits`:
+    /// the top bits of the same hash, so a list of them holds what `1 << (part_bits -
+    /// wide_bits)` lists of narrow records would. They are few (a row in 25), and a list
+    /// each would be as much staging again as the narrow ones'. `part_bits` where no row
+    /// is narrow.
+    pub wide_bits: u32,
+    /// Whether rows may be narrow records at all (`SS_RECORDS=narrow|wide`): every place of
+    /// the directory is below 2^25.
+    pub narrow: bool,
     /// Set by the stage's caller once the links are joined, when clicks are to be written
     /// to their persons' buckets (`Placing`).
     pub placing: OnceLock<Placing>,
@@ -325,9 +434,17 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// The list of the narrow record with key `key`, as `canon` has it.
     #[inline(always)]
     pub fn part(&self, key: u64) -> usize {
         (hash(key) >> (64 - self.part_bits)) as usize
+    }
+
+    /// The list of the `Ev` with key `key`, as `canon` has it: the first `wide_bits` bits of
+    /// `part`.
+    #[inline(always)]
+    pub fn wide_part(&self, key: u64) -> usize {
+        (hash(key) >> (64 - self.wide_bits)) as usize
     }
 
     #[inline(always)]
@@ -338,8 +455,11 @@ impl Plan {
 
 /// One worker's parse output.
 pub struct Out {
-    /// List `Plan::part(key)`: every well-formed event line with a non-empty `event_id` not
-    /// spelled the long way, valid or not.
+    /// List `Plan::part(key)`: the well-formed event lines with a short `event_id` that fit
+    /// an `EvN`, valid or not.
+    pub narrow: Chunks<EvN>,
+    /// List `Plan::wide_part(key)`: every other well-formed event line with a non-empty
+    /// `event_id` not spelled the long way.
     pub events: Chunks<Ev>,
     /// List `Plan::long_part(hi, lo)`: the others.
     pub long_events: Chunks<EvL>,
@@ -363,6 +483,7 @@ pub struct Out {
 impl Out {
     /// Slot `free-early`: the lists are dead once the dedup has read them.
     pub fn release(&mut self) {
+        self.narrow.release();
         self.events.release();
         self.long_events.release();
         self.clicks.release();
@@ -379,9 +500,16 @@ impl Ingest {
         // 1,711 ms, and 1,502 with 2,048 lists of four times the rows).
         let part_bits = (self.event_rows / 8192).next_power_of_two().trailing_zeros().clamp(6, 11);
         let part_bits = types::env::number("SS_PART_BITS_OPAQUE", part_bits as usize).clamp(1, 16) as u32;
+        let users = Users::for_rows(self.event_rows + self.click_rows + self.link_rows, grow);
+        let narrow = users.bound() <= 1 << 25 && types::env::pick("SS_RECORDS", &["narrow", "wide"]) == 0;
         Plan {
-            users: Users::for_rows(self.event_rows + self.click_rows + self.link_rows, grow),
+            users,
             part_bits,
+            // Where no row is narrow every short-keyed row is an `Ev`: a list each, as
+            // before there were narrow records (sharing a list, eight dedup tasks each read
+            // all of it for their own eighth: a run was a quarter slower).
+            wide_bits: if narrow { part_bits.saturating_sub(3).max(1).min(part_bits) } else { part_bits },
+            narrow,
             long_bits: part_bits.saturating_sub(3).max(1),
             kernel: DECODES[types::env::pick("SS_DECODE", DECODES)] != "row",
             lean: DECODES[types::env::pick("SS_DECODE", DECODES)] == "lean",
@@ -397,9 +525,11 @@ impl Ingest {
         // A worker's block has room for four times its share of the lines (it is address
         // space until written), a chunk a list and a huge page more.
         let room = |rows: usize, record: usize, lists: usize| (rows + rows / 8) * record * 4 / workers.max(4) + lists * 4096 + (2 << 20);
-        let (parts, long_parts) = (1usize << plan.part_bits, 1usize << plan.long_bits);
+        let (parts, wide_parts, long_parts) = (1usize << plan.part_bits, 1usize << plan.wide_bits, 1usize << plan.long_bits);
         Out {
-            events: Chunks::new(parts, room(self.event_rows, size_of::<Ev>(), parts)),
+            narrow: Chunks::new(parts, room(self.event_rows, size_of::<EvN>(), parts)),
+            // The few rows that are not narrow; when none may be, every row.
+            events: Chunks::new(wide_parts, room(if plan.narrow { self.event_rows / 8 } else { self.event_rows }, size_of::<Ev>(), wide_parts)),
             long_events: Chunks::new(long_parts, room(self.event_rows / 4, size_of::<EvL>(), long_parts)),
             clicks: Chunks::new(1, room(self.click_rows, size_of::<Ck>(), 1)),
             placed: None,
@@ -587,8 +717,8 @@ unsafe fn event_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 7], 
         if let Some((hi, lo)) = long_key_at(id.p, id.len, b'e') {
             long_events.push_at(plan.long_part(hi, lo), EvL { hi, lo, user_ts, ingest_pay });
         } else {
-            let key = short_key_at(id.p, id.len, b'e').unwrap_or_else(|| id::intern_any(std::slice::from_raw_parts(id.p, id.len)));
-            events.push_at(plan.part(key), Ev { key, user_ts, ingest_pay });
+            let key = canon(short_key_at(id.p, id.len, b'e').unwrap_or_else(|| id::intern_any(std::slice::from_raw_parts(id.p, id.len))));
+            events.push_at(plan.wide_part(key), Ev { key, user_ts, ingest_pay });
         }
     }
 }
@@ -618,13 +748,49 @@ mod tests {
 
     use super::*;
 
+    /// A narrow record gives back the row it was made of, takes only rows it can hold, and
+    /// two keys are one `canon` only when they are one key.
+    #[test]
+    fn narrow_records_come_back() {
+        let ids: [&[u8]; 12] = [b"e0", b"e1", b"ez", b"e10", b"e1a0", b"ezzzzzzzz", b"e4k2nn2cj", b"e10000000", b"ea0b0c0d0", b"e9z9z9z9z", b"ea", b"e99999999"];
+        let mut seen = std::collections::HashSet::new();
+        for id in ids {
+            let mut bytes = [0u8; 48];
+            bytes[..id.len()].copy_from_slice(id);
+            // SAFETY: 48 bytes are readable.
+            let key = unsafe { short_key_at(bytes.as_ptr(), id.len(), b'e') }.unwrap();
+            assert!(seen.insert(canon(key)), "{:?}", std::str::from_utf8(id));
+            assert!(canon(key) < 1 << 48);
+            // The digits come back out of the 48 bits: six bits each, the last highest.
+            let digits: Vec<u8> = (0..8).map(|at| (canon(key) >> (6 * at) & 63) as u8).map(|value| if value < 10 { b'0' + value } else { b'a' + value - 10 }).collect();
+            assert_eq!(&digits[8 - (id.len() - 1)..], &id[1..], "{:?}", std::str::from_utf8(id));
+            for (user, ts, ingest) in [(0u32, 0u32, NARROW_INGEST), (1, 1, NARROW_INGEST + 1), ((1 << 25) - 1, (1 << 31) - 1, NARROW_INGEST + (1 << 24) - 1), (77, 1_234_567_890, (1 << 30) + 86_400 * 9 + 5), (NO_USER, 0, 1 << 30)] {
+                let (user_ts, ingest_pay) = (u64::from(user) | u64::from(ts) << 32, u64::from(ingest));
+                let row = EvN::pack(key, user_ts, ingest_pay).unwrap_or_else(|| panic!("{user} {ts} {ingest}"));
+                // A row with no `ts` keeps no user.
+                let kept = if ts == 0 { 0 } else { user };
+                assert_eq!((row.key(), row.user_ts(), row.ingest()), (canon(key), u64::from(kept) | u64::from(ts) << 32, ingest));
+                assert_eq!(row.b & EvN::TS, u64::from(ts) << 25);
+            }
+            // What does not fit: a purchase, a place, a `ts` or an ingest too wide.
+            assert_eq!(EvN::pack(key, 5 | 9 << 32, u64::from(1u32 << 30) | 1 << 32), None);
+            assert_eq!(EvN::pack(key, 1 << 25 | 9 << 32, 1 << 30), None);
+            assert_eq!(EvN::pack(key, 5 | 1 << 63, 1 << 30), None);
+            assert_eq!(EvN::pack(key, 5 | 9 << 32, u64::from(NARROW_INGEST - 1)), None);
+            assert_eq!(EvN::pack(key, 5 | 9 << 32, u64::from(NARROW_INGEST + (1 << 24))), None);
+        }
+        assert_eq!(EvN::pack(id::SLOW | 5, 5 | 9 << 32, 1 << 30), None, "an interned key");
+        assert_eq!(canon(id::SLOW | 5), id::SLOW | 5);
+    }
+
+
     /// Lists of both key widths take a row by its `event_id`'s spelling, and an invalid row
     /// names no user.
     #[test]
     fn rows_go_by_their_ids_spelling() {
         let ctx = Ctx::new(parse_f1(b"2026-10-08T00:00:00Z").unwrap(), parse_f1(b"2026-10-22T00:00:00Z").unwrap(), &[], &[]).unwrap();
         let dates = Dates::new(&ctx);
-        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, lean: false, whole_clicks: false, placing: OnceLock::new(), wait_for_placing: false, ask_step: 63 };
+        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, lean: false, whole_clicks: false, wide_bits: 1, narrow: true, placing: OnceLock::new(), wait_for_placing: false, ask_step: 63 };
         let (mut events, mut long_events) = (Chunks::<Ev>::new(8, 1 << 16), Chunks::<EvL>::new(2, 1 << 16));
         let text = b"\ne1,u1,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,view,p1,\n\
 e02423c3d84ab053af78764ce49f23b5c,u02423c3d84ab053af78764ce49f23b5c,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,cart,p1,\n\
