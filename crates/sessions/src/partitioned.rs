@@ -484,16 +484,18 @@ pub(crate) fn bucket_dense_as(
                 unsafe { *counts.add(at + 1) += 1 };
             }
         });
-        // The clicks the parse placed: a person is its place already.
+        // The clicks the parse placed: a person is its place already. The place is 16 bits,
+        // checked as a `u32` as the events' are: as eight lanes of 64 bits the compiler made
+        // the check 512-bit loads, a permute and a compare.
         placed(&mut |piece| {
             let (counts, span) = (counts, span);
             let mut chunks = piece.chunks_exact(8);
             for chunk in &mut chunks {
-                let at: [usize; 8] = std::array::from_fn(|k| chunk[k].place());
-                assert!(at.iter().all(|&at| at < span), "a click outside its bucket");
+                let at: [u32; 8] = std::array::from_fn(|k| chunk[k].place() as u32);
+                assert!(at.iter().all(|&at| (at as usize) < span), "a click outside its bucket");
                 for at in at {
                     // SAFETY: `at < span`, and `click_ends` has `span + 1` entries.
-                    unsafe { *counts.add(at + 1) += 1 };
+                    unsafe { *counts.add(at as usize + 1) += 1 };
                 }
             }
             for click in chunks.remainder() {
