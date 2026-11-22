@@ -270,8 +270,86 @@ pub unsafe fn populate(addr: *mut u8, len: usize) -> bool {
 /// 67 MB table on 4 KB pages is a page walk each time; on 2 MB pages the table is 34 entries
 /// of the TLB.
 pub fn collapse_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| crate::env::pick("SS_COLLAPSE", &["off", "on"]) == 1)
+    collapse_mode() != 0
+}
+
+/// `SS_COLLAPSE=off|on|all|emulate`, as 0 to 3; read once.
+///
+/// - `on`: the tables above.
+/// - `all`: also every stretch a worker is about to fill (`back`: a `Chunks` block as its
+///   chunks are taken; `src/region.rs` does the same for a thread's own chunk). The run is
+///   then on 2 MB pages as it is where the machine gives them by itself: a fresh 2 MB is
+///   one call, not 512 pages each backed, mapped and at the end unmapped on its own, and
+///   what is read back costs no page walks.
+/// - `emulate`: `all` for a kernel without `MADV_COLLAPSE` whose transparent huge pages
+///   are on: the stretch is marked `MADV_HUGEPAGE` and its first write gets the 2 MB
+///   page. With `SS_HUGE=never` this is the end state of `all`, without what the
+///   collapses cost.
+fn collapse_mode() -> usize {
+    static MODE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| crate::env::pick("SS_COLLAPSE", &["off", "on", "all", "emulate"]))
+}
+
+/// The bytes a list that takes its memory chunk after chunk has backed at a time (`back`),
+/// a power of two, 0 for none: `SS_COLLAPSE_MB` megabytes (2) where the stretches are
+/// collapsed, else `populate_window`. Read once.
+pub fn back_window() -> usize {
+    static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| if collapse_mode() >= 2 { (crate::env::number("SS_COLLAPSE_MB", 2).max(2) << 20).next_power_of_two() } else { populate_window() })
+}
+
+/// Has the kernel back `addr..addr + len` now, for a thread about to fill it: its whole
+/// 2 MB steps as 2 MB pages where `SS_COLLAPSE` says so and `addr` is on such a step (a
+/// byte written into each, then `collapse`), and the rest, or all of it when the kernel
+/// will not, by `populate` where `SS_POPULATE` is set.
+///
+/// # Safety
+/// Whole 4 KB pages of anonymous memory the caller owns and has nothing in yet: a zero is
+/// written at every 2 MB step.
+pub unsafe fn back(addr: *mut u8, len: usize) {
+    let mode = collapse_mode();
+    let whole = if mode >= 2 && addr as usize & (HUGE - 1) == 0 { len & !(HUGE - 1) } else { 0 };
+    // SAFETY: the caller's range, nothing in it yet.
+    unsafe {
+        if whole != 0 {
+            if mode == 3 {
+                advise_huge(addr, whole);
+            }
+            for step in (0..whole).step_by(HUGE) {
+                addr.add(step).write_volatile(0);
+            }
+            if mode == 3 || collapse_counted(addr, whole) {
+                if len > whole && populate_window() != 0 {
+                    populate(addr.add(whole), len - whole);
+                }
+                return;
+            }
+        }
+        if populate_window() != 0 {
+            populate(addr, len);
+        }
+    }
+}
+
+/// `collapse`, until the kernel has said no eight times in a row: then it is not asked
+/// again (a kernel without the call, or a machine with no 2 MB of memory in one piece).
+///
+/// # Safety
+/// As `collapse`.
+unsafe fn collapse_counted(addr: *mut u8, len: usize) -> bool {
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+    static REFUSALS: AtomicU32 = AtomicU32::new(0);
+    if REFUSALS.load(Relaxed) >= 8 {
+        return false;
+    }
+    // SAFETY: the caller's contract.
+    let done = unsafe { collapse(addr, len) };
+    if done {
+        REFUSALS.store(0, Relaxed);
+    } else {
+        REFUSALS.fetch_add(1, Relaxed);
+    }
+    done
 }
 
 /// Marks `addr..addr + len` as wanting huge pages (`MADV_HUGEPAGE`): where the machine gives

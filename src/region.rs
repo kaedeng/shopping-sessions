@@ -120,6 +120,9 @@ mod linux {
     struct Own {
         at: usize,
         end: usize,
+        /// `SS_COLLAPSE=all`: the chunk is on 2 MB pages up to here, never below `at`
+        /// (`back_chunk`); `usize::MAX` when chunks are left to their first writes.
+        backed: usize,
         small_at: usize,
         small_end: usize,
         freed: [usize; (SMALL - MIN + 1) as usize],
@@ -128,7 +131,7 @@ mod linux {
     thread_local! {
         // No destructor and a constant start: usable from a thread's first allocation to its
         // last, and never itself a reason to allocate.
-        static OWN: UnsafeCell<Own> = const { UnsafeCell::new(Own { at: 0, end: 0, small_at: 0, small_end: 0, freed: [0; (SMALL - MIN + 1) as usize] }) };
+        static OWN: UnsafeCell<Own> = const { UnsafeCell::new(Own { at: 0, end: 0, backed: 0, small_at: 0, small_end: 0, freed: [0; (SMALL - MIN + 1) as usize] }) };
     }
 
     unsafe extern "C" {
@@ -147,6 +150,12 @@ mod linux {
     static POPULATE: AtomicBool = AtomicBool::new(false);
     /// The smallest block that is worth the call.
     const POPULATE_FROM: usize = 64 << 10;
+    const MADV_COLLAPSE: i32 = 25;
+    /// `SS_COLLAPSE` (`types::mem`): 1 for `all`, 2 for `emulate`, else 0. With either, a
+    /// thread's chunk is put onto 2 MB pages as its mark passes each 2 MB (`back`).
+    static COLLAPSE: AtomicU8 = AtomicU8::new(0);
+    /// Collapses the kernel refused in a row; at 8 it is not asked again.
+    static REFUSALS: AtomicU8 = AtomicU8::new(0);
 
     pub(super) fn large_used() -> Option<(usize, usize)> {
         let base = BASE.load(Relaxed);
@@ -193,6 +202,19 @@ mod linux {
                 !value.is_null() && *value != 0 && !(*value == b'0' && *value.add(1) == 0)
             };
             POPULATE.store(populate, SeqCst);
+            // SAFETY: as above; the value is compared up to its terminator.
+            let collapse = unsafe {
+                let value = getenv(c"SS_COLLAPSE".as_ptr().cast());
+                let is = |word: &core::ffi::CStr| !value.is_null() && core::ffi::CStr::from_ptr(value.cast()) == word;
+                if is(c"all") {
+                    1
+                } else if is(c"emulate") {
+                    2
+                } else {
+                    0
+                }
+            };
+            COLLAPSE.store(collapse, SeqCst);
             // SAFETY: inside the mapping. A kernel without huge pages says no to both: 4 KB
             // pages everywhere then.
             unsafe {
@@ -254,9 +276,55 @@ mod linux {
         let start = (own.at + align - 1) & !(align - 1);
         if start + bytes <= own.end {
             own.at = start + bytes;
+            if own.at > own.backed {
+                back_chunk(own);
+            }
             return start as *mut u8;
         }
         fresh(own, bytes)
+    }
+
+    /// `SS_COLLAPSE=all`: the whole 2 MB steps of `from..from + len` (both on such a step)
+    /// onto 2 MB pages: a byte written into each, then `MADV_COLLAPSE`, which makes a 2 MB
+    /// page of a step that has one page (Linux 6.1; it does not ask the machine's
+    /// huge-page setting). `emulate`: the range marked `MADV_HUGEPAGE` first, so that the
+    /// write itself gets the page where the machine gives them, and no collapse.
+    ///
+    /// The bytes written are zeros, into memory no caller has yet (or has only just been
+    /// given): what `alloc_zeroed` counts on stays true.
+    fn back(from: usize, len: usize) {
+        let mode = COLLAPSE.load(Relaxed);
+        if mode == 0 || len == 0 {
+            return;
+        }
+        // SAFETY: inside the reservation, above every block in use.
+        unsafe {
+            if mode == 2 {
+                madvise(from as *mut u8, len, MADV_HUGEPAGE);
+            }
+            let mut step = from;
+            while step < from + len {
+                (step as *mut u8).write_volatile(0);
+                step += HUGE;
+            }
+            if mode == 1 && REFUSALS.load(Relaxed) < 8 {
+                if madvise(from as *mut u8, len, MADV_COLLAPSE) == 0 {
+                    REFUSALS.store(0, Relaxed);
+                } else {
+                    REFUSALS.fetch_add(1, Relaxed);
+                }
+            }
+        }
+    }
+
+    /// The thread's chunk onto 2 MB pages up to the 2 MB step at or above its mark.
+    #[cold]
+    #[inline(never)]
+    fn back_chunk(own: &mut Own) {
+        let to = ((own.at + HUGE - 1) & !(HUGE - 1)).min(own.end);
+        let from = own.backed;
+        own.backed = to;
+        back(from, to - from);
     }
 
     #[cold]
@@ -266,6 +334,10 @@ mod linux {
         let chunk = take(CHUNK, HUGE);
         if !chunk.is_null() {
             (own.at, own.end) = (chunk as usize + bytes, chunk as usize + CHUNK);
+            own.backed = if COLLAPSE.load(Relaxed) != 0 { chunk as usize } else { usize::MAX };
+            if own.at > own.backed {
+                back_chunk(own);
+            }
         }
         chunk
     }
@@ -438,6 +510,10 @@ mod linux {
                         let grows = ptr as usize + old == own.at && ptr as usize + new <= own.end;
                         if grows {
                             own.at = ptr as usize + new;
+                            // Now, while the block's new bytes hold nothing.
+                            if own.at > own.backed {
+                                back_chunk(own);
+                            }
                         }
                         grows
                     });
@@ -453,7 +529,10 @@ mod linux {
                 // `SS_POPULATE`: the copy below writes the new block's first pages one after
                 // another, each a fault of its own where it is fresh memory without huge
                 // pages. A large block starts on a page (`kind`).
-                if layout.size() >= POPULATE_FROM && ours(to) && to as usize & (PAGE - 1) == 0 && POPULATE.load(Relaxed) {
+                if new_size > MOST && ours(to) && COLLAPSE.load(Relaxed) != 0 {
+                    // The reservation's own block, whole 2 MB steps: those the copy fills.
+                    back(to as usize, (layout.size() + HUGE - 1) & !(HUGE - 1));
+                } else if layout.size() >= POPULATE_FROM && ours(to) && to as usize & (PAGE - 1) == 0 && POPULATE.load(Relaxed) {
                     // SAFETY: whole pages inside the new block, which holds `new_size` bytes.
                     if unsafe { madvise(to, layout.size() & !(PAGE - 1), MADV_POPULATE_WRITE) } != 0 {
                         POPULATE.store(false, Relaxed);
