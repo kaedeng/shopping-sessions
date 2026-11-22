@@ -215,6 +215,87 @@ pub fn stretched() -> Option<String> {
     std::env::var("SS_PROBE").ok()?.strip_prefix("stage:").map(str::to_owned)
 }
 
+/// Laps so far (`lapped`): 1 while the parse runs, 2 the dedup, 3 the sessions stage.
+static LAPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Per stage, by `LAPS`: the core's clock over its time-stamp counter's as `f64` bits, read
+/// in the middle of the stage (`read_clock`); 0 for none.
+static CLOCKS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// A stage has ended; `main` calls it at every lap.
+pub fn lapped() {
+    LAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The clock of the calling thread's core over its time-stamp counter's: the fastest of
+/// 2,000 bursts of about a microsecond, 2.4 ms in all.
+///
+/// A burst is 16 register adds a round, each needing the one before: one a cycle whatever
+/// the clock, on any of four ports. The core's other thread is at work on the stage and
+/// takes ports now and then, more in a stage of scalar code than in one of vector code,
+/// which is the very comparison: a burst as long as 20 us read 5 to 15% low in the dedup
+/// stage on a machine whose clock does not change. A burst this short is often left alone
+/// from end to end, and the fastest one is the clock: the three stages then read the same
+/// there. (The counter of an AMD core steps by 42, so a burst cannot be much shorter.)
+#[cfg(target_arch = "x86_64")]
+fn core_clock() -> f64 {
+    const ROUNDS: u64 = 256;
+    let mut best = 0f64;
+    for _ in 0..2000 {
+        let from = ticks();
+        // SAFETY: registers only.
+        unsafe {
+            std::arch::asm!(
+                "2:",
+                "add {x}, {y}", "add {y}, {x}", "add {x}, {y}", "add {y}, {x}",
+                "add {x}, {y}", "add {y}, {x}", "add {x}, {y}", "add {y}, {x}",
+                "add {x}, {y}", "add {y}, {x}", "add {x}, {y}", "add {y}, {x}",
+                "add {x}, {y}", "add {y}, {x}", "add {x}, {y}", "add {y}, {x}",
+                "dec {n}",
+                "jnz 2b",
+                x = inout(reg) 1u64 => _,
+                y = inout(reg) 1u64 => _,
+                n = inout(reg) ROUNDS => _,
+                options(nomem, nostack),
+            );
+        }
+        let counted = ticks().wrapping_sub(from);
+        if counted != 0 {
+            best = best.max((16 * ROUNDS) as f64 / counted as f64);
+        }
+    }
+    best
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn core_clock() -> f64 {
+    0.0
+}
+
+/// `types::par::midway`'s hook: the clock of worker 0's core, in the middle of a stage.
+fn read_clock() {
+    use std::sync::atomic::Ordering::Relaxed;
+    CLOCKS[LAPS.load(Relaxed).min(7)].store(core_clock().to_bits(), Relaxed);
+}
+
+/// `SS_PROBE=clock:parse` or `clock:sessions`: how far that stage's cores run below the
+/// dedup stage's, as a wait. A Cascade Lake lowers a core's clock while it runs 512-bit
+/// instructions (by about a tenth for the light ones, more for multiplies) and for most of
+/// a millisecond after; the parse and the sessions stage are full of them, the dedup stage
+/// has none, and all eight workers are busy in each, so the turbo bin is the same. The run
+/// sleeps 50 ms times `10 + percent` at its end, `percent` from -9 to 60; no sleep at all
+/// means a stage was not read. So the score less the same build's, over 0.05 s, less 10,
+/// is the percent.
+fn clock_code(stage: &str) -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let read = |laps: usize| f64::from_bits(CLOCKS[laps].load(Relaxed));
+    let (of, dedup) = (read(if stage == "sessions" { 3 } else { 1 }), read(2));
+    eprintln!("probe: clock over counter: parse {:.4} dedup {:.4} sessions {:.4}", read(1), read(2), read(3));
+    if of <= 0.0 || dedup <= 0.0 {
+        return 0;
+    }
+    (10.0 + (100.0 * (1.0 - of / dedup)).round()).clamp(1.0, 70.0) as u64
+}
+
 /// The wait of `stretched` for a stage that took `took`.
 pub fn wait(took: std::time::Duration) {
     std::thread::sleep(took * types::env::number("SS_PROBE_TIMES", 10) as u32);
@@ -223,7 +304,10 @@ pub fn wait(took: std::time::Duration) {
 impl Probe {
     /// `Some` when `SS_PROBE` is set. Call before the workers are started.
     pub fn start() -> Option<Probe> {
-        std::env::var_os("SS_PROBE")?;
+        let probe = std::env::var("SS_PROBE").ok()?;
+        if probe.starts_with("clock:") {
+            types::par::midway(read_clock);
+        }
         Some(Probe { vmstat: read("/proc/vmstat").unwrap_or_default(), stat: read("/proc/stat").unwrap_or_default(), allowed: types::par::pin::allowed(), started: Instant::now() })
     }
 
@@ -232,6 +316,12 @@ impl Probe {
     pub fn finish(&self, data: &std::path::Path) {
         // A stage's wait is all that probe does: no report, which would add its own time.
         if stretched().is_some() {
+            return;
+        }
+        if let Some(stage) = std::env::var("SS_PROBE").ok().as_deref().and_then(|value| value.strip_prefix("clock:")) {
+            let code = clock_code(stage);
+            eprintln!("probe: clock code {code}");
+            std::thread::sleep(std::time::Duration::from_millis(50 * code));
             return;
         }
         if std::env::var_os("SS_PROBE").is_some_and(|value| value == "sleep") {

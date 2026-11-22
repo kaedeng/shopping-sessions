@@ -6,6 +6,7 @@
 //! `SS_TIMING=1` prints each stage's wall time to stderr; implementation.md lists every knob.
 //! Built with `--features trace`, `SS_TRACE=FILE` saves every task as a span (`types::par::trace`).
 
+mod fallback;
 #[cfg(feature = "pipe-positional")]
 mod opaque;
 #[cfg(feature = "pipe-positional")]
@@ -22,7 +23,7 @@ use ingest::ParseOut;
 use sessions::Agg;
 use types::par;
 use types::parts::Parts;
-use types::record::{ClickRec, PersonEvent};
+use types::record::{ClickN, ClickRec, PersonEvent};
 
 // Slot `alloc-mimalloc`: a build-time swap, since a process has one global allocator.
 #[cfg(feature = "alloc-mimalloc")]
@@ -55,6 +56,10 @@ struct Scattered {
     /// them that way (`opaque::Staged::dense`).
     #[cfg(feature = "pipe-positional")]
     dense: Option<opaque::DenseBuckets>,
+    /// The clicks the opaque parse wrote to their persons' buckets itself
+    /// (`ingest::opaque::Placing`): the same buckets as `dense`.
+    #[cfg(feature = "pipe-positional")]
+    placed: Option<types::chunks::Chunks<ClickN>>,
 }
 
 fn dir(var: &str, default: &str) -> PathBuf {
@@ -104,24 +109,30 @@ fn descriptors() -> bool {
     false
 }
 
-/// Slot `free-early`, the last of it (`SS_EXIT=release|leave`): every large block the
-/// run still holds goes back to the kernel now, a piece a task on all the workers, and the
-/// process ends with next to nothing mapped. Call it last: what the blocks held reads as
-/// zeros afterwards.
+/// Slot `free-early`, the last of it (`SS_EXIT=leave|release`, the pick first): with
+/// `release`, every large block the run still holds goes back to the kernel now, a piece a
+/// task on all the workers, and the process ends with next to nothing mapped. Call it
+/// last: what the blocks held reads as zeros afterwards.
 ///
 /// Left to the exit, one thread unmaps it all after the output is written and before the
-/// process is gone, which whoever times the run waits for. With 2 MB pages that is 5 ms at
-/// 20M events; on 4 KB pages (the scorer has no huge pages) the 900 MB still held are
-/// 225,000 pages and it was 55 ms, a tenth of the run.
+/// process is gone, which whoever times the run waits for. On the x86 box (WSL2) with 4 KB
+/// pages that was 51 ms at 20M events, and handing the blocks back first made the process
+/// 8% faster. On the scorer the same build was 19 ms slower with it than without (0.6270
+/// against 0.6076 s, one binary): unmapping at exit is cheap there, or eight threads
+/// unmapping at once is dear. So the pick is to leave it to the exit.
 fn hand_back(workers: usize) {
     #[cfg(feature = "alloc-region")]
-    if types::mem::free_early() && types::env::pick("SS_EXIT", &["release", "leave"]) == 0 {
+    if types::mem::free_early() && types::env::pick("SS_EXIT", &["leave", "release"]) == 1 {
         if let Some((from, to)) = region::large_used() {
             let started = Instant::now();
             // A thread's chunk is 64 MB, mostly one worker's; smaller pieces so that the
             // workers come out even.
             const PIECE: usize = 8 << 20;
             let mut states = vec![(); workers.max(1)];
+            // `SS_EXIT_WORKERS=1` is the exit's own work done here, on one thread: with
+            // `SS_PROBE=stage:handback` it tells what unmapping costs on a machine that
+            // shows nothing but a run's time.
+            par::limit(types::env::number("SS_EXIT_WORKERS", usize::MAX));
             par::run(&mut states, (to - from).div_ceil(PIECE), |_, _, piece| {
                 let start = from + piece * PIECE;
                 // SAFETY: whole pages of the reservation; nothing reads a large block after
@@ -143,8 +154,12 @@ fn hand_back(workers: usize) {
 }
 
 fn main() {
+    // A death of this try is the start of a second, by the classic pipeline (`fallback`).
+    fallback::arm();
     if let Err(error) = run() {
         eprintln!("shopping-sessions: {error}");
+        // So is an error. Back from this only where there is no second try to start.
+        fallback::again();
         std::process::exit(1);
     }
 }
@@ -162,10 +177,13 @@ fn run() -> Result<(), String> {
     // (`probe::stretched`).
     let stretched = probe::stretched();
     let mut lap = |stage: &'static str| {
+        // `SS_FAULT`: the run dies here, for tests.
+        fallback::fault(stage);
         if let Some(&(_, taking)) = stage_workers.iter().find(|(after, _)| *after == stage) {
             par::limit(taking);
         }
         types::tl::mark(stage);
+        probe::lapped();
         if timing || stretched.is_some() {
             let now = Instant::now();
             if timing {
@@ -180,6 +198,11 @@ fn run() -> Result<(), String> {
     };
 
     let (data, out) = (dir("DATA_DIR", "/data"), dir("OUTPUT_DIR", "/output"));
+    // A second try writes where the first may have left files (`fallback`).
+    if fallback::second() {
+        fallback::clear(&out);
+    }
+    fallback::failing()?;
     // `SS_PROBE`: a report on the machine after the run (`probe`).
     let probe = probe::Probe::start();
     one_arena();
@@ -218,6 +241,7 @@ fn run() -> Result<(), String> {
     {
         if let Some((plan, parsed)) = opened.pos {
             positional::run(&ctx, &ingest, &plan, parsed, &out, parallel_alloc, &mut lap)?;
+            fallback::done();
             if timing {
                 eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
             }
@@ -299,6 +323,8 @@ fn run() -> Result<(), String> {
                 opaque: Default::default(),
                 #[cfg(feature = "pipe-positional")]
                 dense: None,
+                #[cfg(feature = "pipe-positional")]
+                placed: None,
             });
             par::run(&mut scattered, parts + click_tasks.len(), |_, mine, task| {
                 if task < parts {
@@ -345,6 +371,13 @@ fn run() -> Result<(), String> {
                     &|each| scattered.iter().for_each(|mine| dense(mine).keys.for_each(bucket, |piece| each(piece))),
                     &|each| scattered.iter().for_each(|mine| dense(mine).pays.for_each(bucket, |piece| each(piece))),
                     &|each| scattered.iter().for_each(|mine| dense(mine).clicks.for_each(bucket, |piece| each(piece))),
+                    &|each| {
+                        scattered.iter().for_each(|mine| {
+                            if let Some(placed) = &mine.placed {
+                                placed.for_each(bucket, |piece| each(piece));
+                            }
+                        })
+                    },
                     agg,
                 );
             });
@@ -382,33 +415,70 @@ fn run() -> Result<(), String> {
         std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
     }
     let failure = OnceLock::new();
-    let mut outputs: Vec<(&mut Agg, &mut Scattered)> = aggs.iter_mut().zip(&mut scattered).collect();
-    par::each(&mut outputs, |worker, (agg, mine)| {
-        let rows = std::mem::take(&mut agg.user_daily);
-        // The opaque pipeline's persons are places in its directory: the writer asks for
-        // their names.
-        #[cfg(feature = "pipe-positional")]
-        let written = match &names {
-            Some(names) => output::user_daily_named(&user_folder, worker, &ctx, rows, &|keys, out| names.texts(keys, out)),
-            None => output::user_daily(&user_folder, worker, &ctx, rows),
-        };
-        #[cfg(not(feature = "pipe-positional"))]
-        let written = output::user_daily(&user_folder, worker, &ctx, rows);
-        if let Err(error) = written {
-            drop(failure.set(error));
+    // The opaque pipeline's persons are places in its directory: the writer asks for their
+    // names.
+    type TextOf<'a> = &'a (dyn Fn(&[types::Id], &mut Vec<u8>) + Sync);
+    #[cfg(feature = "pipe-positional")]
+    let texts = names.as_ref().map(|names| move |keys: &[types::Id], out: &mut Vec<u8>| names.texts(keys, out));
+    #[cfg(feature = "pipe-positional")]
+    let text_of: Option<TextOf> = texts.as_ref().map(|texts| texts as TextOf);
+    #[cfg(not(feature = "pipe-positional"))]
+    let text_of: Option<TextOf> = None;
+    // The stage's tasks, a file each, taken by whichever worker is free: every worker's
+    // `user_daily` rows, then `campaign_daily` in as many parts as there are workers (a
+    // part is an even share of the cells, summed over every worker's counters).
+    //
+    // The rows `sessions::dense_walk` left narrow go in `SS_OUT_PIECES` stretches a worker
+    // (3 unless set): one file a worker, written by that worker, ended the stage on the
+    // worker with the most rows (a third more than the one with the fewest, 2 ms of 7 at
+    // 20M events), and `campaign_daily`, summed and written whole by the one thread that
+    // was left after that, was 2 ms more. Rows of the other table are a file a worker,
+    // written also when a worker has no rows at all: a table needs a file.
+    let user_pieces = types::env::number("SS_OUT_PIECES", 3).clamp(1, 64);
+    enum File<'a> {
+        Narrow(types::rows::NarrowPiece<'a>),
+        Whole(types::rows::UserDaily),
+        Campaign(usize),
+    }
+    let mut tables: Vec<_> = aggs.iter_mut().map(|agg| (std::mem::take(&mut agg.user_daily), std::mem::take(&mut agg.user_narrow))).collect();
+    let (aggs, parts) = (&aggs, tables.len());
+    let mut files: Vec<std::sync::Mutex<Option<File>>> = Vec::new();
+    for (rows, narrow) in tables.iter_mut() {
+        let walked = !narrow.is_empty();
+        files.extend(narrow.pieces(user_pieces).into_iter().filter(|piece| !piece.is_empty()).map(|piece| std::sync::Mutex::new(Some(File::Narrow(piece)))));
+        if !(walked && rows.person.is_empty()) {
+            files.push(std::sync::Mutex::new(Some(File::Whole(std::mem::take(rows)))));
         }
+    }
+    files.extend((0..parts).map(|part| std::sync::Mutex::new(Some(File::Campaign(part)))));
+    let mut states: Vec<(&mut Scattered, bool)> = scattered.iter_mut().map(|mine| (mine, false)).collect();
+    par::run(&mut states, files.len(), |_, (mine, released), task| {
         // Slot `free-early`: the person buckets are dead since the sessions stage.
-        if free_early {
+        if free_early && !*released {
+            *released = true;
             mine.events.release();
             mine.clicks.release();
         }
+        let file = files[task].lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take().expect("a task is taken once");
+        let written = match file {
+            File::Narrow(piece) => output::user_daily_narrow(&user_folder, task, &ctx, piece, text_of),
+            File::Whole(rows) => match text_of {
+                Some(text_of) => output::user_daily_named(&user_folder, task, &ctx, rows, text_of),
+                None => output::user_daily(&user_folder, task, &ctx, rows),
+            },
+            File::Campaign(part) => output::campaign_daily(&campaign_folder, part, &ctx, sessions::campaign_daily_part(&ctx, aggs, part, parts)),
+        };
+        if let Err(error) = written {
+            drop(failure.set(error));
+        }
+        fallback::fault("files");
     });
-    drop(outputs);
-    types::tl::mark("user_daily written");
+    drop((states, files));
     if let Some(error) = failure.into_inner() {
         return Err(error);
     }
-    output::campaign_daily(&campaign_folder, 0, &ctx, sessions::campaign_daily(&ctx, &aggs))?;
+    // Every file is written: a death from here on loses nothing.
+    fallback::done();
     lap("output");
     if timing {
         eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);

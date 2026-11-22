@@ -19,7 +19,9 @@ name="$1"; shift
 flags=""
 if [ "${1:-}" = "-f" ]; then flags="$2"; shift 2; fi
 switches="$*"
-base=$(git rev-parse HEAD)
+# BASE=<commit> makes the branch from that commit and not from whatever HEAD is by now:
+# other sessions commit to this branch, so name the commit whose image was checked.
+base=$(git rev-parse "${BASE:-HEAD}")
 git show "$base:Dockerfile" | grep -q '^ENV SS_RUN=' || { echo "variant.sh: no 'ENV SS_RUN=' line in the commit's Dockerfile" >&2; exit 1; }
 git show "$base:Dockerfile" | grep -q '^ARG EXTRA_RUSTFLAGS=' || { echo "variant.sh: no 'ARG EXTRA_RUSTFLAGS=' line in the commit's Dockerfile" >&2; exit 1; }
 # awk, not sed: the flags hold characters a sed replacement would read.

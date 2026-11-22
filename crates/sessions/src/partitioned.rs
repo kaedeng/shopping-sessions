@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 
 use types::hash::person_hash;
 use types::id::Id;
-use types::record::{ClickRec, PersonEvent};
+use types::record::{ClickN, ClickRec, PersonEvent};
 use types::Ctx;
 
 use crate::{Agg, Click};
@@ -325,18 +325,24 @@ pub fn bucket_dense(
     events: &dyn Fn(&mut dyn FnMut(&[u64])),
     pays: &dyn Fn(&mut dyn FnMut(&[crate::DensePay])),
     clicks: &dyn Fn(&mut dyn FnMut(&[ClickRec])),
+    placed: &dyn Fn(&mut dyn FnMut(&[ClickN])),
     agg: &mut Agg,
 ) {
     // `SS_TIME_SORT=net|std`: a person's times by `sort_times`, or by `sort_unstable`.
     // `SS_DENSE_WALK=wide|person`: the sessions, rows and counters a bucket at a time
     // (`dense_walk`), or person by person.
-    static PICKS: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
-    let (net, wide_walk) = *PICKS.get_or_init(|| (types::env::pick("SS_TIME_SORT", &["net", "std"]) == 0, types::env::pick("SS_DENSE_WALK", &["wide", "person"]) == 0));
-    bucket_dense_as(ctx, base, span, events, pays, clicks, agg, net, wide_walk)
+    // `SS_SESS_WIDTH=512|256`: the kernels in 512-bit registers, or in 256-bit ones and
+    // narrower with no 256-bit multiply (`dense_walk` says why).
+    static PICKS: std::sync::OnceLock<(bool, bool, bool)> = std::sync::OnceLock::new();
+    let (net, wide_walk, narrow) = *PICKS.get_or_init(|| {
+        (types::env::pick("SS_TIME_SORT", &["net", "std"]) == 0, types::env::pick("SS_DENSE_WALK", &["wide", "person"]) == 0, types::env::pick("SS_SESS_WIDTH", &["512", "256"]) == 1)
+    });
+    bucket_dense_as(ctx, base, span, events, pays, clicks, placed, agg, net, wide_walk, narrow)
 }
 
-/// `bucket_dense` with its two choices given: `net` sorts a person's times by `sort_times`,
-/// `wide_walk` takes the bucket through `dense_walk` where it can run.
+/// `bucket_dense` with its three choices given: `net` sorts a person's times by `sort_times`,
+/// `wide_walk` takes the bucket through `dense_walk` where it can run, `narrow` runs the
+/// kernels' 256-bit forms.
 #[cfg(feature = "pipe-positional")]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bucket_dense_as(
@@ -346,14 +352,19 @@ pub(crate) fn bucket_dense_as(
     events: &dyn Fn(&mut dyn FnMut(&[u64])),
     pays: &dyn Fn(&mut dyn FnMut(&[crate::DensePay])),
     clicks: &dyn Fn(&mut dyn FnMut(&[ClickRec])),
+    placed: &dyn Fn(&mut dyn FnMut(&[ClickN])),
     agg: &mut Agg,
     net: bool,
     wide_walk: bool,
+    narrow: bool,
 ) {
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
-    let Agg { user_daily, bucket: scratch, attr, wide, day, counters, dense, .. } = agg;
+    let Agg { user_daily, user_narrow, bucket: scratch, attr, wide, day, counters, dense, .. } = agg;
     #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd")))]
     let Agg { user_daily, bucket: scratch, attr, day, counters, dense, .. } = agg;
+    // The walk's table; a build without the walk has no use for it.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
+    let _ = &user_narrow;
     let Dense { ends, click_ends, ts, clicks: grouped, side, sorter, .. } = dense;
     let offset = u64::from(base) << 32;
     // A key's person as its place among the bucket's; checked where it is first met, in the
@@ -368,6 +379,10 @@ pub(crate) fn bucket_dense_as(
     // event for a count. A pass also copies what it captured into locals first: a store
     // through a raw pointer may be to the closure's own fields for all the compiler knows,
     // and each one was followed by a load of the pointer it had just used.
+    //
+    // A key's place is a `u32` (the key less the base, shifted right by 32): checked as eight
+    // lanes of 64 bits, the compiler made the check one 512-bit compare, the one 512-bit
+    // instruction of these passes (`SS_SESS_WIDTH` says why that matters).
 
     // The events: counted per person, then each time to its person's stretch.
     ends.clear();
@@ -378,11 +393,11 @@ pub(crate) fn bucket_dense_as(
             let (counts, offset, span) = (counts, offset, span);
             let mut chunks = piece.chunks_exact(8);
             for chunk in &mut chunks {
-                let at: [usize; 8] = std::array::from_fn(|k| (chunk[k].wrapping_sub(offset) >> 32) as usize);
-                assert!(at.iter().all(|&at| at < span), "an event outside its bucket");
+                let at: [u32; 8] = std::array::from_fn(|k| (chunk[k].wrapping_sub(offset) >> 32) as u32);
+                assert!(at.iter().all(|&at| (at as usize) < span), "an event outside its bucket");
                 for at in at {
                     // SAFETY: `at < span`, and `ends` has `span + 1` entries.
-                    unsafe { *counts.add(at + 1) += 1 };
+                    unsafe { *counts.add(at as usize + 1) += 1 };
                 }
             }
             for &key in chunks.remainder() {
@@ -469,6 +484,27 @@ pub(crate) fn bucket_dense_as(
                 unsafe { *counts.add(at + 1) += 1 };
             }
         });
+        // The clicks the parse placed: a person is its place already. The place is 16 bits,
+        // checked as a `u32` as the events' are: as eight lanes of 64 bits the compiler made
+        // the check 512-bit loads, a permute and a compare.
+        placed(&mut |piece| {
+            let (counts, span) = (counts, span);
+            let mut chunks = piece.chunks_exact(8);
+            for chunk in &mut chunks {
+                let at: [u32; 8] = std::array::from_fn(|k| chunk[k].place() as u32);
+                assert!(at.iter().all(|&at| (at as usize) < span), "a click outside its bucket");
+                for at in at {
+                    // SAFETY: `at < span`, and `click_ends` has `span + 1` entries.
+                    unsafe { *counts.add(at as usize + 1) += 1 };
+                }
+            }
+            for click in chunks.remainder() {
+                let at = click.place();
+                assert!(at < span, "a click outside its bucket");
+                // SAFETY: as above.
+                unsafe { *counts.add(at + 1) += 1 };
+            }
+        });
     }
     let mut kept = 0u32;
     for end in click_ends.iter_mut() {
@@ -507,6 +543,34 @@ pub(crate) fn bucket_dense_as(
                 }
             }
         });
+        placed(&mut |piece| {
+            let (out, next) = (out, next);
+            let mut chunks = piece.chunks_exact(8);
+            for chunk in &mut chunks {
+                let mut at = [0u32; 8];
+                for (at, click) in at.iter_mut().zip(chunk) {
+                    // SAFETY: the count pass indexed the same persons, below `span`.
+                    unsafe {
+                        let slot = next.add(click.place());
+                        *at = *slot;
+                        *slot = *at + 1;
+                    }
+                }
+                for (at, click) in at.into_iter().zip(chunk) {
+                    // SAFETY: the positions are a permutation of `0..kept`, inside the
+                    // reserved room.
+                    unsafe { out.add(at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.click }) };
+                }
+            }
+            for click in chunks.remainder() {
+                // SAFETY: as above.
+                unsafe {
+                    let slot = next.add(click.place());
+                    out.add(*slot as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.click });
+                    *slot += 1;
+                }
+            }
+        });
         // SAFETY: every position in `0..kept` was written once above.
         unsafe { grouped.set_len(kept as usize) };
     }
@@ -522,7 +586,13 @@ pub(crate) fn bucket_dense_as(
             && let Some(wide) = wide.as_mut()
         {
             // SAFETY: the scatters above left `ends` and `click_ends` as each person's end.
-            unsafe { crate::dense_walk::walk(ctx, base, span, ends, click_ends, &mut ts[..], &mut grouped[..], &side[..], &mut dense.walk, sorter, wide, counters, user_daily) };
+            unsafe {
+                if narrow {
+                    crate::dense_walk::walk::<true>(ctx, base, span, ends, click_ends, &mut ts[..], &mut grouped[..], &side[..], &mut dense.walk, sorter, wide, counters, user_narrow)
+                } else {
+                    crate::dense_walk::walk::<false>(ctx, base, span, ends, click_ends, &mut ts[..], &mut grouped[..], &side[..], &mut dense.walk, sorter, wide, counters, user_narrow)
+                }
+            };
             return;
         }
     }
@@ -541,7 +611,9 @@ pub(crate) fn bucket_dense_as(
         }
         let person = Id::from(base) + at as Id;
         let times = &mut ts[from..end];
-        if net {
+        if net && narrow {
+            crate::sort_times::sort_narrow(times, sorter);
+        } else if net {
             crate::sort_times::sort(times, sorter);
         } else {
             times.sort_unstable();
@@ -584,7 +656,11 @@ pub(crate) fn bucket_dense_as(
             #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
             let done = match wide.as_mut() {
                 Some(wide) => {
-                    wide.person(clicks, starts, days, credits, counters.wide());
+                    if narrow {
+                        wide.person_narrow(clicks, starts, days, credits, counters.wide());
+                    } else {
+                        wide.person(clicks, starts, days, credits, counters.wide());
+                    }
                     true
                 }
                 None => false,

@@ -1,7 +1,14 @@
 # Shopping Sessions: a custom Rust engine (no Polars). implementation.md describes it.
 # The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
 # no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
-FROM rust:1.98-slim-trixie AS build
+#
+# The build image by its digest, not by its tag alone: a tag is moved when the image is
+# rebuilt (a new Debian point release, a new C library patch), and the C library is linked
+# into the binary. This is the image the tag named on 2026-11-22, which the measured and
+# scored builds up to then were made with. The digest is of the tag's whole list of
+# platforms, so the line still pins none. To move it: `docker buildx imagetools inspect
+# rust:<tag>`, then check and measure the result.
+FROM rust:1.98-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7 AS build
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
@@ -17,7 +24,7 @@ COPY src/ src/
 #   Cascade Lake Xeons the microcode fix for the jump erratum (SKX102) keeps such a jump out
 #   of the decoded-instruction cache. No use on Ice Lake or later, nor on AMD.
 ARG CPU=cascadelake
-ARG EXTRA_RUSTFLAGS=""
+ARG EXTRA_RUSTFLAGS="-C llvm-args=-x86-branches-within-32B-boundaries"
 # One static, non-relocatable binary: the C library is linked in, so the image below is the
 # binary alone, and a start is an exec with no loader, no libraries to map and no relocations
 # to apply (about 1 ms of a 17 ms run at 1M events, and what `docker run` adds on top).
@@ -53,10 +60,16 @@ WORKDIR /app
 #                            sleeps (300): a watching thread slows its core's other thread.
 # - SS_PART_BITS_OPAQUE=N    log2 of the event lists (11 at 20M events): two workers on
 #                            one core share its 1 MB L2.
+# - SS_FALLBACK=on|off       a run that dies (a fault, a panic, an error) starts over as the
+#                            classic pipeline, seconds where this one takes tenths
+#                            (`src/fallback.rs`); `off` lets it die.
 # - SS_PROBE=sleep           the machine as a number: the run takes 0.1 s times it longer
 #                            (`probe::code` has the digits). The scorer shows no stderr.
 # `scripts/variant.sh NAME SWITCH...` makes the branch `runner/NAME` with the line below
-# rewritten and pushes it. SS_RUN is read by nothing: it keeps the line whole when every
-# switch is at its default.
-ENV SS_RUN=1
+# rewritten (a variant names every switch it wants, these two included) and pushes it.
+# SS_RUN is read by nothing: it keeps the line whole when no switch is set.
+#
+# The two set here are what scored best on the scorer: 0.6351 s without them, 0.6115 s
+# with them, 0.6076 s with the two parse and sessions commits that followed.
+ENV SS_RUN=1 SS_POPULATE=1024 SS_COLLAPSE=on SS_DECODE=lean SS_PART_BITS_OPAQUE=11 SS_CHUNK_KB=128 SS_TAIL=small SS_SESS_WIDTH=256 SS_ATTR_HEAVY=flat
 CMD ["/app/shopping-sessions"]

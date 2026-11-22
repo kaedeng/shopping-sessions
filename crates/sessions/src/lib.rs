@@ -36,8 +36,8 @@ mod sort_times;
 #[cfg(test)]
 mod tests;
 
-use types::record::{ClickRec, PersonEvent};
-use types::rows::{CampaignDaily, UserDaily};
+use types::record::{ClickN, ClickRec, PersonEvent};
+use types::rows::{CampaignDaily, UserDaily, UserDailyNarrow};
 use types::{Ctx, Id};
 
 /// One click as the attribution reads it; a person's clicks sit together in the bucket.
@@ -137,6 +137,9 @@ fn key_sort() -> SortFn {
 pub struct Agg {
     /// This worker's `user_daily` rows, one per person and day with a session.
     pub user_daily: UserDaily,
+    /// More of them: the rows of the buckets that went through `dense_walk`, which writes
+    /// them narrow. A row is in one of the two tables.
+    pub user_narrow: UserDailyNarrow,
     bucket: partitioned::Scratch,
     rows: purchase_side::Rows,
     attr: attr_sweep::Attr,
@@ -157,6 +160,7 @@ impl Agg {
     pub fn new(ctx: &Ctx) -> Agg {
         Agg {
             user_daily: UserDaily::default(),
+            user_narrow: UserDailyNarrow::default(),
             bucket: Default::default(),
             rows: Default::default(),
             attr: attr_sweep::Attr::new(ctx),
@@ -257,6 +261,8 @@ pub struct DensePay {
 ///   the key `person << 32 | ts`; it is called twice, with the same pieces.
 /// - `pays` does the same with the purchases among those events, once.
 /// - `clicks` does the same with the bucket's clicks, twice; a click's `user` is its person.
+/// - `placed` does the same with the bucket's clicks that are `ClickN`s, twice: those the
+///   parse placed itself, a click's person being its place among the bucket's.
 ///
 /// The rows are `bucket`'s, with the person's number as the row's `person`.
 #[cfg(feature = "pipe-positional")]
@@ -267,9 +273,10 @@ pub fn bucket_dense(
     events: &dyn Fn(&mut dyn FnMut(&[u64])),
     pays: &dyn Fn(&mut dyn FnMut(&[DensePay])),
     clicks: &dyn Fn(&mut dyn FnMut(&[ClickRec])),
+    placed: &dyn Fn(&mut dyn FnMut(&[ClickN])),
     agg: &mut Agg,
 ) {
-    partitioned::bucket_dense(ctx, base, span, events, pays, clicks, agg)
+    partitioned::bucket_dense(ctx, base, span, events, pays, clicks, placed, agg)
 }
 
 /// `bucket` with the assists counted per stretch of a person's sessions (`attr-interval`): for

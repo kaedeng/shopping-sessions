@@ -15,6 +15,19 @@ use std::thread;
 /// Workers that take the tasks of the `run`s from here on: `limit`.
 static CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
 
+/// What `run` calls on worker 0 once in each run, past the middle of its tasks: `midway`.
+/// 0 for nothing.
+static MIDWAY: AtomicUsize = AtomicUsize::new(0);
+
+/// From here on every `run` calls `hook` once, on worker 0 (the thread that called `run`),
+/// right after the first task that worker finishes whose index is past half the run's
+/// tasks: in the middle of a stage, with the other workers at work and the stage's own code
+/// run a moment before. For a probe of the machine (`SS_PROBE=clock:...`); nothing is called
+/// in a run where worker 0 gets no such task.
+pub fn midway(hook: fn()) {
+    MIDWAY.store(hook as usize, Relaxed);
+}
+
 /// At most `workers` workers take the tasks of every `run` that follows (`usize::MAX`: all of
 /// them again). The others' states stay as `init` built them. For a machine whose CPUs are
 /// two threads of one core: a stage bound by memory may do better with one worker a core
@@ -400,8 +413,10 @@ pub fn run<S: Send>(states: &mut [S], tasks: usize, task: impl Fn(usize, &mut S,
     let next = AtomicUsize::new(0);
     let stage = trace::next_stage();
     let taking = CAP.load(Relaxed).min(states.len());
+    let midway = MIDWAY.load(Relaxed);
     each(&mut states[..taking], |worker, state| {
         crate::tl::mark("worker in");
+        let mut called = midway == 0 || worker != 0;
         loop {
             let index = next.fetch_add(1, Relaxed);
             if index >= tasks {
@@ -410,6 +425,11 @@ pub fn run<S: Send>(states: &mut [S], tasks: usize, task: impl Fn(usize, &mut S,
             let start = trace::now();
             task(worker, state, index);
             trace::span(stage, worker, index, start);
+            if !called && index >= tasks / 2 {
+                called = true;
+                // SAFETY: not 0, so the address of the `fn()` that `midway` stored.
+                unsafe { std::mem::transmute::<usize, fn()>(midway)() };
+            }
         }
         crate::tl::mark("worker out");
     });

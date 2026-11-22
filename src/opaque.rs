@@ -16,13 +16,14 @@
 use std::sync::OnceLock;
 
 use ingest::Ingest;
-use ingest::opaque::{Ev, EvL, LinkRec, Out, Plan};
+use ingest::opaque::{Ev, EvL, EvN, LinkRec, Out, Placing, Plan};
 use types::chunks::Chunks;
 use types::hash::{hash, person_hash};
 use types::parts::{Combine, Mode, Parts, Plain};
-use types::record::{ClickRec, PersonEvent};
+use types::record::{ClickN, ClickRec, PersonEvent};
 use types::mem::Zeroed;
-use types::users::{Users, mix_long};
+use types::id::SLOW;
+use types::users::{UserKey, Users, mix_long, short_digits};
 use types::{Ctx, Id, par};
 
 use crate::Scattered;
@@ -62,7 +63,7 @@ pub struct Persons {
 impl Persons {
     /// The persons the links make: a union-find over the users' numbers, each root keeping
     /// its component's smallest ID as the links come.
-    pub fn new(users: &Users, links: &[Vec<LinkRec>]) -> Persons {
+    pub fn new(users: &Users, links: &[&[LinkRec]]) -> Persons {
         // Zeroed lazily by the kernel, and touched only where a user's number is: the
         // numbers are dense, so that is the arrays' first few megabytes.
         // SAFETY: all zeros is a valid integer, and a valid pair of them.
@@ -73,6 +74,10 @@ impl Persons {
         let numbered = users.count();
         up.touch_first(numbered);
         names.touch_first(numbered);
+        // `SS_TAIL=small`: the entries past those are read for every row of a user that no
+        // link names, and are zeros: kept on 4 KB pages, they read as one zero page.
+        up.small_tail(numbered);
+        names.small_tail(numbered);
         // The root of `x`, every user on the way pointed at its grandparent.
         fn find(up: &mut [u32], mut x: u32) -> u32 {
             loop {
@@ -90,7 +95,7 @@ impl Persons {
         // Whether the ID of `a` is the smaller: by the first 8 bytes, and by all of them
         // where those are the same.
         let less = |a: (u32, u64), b: (u32, u64)| if a.1 != b.1 { a.1 < b.1 } else { a.0 != b.0 && users.less(a.0, b.0) };
-        let all = || links.iter().flatten();
+        let all = || links.iter().copied().flatten();
         // The entries of the link a few on are asked for as each link is taken: the links
         // come in no order.
         let ahead = |up: &[u32], names: &[(u32, u64)], next: Option<&LinkRec>| {
@@ -190,6 +195,23 @@ impl Row for Ev {
     }
 }
 
+impl Row for EvN {
+    #[inline(always)]
+    fn slot(&self) -> u64 {
+        hash(self.key())
+    }
+
+    #[inline(always)]
+    fn same(&self, other: &EvN) -> bool {
+        self.key() == other.key()
+    }
+
+    #[inline(always)]
+    fn words(&self) -> (u64, u64) {
+        (self.user_ts(), u64::from(self.ingest()))
+    }
+}
+
 impl Row for EvL {
     #[inline(always)]
     fn slot(&self) -> u64 {
@@ -213,13 +235,20 @@ pub struct Scratch {
     /// Each slot 0 or 1 + an index into the kept rows.
     table: Vec<u32>,
     kept: Vec<Ev>,
+    kept_narrow: Vec<EvN>,
     kept_long: Vec<EvL>,
 }
 
 /// Slots per row, rounded up to a power of two: the table ends a quarter full or less.
 const ROOM: usize = 4;
-/// Rows `dedup` asks for the slot of ahead of the row it is at.
-const AHEAD_SLOTS: usize = 8;
+/// Rows `dedup` asks for the slot of ahead of the row it is at: `SS_DEDUP_AHEAD`, 8 unless
+/// set, 0 for none. A row asked for is 11 instructions more (2% of a run's), for 6% of the
+/// stage's time at 21,000 rows a list (a table of half a megabyte) on a machine with a core
+/// a worker; see `SS_ASK` in `ingest::opaque::kern`.
+fn ahead_slots() -> usize {
+    static AHEAD: OnceLock<usize> = OnceLock::new();
+    *AHEAD.get_or_init(|| types::env::number("SS_DEDUP_AHEAD", 8).min(64))
+}
 
 /// List `list` of every worker deduplicated into `kept`: one record per `event_id`, the copy
 /// with the smallest `ingest`. `bits` are the hash bits that chose the list.
@@ -235,12 +264,15 @@ fn dedup<'p, R: Row + 'p>(lists: impl Iterator<Item = &'p Chunks<R>> + Clone, li
     table.clear();
     table.resize(mask + 1, 0);
     kept.reserve(rows);
+    let ahead = ahead_slots();
     for chunks in lists {
         chunks.for_each(list, |piece| {
             for (number, row) in piece.iter().enumerate() {
-                // The slot of the row a few on: at 60M events a list's table is half a
-                // megabyte and its kept rows more, past L2 together.
-                if let Some(coming) = piece.get(number + AHEAD_SLOTS) {
+                // `SS_DEDUP_AHEAD`: the slot of the row a few on (at 60M events a list's
+                // table is half a megabyte and its kept rows more, past L2 together).
+                if ahead != 0
+                    && let Some(coming) = piece.get(number + ahead)
+                {
                     types::mem::prefetch(table.as_ptr().wrapping_add((coming.slot() >> shift) as usize & mask));
                 }
                 let mut at = (row.slot() >> shift) as usize & mask;
@@ -264,6 +296,158 @@ fn dedup<'p, R: Row + 'p>(lists: impl Iterator<Item = &'p Chunks<R>> + Clone, li
                 }
             }
         });
+    }
+}
+
+/// In a slot of `dedup_short`'s table: the row is one of the wider records kept.
+const WIDE: u32 = 1 << 31;
+
+/// `dedup` for the short-keyed events of list `list`: every worker's records of that list,
+/// the narrow ones into `kept` and the wider rows, which lie among them as two records each
+/// (`EvN::head`), into `wide`. One table for both, by the key as `canon` has it, which both
+/// kinds of record hold: a copy of an `event_id` is found whichever record its row became,
+/// in one pass over the list. A record that loses to one of the other kind loses its `ts`:
+/// no row any more for the placing loop.
+///
+/// Where no row may be narrow (`Plan::narrow`) the rows are an `Ev` each in lists of their
+/// own, and this is `dedup` of those.
+///
+/// The loop keeps what it reads in locals and writes the kept rows through pointers into
+/// room made before it. As a closure over the table, the two vectors, the shift and the
+/// mask it read each of them from memory again for every record (a store through a pointer
+/// may be to the closure's own fields, for all the compiler knows), and every push checked
+/// the vector's room: 17 instructions a record more than this.
+fn dedup_short(parsed: &[Out], list: usize, plan: &Plan, table: &mut Vec<u32>, kept: &mut Vec<EvN>, wide: &mut Vec<Ev>) {
+    kept.clear();
+    if !plan.narrow {
+        return dedup(parsed.iter().map(|out| &out.events), list, plan.part_bits, table, wide);
+    }
+    wide.clear();
+    // Records: a few more than the rows, a wider row being two and a pad one.
+    let rows: usize = parsed.iter().map(|out| out.narrow.len_of(list)).sum();
+    if rows == 0 {
+        return;
+    }
+    let slot_bits = (ROOM * rows).next_power_of_two().max(1024).trailing_zeros();
+    assert!(plan.part_bits + slot_bits <= 64 && rows < WIDE as usize);
+    let (shift, mask) = (64 - plan.part_bits - slot_bits, (1usize << slot_bits) - 1);
+    table.clear();
+    table.resize(mask + 1, 0);
+    // A narrow record is kept once at the most, and so is a wider row, which is two records.
+    kept.reserve(rows);
+    wide.reserve(rows / 2 + 1);
+    let ahead = ahead_slots();
+    const KEY: u64 = (1 << 48) - 1;
+    let (slots, kept_at, wide_at) = (table.as_mut_ptr(), kept.as_mut_ptr(), wide.as_mut_ptr());
+    let (mut kept_len, mut wide_len) = (0usize, 0usize);
+    for out in parsed {
+        out.narrow.for_each(list, |piece| {
+            let (slots, kept_at, wide_at, shift, mask, ahead) = (slots, kept_at, wide_at, shift, mask, ahead);
+            let (mut kept_n, mut wide_n) = (kept_len, wide_len);
+            let (records, count) = (piece.as_ptr(), piece.len());
+            let mut number = 0;
+            // SAFETY: `number < count` where a record is read, and a wider row's second
+            // record is in the piece its first is in (`Chunks::push_pair_at`). A slot's
+            // index is masked to the table. `kept_n` and `wide_n` grow by one a record or a
+            // pair of them at the most, so they stay inside the room reserved above; a slot
+            // holds one more than the index of a row written before it was set.
+            unsafe {
+                while number < count {
+                    let row = *records.add(number);
+                    // `SS_DEDUP_AHEAD`: the slot of the record a few on (some slot, for a
+                    // record that is no narrow one).
+                    if ahead != 0 {
+                        let coming = (*records.add((number + ahead).min(count - 1))).a & KEY;
+                        types::mem::prefetch(slots.add((hash(coming) >> shift) as usize & mask));
+                    }
+                    if row.a & EvN::HEAD != EvN::HEAD {
+                        number += 1;
+                        let key = row.a & KEY;
+                        let mut at = (hash(key) >> shift) as usize & mask;
+                        loop {
+                            let slot = slots.add(at);
+                            let held = *slot;
+                            if held == 0 {
+                                kept_at.add(kept_n).write(row);
+                                kept_n += 1;
+                                *slot = kept_n as u32;
+                                break;
+                            }
+                            if held & WIDE == 0 {
+                                let first = &mut *kept_at.add(held as usize - 1);
+                                if first.a & KEY == key {
+                                    if row.ingest() < first.ingest() {
+                                        *first = row;
+                                    }
+                                    break;
+                                }
+                            } else {
+                                let first = &mut *wide_at.add((held & !WIDE) as usize - 1);
+                                if first.key == key {
+                                    if row.ingest() < first.ingest_pay as u32 {
+                                        first.user_ts &= 0xFFFF_FFFF;
+                                        kept_at.add(kept_n).write(row);
+                                        kept_n += 1;
+                                        *slot = kept_n as u32;
+                                    }
+                                    break;
+                                }
+                            }
+                            at = (at + 1) & mask;
+                        }
+                        continue;
+                    }
+                    if row.a == EvN::PAD.a {
+                        number += 1;
+                        continue;
+                    }
+                    // A wider row: its key here, its other two words in the record after.
+                    assert!(number + 1 < count, "a wider row's second record is in its piece");
+                    let rest = *records.add(number + 1);
+                    number += 2;
+                    let row = Ev { key: row.b, user_ts: rest.a, ingest_pay: rest.b };
+                    let key = row.key;
+                    let mut at = (hash(key) >> shift) as usize & mask;
+                    loop {
+                        let slot = slots.add(at);
+                        let held = *slot;
+                        if held == 0 {
+                            wide_at.add(wide_n).write(row);
+                            wide_n += 1;
+                            *slot = WIDE | wide_n as u32;
+                            break;
+                        }
+                        if held & WIDE != 0 {
+                            let first = &mut *wide_at.add((held & !WIDE) as usize - 1);
+                            if first.key == key {
+                                if (row.ingest_pay as u32) < (first.ingest_pay as u32) {
+                                    *first = row;
+                                }
+                                break;
+                            }
+                        } else {
+                            let first = &mut *kept_at.add(held as usize - 1);
+                            if first.a & KEY == key {
+                                if (row.ingest_pay as u32) < first.ingest() {
+                                    first.b &= !EvN::TS;
+                                    wide_at.add(wide_n).write(row);
+                                    wide_n += 1;
+                                    *slot = WIDE | wide_n as u32;
+                                }
+                                break;
+                            }
+                        }
+                        at = (at + 1) & mask;
+                    }
+                }
+            }
+            (kept_len, wide_len) = (kept_n, wide_n);
+        });
+    }
+    // SAFETY: that many rows were written into the room reserved, each once.
+    unsafe {
+        kept.set_len(kept_len);
+        wide.set_len(wide_len);
     }
 }
 
@@ -326,28 +510,49 @@ fn scatter_dense<R: Row>(kept: &[R], persons: &Persons, shift: u32, out: &mut De
     out.keys.fence();
 }
 
-/// `scatter_clicks` into the same buckets.
+/// `scatter_clicks` into the same buckets. With `recycle`, a chunk of the worker's list goes
+/// to the buckets' lists once its clicks are placed (`Chunks::give`).
 #[inline(always)]
-fn scatter_clicks_dense(from: &Out, persons: &Persons, shift: u32, out: &mut DenseBuckets) {
-    let mut place = |piece: &[ingest::opaque::Ck]| {
+fn scatter_clicks_dense(from: &Out, persons: &Persons, shift: u32, recycle: bool, out: &mut DenseBuckets) {
+    #[inline(always)]
+    fn place(piece: &[ingest::opaque::Ck], persons: &Persons, shift: u32, out: &mut DenseBuckets) {
         for click in piece {
             let root = persons.of(click.user_ts as u32);
             let rec = ClickRec { user: u64::from(root) + 1, click: click.click, ts: (click.user_ts >> 32) as u32, campaign: click.campaign as u32 };
             out.clicks.push((root >> shift) as usize, rec);
         }
-    };
+    }
     // A piece is a chunk of the list, 168 clicks: its persons are asked for when it comes,
     // and placed is the piece before it, asked for a piece ago.
-    let mut asked: &[ingest::opaque::Ck] = &[];
-    from.clicks.for_each(0, |piece| {
+    let mut asked: (&[ingest::opaque::Ck], usize) = (&[], 0);
+    from.clicks.for_each_chunk(0, |piece, chunk| {
         for click in piece {
             persons.prefetch(click.user_ts as u32);
         }
-        place(asked);
-        asked = piece;
+        place(asked.0, persons, shift, out);
+        if recycle && asked.1 != 0 {
+            // SAFETY: the chunk's clicks are placed and the piece after it has come: the
+            // worker's list, which outlives the buckets, is not read there again.
+            unsafe { out.clicks.give(asked.1) };
+        }
+        asked = (piece, chunk);
     });
-    place(asked);
+    place(asked.0, persons, shift, out);
     out.clicks.fence();
+}
+
+/// The chunks of list `list` of every worker's parse, which the dedup has just read, to the
+/// buckets' lists of the worker that read them (`Chunks::give`): a few for the purchases'
+/// lists, the rest for the keys'.
+fn give_chunks<R: Copy>(parsed: &[Out], of: impl Fn(&Out) -> &Chunks<R>, list: usize, ranges: &mut DenseBuckets) {
+    for out in parsed {
+        of(out).chunks_of(list, |chunk| {
+            // SAFETY: the parse's lists outlive the buckets' (neither is dropped before the
+            // run ends), a list is read by the one task that deduplicates it, and that
+            // task has read it.
+            unsafe { if ranges.pays.spare() < 4 { ranges.pays.give(chunk) } else { ranges.keys.give(chunk) } };
+        });
+    }
 }
 
 /// A worker's clicks to their persons' buckets.
@@ -389,9 +594,17 @@ impl Names {
     /// bytes, then its bytes. A name is read through three tables (the root's name, that
     /// user's slot, the slot's key), each far larger than the caches, so the keys go a few
     /// at a time: every table's lines are asked for before any is read.
+    ///
+    /// An entry is stored, not pushed: room for every key's entry at its longest is made
+    /// first, a short name is its length, the `u` and a word of digits whatever their
+    /// count, and a long one's 32 digits come a byte's two at a time from a table. (Pushed
+    /// byte by byte through `Users::text`, each with its test for room, a name was 90
+    /// cycles, and the names a fifth of the output stage.)
     pub fn texts(&self, keys: &[Id], out: &mut Vec<u8>) {
         let users = &self.plan.users;
         let mut named = [0u32; NAMES_HELD];
+        out.reserve(keys.len() * ENTRY_MOST + 16);
+        let (mut at, mut left) = (out.len(), keys.len());
         for held in keys.chunks(NAMES_HELD) {
             for &key in held {
                 self.persons.prefetch_name(key as u32 - 1);
@@ -404,23 +617,87 @@ impl Names {
                 users.prefetch_key(name);
             }
             for &name in &named[..held.len()] {
-                let at = out.len();
-                out.extend_from_slice(&[0; 4]);
-                users.text(name, out);
-                let len = (out.len() - at - 4) as u32;
-                out[at..at + 4].copy_from_slice(&len.to_le_bytes());
+                left -= 1;
+                // SAFETY: `out` has room for `ENTRY_MOST` bytes for this key and each of
+                // the `left` after it, and 16 more: an entry here is at most `ENTRY_MOST`,
+                // and a short one's word of digits ends inside them.
+                unsafe {
+                    let to = out.as_mut_ptr().add(at);
+                    match users.key(name) {
+                        UserKey::Short(key) if key & SLOW != 0 => at = interned(key, out, at, left),
+                        UserKey::Short(key) => {
+                            let (digits, count) = short_digits(key);
+                            to.cast::<u32>().write_unaligned((1 + count as u32).to_le());
+                            *to.add(4) = b'u';
+                            to.add(5).cast::<[u8; 8]>().write_unaligned(digits);
+                            at += 5 + count;
+                        }
+                        UserKey::Long(hi, lo) => {
+                            to.cast::<u32>().write_unaligned(33u32.to_le());
+                            *to.add(4) = b'u';
+                            for (place, byte) in hi.to_le_bytes().into_iter().chain(lo.to_le_bytes()).enumerate() {
+                                to.add(5 + 2 * place).cast::<[u8; 2]>().write_unaligned(HEX[usize::from(byte)]);
+                            }
+                            at += ENTRY_MOST;
+                        }
+                    }
+                }
             }
         }
+        // SAFETY: the bytes up to `at` were written, inside the room made.
+        unsafe { out.set_len(at) };
     }
+}
+
+/// The entry of a name the directory holds interned (not a `u` and digits): any length, so
+/// through the vector, and room made again for the `left` entries after it. Returns where
+/// the next entry goes.
+#[cold]
+#[inline(never)]
+fn interned(key: u64, out: &mut Vec<u8>, at: usize, left: usize) -> usize {
+    // SAFETY: the bytes up to `at` were written.
+    unsafe { out.set_len(at) };
+    out.extend_from_slice(&[0; 4]);
+    types::id::unpack(key, out);
+    let len = (out.len() - at - 4) as u32;
+    out[at..at + 4].copy_from_slice(&len.to_le_bytes());
+    out.reserve(left * ENTRY_MOST + 16);
+    out.len()
 }
 
 /// Names `Names::texts` reads together.
 const NAMES_HELD: usize = 32;
+/// The longest entry of a name the directory keeps as a key: its length in four bytes, `u`,
+/// 32 hexadecimal digits.
+const ENTRY_MOST: usize = 37;
+/// A byte's two hexadecimal digits.
+static HEX: [[u8; 2]; 256] = {
+    let mut table = [[0u8; 2]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        table[byte] = [b"0123456789abcdef"[byte >> 4], b"0123456789abcdef"[byte & 15]];
+        byte += 1;
+    }
+    table
+};
 
 /// Stages 1 and 2. `None` when the directory was too small for the input's users: the
 /// caller starts over with a larger `grow`. `whole_clicks`: `ingest::opaque::click_id_at`.
 pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, parallel_alloc: bool, scatter_mode: Option<usize>, lap: &mut dyn FnMut(&'static str)) -> Option<Staged> {
-    let plan = ingest.opaque_plan(grow, whole_clicks);
+    let mut plan = ingest.opaque_plan(grow, whole_clicks);
+    // `SS_BUCKETS=dense|hash`: the person buckets as ranges of the persons' numbers, for
+    // `sessions::bucket_dense`, or by the persons' hashes, for `sessions::bucket`.
+    let dense_buckets = types::env::pick("SS_BUCKETS", &["dense", "hash"]) == 0;
+    // `SS_CLICKS=placed|listed|wait`: a click chunk taken once the links are joined writes
+    // its clicks to their persons' buckets (`ingest::opaque::Placing`); `listed` writes
+    // every click to its worker's list for the next stage to place, as before; `wait` has
+    // every click chunk wait for the links, so that all are placed (for tests). Buckets
+    // by hash are filled by the next stage only.
+    let click_mode = types::env::pick("SS_CLICKS", &["placed", "listed", "wait"]);
+    // (A placed click names its campaign in 16 bits, `ClickN`.)
+    let place_clicks = dense_buckets && click_mode != 1 && ctx.campaigns.len() <= ClickN::CAMPAIGNS;
+    plan.wait_for_placing = place_clicks && click_mode == 2;
+    let plan = plan;
     // Each worker makes its lists, and before that puts its piece of the directory onto
     // whole 2 MB pages (`types::mem::touch`; `SS_TOUCH=off` leaves that to the first
     // lookups). All of it before the first lookup: a piece touched while another worker
@@ -449,9 +726,22 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
                 std::hint::spin_loop();
             }
             types::tl::mark("links read");
-            let read: Vec<Vec<LinkRec>> = links.iter().map(|read| read.get().cloned().unwrap_or_default()).collect();
+            // The lists as they are: copied into one `Vec` each they were 21 MB at 20M events
+            // and 64 MB at 60M, written to fresh pages by the one task the persons wait for.
+            let read: Vec<&[LinkRec]> = links.iter().map(|read| read.get().map_or(&[][..], Vec::as_slice)).collect();
             drop(persons.set(Persons::new(&plan.users, &read)));
             types::tl::mark("links named");
+            if place_clicks && let Some(persons) = persons.get() {
+                // The buckets by the users numbered so far: the linked ones and those of
+                // the lines read until now. The rest only add buckets of the same width
+                // (there are at most twice as many as `SS_BUCKET_BITS` asks for). A bucket
+                // is no wider than a placed click can name a person of.
+                let count = plan.users.count().max(1);
+                let shift = (usize::BITS - (count - 1).leading_zeros()).saturating_sub(ctx.bucket_bits).min(ClickN::SPAN_BITS);
+                // SAFETY: the array has an entry a number of the directory, the unions are
+                // done, and it lives in `Names` to the end of the run.
+                drop(plan.placing.set(unsafe { Placing::new(persons.up.as_ptr(), shift, ((plan.users.bound() - 1) >> shift) + 1) }));
+            }
         } else {
             ingest.opaque_parse(ctx, &plan, task - link_tasks - 1, out);
         }
@@ -463,20 +753,26 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     lap("parse");
 
     let (parts, long_parts, buckets) = (1usize << plan.part_bits, 1usize << plan.long_bits, 1usize << ctx.bucket_bits);
-    let events: usize = parsed.iter().map(|out| out.events.len() + out.long_events.len()).sum();
+    // (A wider row is two of the narrow lists' records, and a pad is none.)
+    let events: usize = parsed.iter().map(|out| out.narrow.len() - out.narrow.extra() + out.events.len() + out.long_events.len()).sum();
+    // A worker's `user_daily` rows get their room once (`types::rows::expect`): generated
+    // data has a row for every 8 or 9 events, so a quarter of an even share of the events
+    // is twice a worker's rows.
+    types::rows::expect(events / ctx.workers / 4);
+    // The clicks still to place, and those the parse placed.
     let clicks: usize = parsed.iter().map(|out| out.clicks.len()).sum();
+    let placed: usize = parsed.iter().map(|out| out.placed.as_ref().map_or(0, Chunks::len)).sum();
     let room = |rows: usize| rows / ctx.workers / buckets * 9 / 8 + 64;
     if std::env::var_os("SS_TIMING").is_some() {
         let long: usize = parsed.iter().map(|out| out.long_events.len()).sum();
         let links: usize = links.iter().filter_map(OnceLock::get).map(Vec::len).sum();
         let slow: usize = parsed.iter().map(|out| out.slow).sum();
-        eprintln!("opaque: {events} event rows ({long} with a long event_id), {clicks} clicks, {links} links, {} lists, {} users, {slow} lines through the row code", parts + long_parts, plan.users.count());
+        eprintln!("opaque: {events} event rows ({long} with a long event_id), {} clicks ({placed} placed by the parse), {links} links, {} lists, {} users, {slow} lines through the row code", clicks + placed, parts + long_parts, plan.users.count());
     }
-    // `SS_BUCKETS=dense|hash`: the person buckets as ranges of the persons' numbers, for
-    // `sessions::bucket_dense`, or by the persons' hashes, for `sessions::bucket`.
-    let dense = (types::env::pick("SS_BUCKETS", &["dense", "hash"]) == 0).then(|| {
+    // The buckets as the parse placed its clicks, if it did.
+    let dense = dense_buckets.then(|| {
         let count = plan.users.count().max(1);
-        let shift = (usize::BITS - (count - 1).leading_zeros()).saturating_sub(ctx.bucket_bits);
+        let shift = plan.placing.get().map_or((usize::BITS - (count - 1).leading_zeros()).saturating_sub(ctx.bucket_bits), |placing| placing.shift);
         (shift, ((count - 1) >> shift) + 1)
     });
     let mut scattered: Vec<Scattered> = par::init(ctx.workers, parallel_alloc, |_| match dense {
@@ -486,6 +782,7 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
             scratch: Default::default(),
             opaque: Default::default(),
             dense: Some(DenseBuckets::new(lists, events, clicks, ctx.workers)),
+            placed: None,
         },
         None => Scattered {
             events: Parts::new(buckets, room(events), scatter_mode),
@@ -493,8 +790,21 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
             scratch: Default::default(),
             opaque: Default::default(),
             dense: None,
+            placed: None,
         },
     });
+    // The clicks the parse placed stay with the buckets: the sessions stage reads them.
+    for (mine, out) in scattered.iter_mut().zip(parsed.iter_mut()) {
+        mine.placed = out.placed.take();
+    }
+    // `SS_RECYCLE=off|on`. `on`: the buckets' lists written into the chunks of the parse's
+    // lists as the dedup has read them (`Chunks::give`), for buckets that are ranges of
+    // numbers. `off`, the pick: into fresh memory, and the parse's lists handed back to the
+    // kernel after the stage. On 4 KB pages here `on` is 4% faster; on the scorer it was not
+    // (0.6122 s against 0.6076 without, one submission each). The likely reason: a list is
+    // written with streaming stores, and a chunk the task has just read is in its caches,
+    // which an Intel core has to empty of the line first.
+    let recycle = dense.is_some() && types::env::pick("SS_RECYCLE", &["off", "on"]) == 1;
     {
         let (parsed, persons) = (&parsed[..], &persons);
         // The clicks' tasks are taken first: each is a worker's whole list, as long as
@@ -504,20 +814,33 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
         let workers = parsed.len();
         par::run(&mut scattered, workers + parts + long_parts, |_, mine, task| {
             let task = if task < workers { parts + long_parts + task } else { task - workers };
-            let Scattered { events, clicks, opaque: Scratch { table, kept, kept_long }, dense: ranges, .. } = mine;
+            let Scattered { events, clicks, opaque: Scratch { table, kept, kept_narrow, kept_long }, dense: ranges, .. } = mine;
             if let (Some(ranges), Some((shift, _))) = (ranges, dense) {
                 if task < parts {
-                    dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, table, kept);
+                    dedup_short(parsed, task, &plan, table, kept_narrow, kept);
+                    if recycle {
+                        give_chunks(parsed, |out| &out.narrow, task, ranges);
+                    }
+                    scatter_dense(kept_narrow, persons, shift, ranges);
                     scatter_dense(kept, persons, shift, ranges);
                 } else if task < parts + long_parts {
                     dedup(parsed.iter().map(|out| &out.long_events), task - parts, plan.long_bits, table, kept_long);
+                    if recycle {
+                        give_chunks(parsed, |out| &out.long_events, task - parts, ranges);
+                    }
                     scatter_dense(kept_long, persons, shift, ranges);
                 } else {
-                    scatter_clicks_dense(&parsed[task - parts - long_parts], persons, shift, ranges);
+                    scatter_clicks_dense(&parsed[task - parts - long_parts], persons, shift, recycle, ranges);
                 }
             } else if task < parts {
-                dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, table, kept);
-                if events.combining() { scatter::<_, Combine>(kept, persons, ctx.bucket_bits, events) } else { scatter::<_, Plain>(kept, persons, ctx.bucket_bits, events) }
+                dedup_short(parsed, task, &plan, table, kept_narrow, kept);
+                if events.combining() {
+                    scatter::<_, Combine>(kept_narrow, persons, ctx.bucket_bits, events);
+                    scatter::<_, Combine>(kept, persons, ctx.bucket_bits, events);
+                } else {
+                    scatter::<_, Plain>(kept_narrow, persons, ctx.bucket_bits, events);
+                    scatter::<_, Plain>(kept, persons, ctx.bucket_bits, events);
+                }
             } else if task < parts + long_parts {
                 dedup(parsed.iter().map(|out| &out.long_events), task - parts, plan.long_bits, table, kept_long);
                 if events.combining() { scatter::<_, Combine>(kept_long, persons, ctx.bucket_bits, events) } else { scatter::<_, Plain>(kept_long, persons, ctx.bucket_bits, events) }
@@ -528,7 +851,9 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
         });
     }
     lap("dedup");
-    if types::mem::free_early() {
+    // The parse's lists are dead. Where their chunks went to the buckets' lists they stay,
+    // with those, to the end of the run; else each worker hands its own back now.
+    if types::mem::free_early() && !recycle {
         par::each(&mut parsed, |_, out| out.release());
     }
     // The exit path skips destructors (`fast-exit`), and these are large.
