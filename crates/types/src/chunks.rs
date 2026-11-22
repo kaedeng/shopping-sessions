@@ -26,6 +26,8 @@ const LINK: usize = 4032;
 const HUGE: usize = 2 << 20;
 /// What a list's `cur` holds before its first chunk: the offset of a chunk's link, at no chunk.
 const NONE: usize = LINK;
+/// Blocks `for_each` of pooled lists asks for ahead of the one it is at.
+const POOL_AHEAD: usize = 8;
 
 const _: () = assert!(LINK % STAGE == 0 && LINK + size_of::<usize>() <= CHUNK);
 
@@ -76,6 +78,13 @@ pub struct Chunks<T> {
     spare: Vec<usize>,
     /// Records `push_pair_at` appended beyond one a pair: a pair's second, and each pad.
     extra: usize,
+    /// `pool`: the lists' blocks go one after another into one chunk at a time, the one given
+    /// last first, each list keeping where its blocks are (`index`) instead of chunks of its
+    /// own; `slot..slot_end` is what is left of that chunk.
+    pooled: bool,
+    index: Vec<Vec<usize>>,
+    slot: usize,
+    slot_end: usize,
     _records: PhantomData<T>,
 }
 
@@ -105,8 +114,26 @@ impl<T: Copy> Chunks<T> {
             arenas: vec![arena],
             spare: Vec::new(),
             extra: 0,
+            pooled: false,
+            index: Vec::new(),
+            slot: 0,
+            slot_end: 0,
             _records: PhantomData,
         }
+    }
+
+    /// Has these lists, empty, write their blocks into a pool (`push_as::<true>`): every
+    /// list's next block goes into the next free 192 bytes of one chunk, the chunk given last
+    /// (`give`) before any other, and each list keeps the blocks' addresses in order, room for
+    /// `records` records each made now. For lists written a block at a time from many places
+    /// (a worker's person buckets): a chunk of a list of its own takes its 21 blocks over a
+    /// hundred dedup tasks, so a chunk just read is warm in the caches for the first of them
+    /// only; a pool's chunk is written in one go while it is still warm, with plain stores.
+    pub fn pool(&mut self, records: usize) {
+        assert!(self.is_empty() && !self.pooled, "Chunks::pool on lists in use");
+        let blocks = records * Self::SIZE / STAGE + 2;
+        self.pooled = true;
+        self.index = (0..self.lists()).map(|_| Vec::with_capacity(blocks)).collect();
     }
 
     pub fn lists(&self) -> usize {
@@ -124,13 +151,23 @@ impl<T: Copy> Chunks<T> {
     /// `list < self.lists()`.
     #[inline(always)]
     pub unsafe fn push_at(&mut self, list: usize, rec: T) {
-        debug_assert!(list < self.lists());
+        // SAFETY: the caller's.
+        unsafe { self.push_at_as::<false>(list, rec) }
+    }
+
+    /// `push_at` into lists that are `POOLED` (`pool`) or not.
+    ///
+    /// # Safety
+    /// `list < self.lists()`, and `POOLED` is whether `pool` was called.
+    #[inline(always)]
+    pub unsafe fn push_at_as<const POOLED: bool>(&mut self, list: usize, rec: T) {
+        debug_assert!(list < self.lists() && POOLED == self.pooled);
         // SAFETY: the caller keeps `list` in range; a list's staging holds `STAGE` bytes, and
         // `fill` is a multiple of the record's size below it once a full block is written out.
         unsafe {
             let mut fill = *self.fill.get_unchecked(list) as usize;
             if fill == STAGE {
-                self.flush(list);
+                if POOLED { self.flush_pooled(list) } else { self.flush(list) }
                 fill = 0;
             }
             self.stage.ptr.add(list * STAGE + fill).cast::<T>().write_unaligned(rec);
@@ -192,9 +229,15 @@ impl<T: Copy> Chunks<T> {
 
     /// Appends `rec` to list `list`; panics if there is no such list.
     pub fn push(&mut self, list: usize, rec: T) {
-        assert!(list < self.lists(), "list {list} of {}", self.lists());
+        self.push_as::<false>(list, rec)
+    }
+
+    /// `push` into lists that are `POOLED` (`pool`) or not; panics if that is wrong.
+    #[inline(always)]
+    pub fn push_as<const POOLED: bool>(&mut self, list: usize, rec: T) {
+        assert!(list < self.lists() && POOLED == self.pooled, "list {list} of {}, pooled {}", self.lists(), self.pooled);
         // SAFETY: checked above.
-        unsafe { self.push_at(list, rec) }
+        unsafe { self.push_at_as::<POOLED>(list, rec) }
     }
 
     /// List `list`'s full staging block to its chunk, with streaming stores.
@@ -203,6 +246,7 @@ impl<T: Copy> Chunks<T> {
     /// `list < self.lists()`, and its staging holds `STAGE` bytes.
     #[inline(never)]
     unsafe fn flush(&mut self, list: usize) {
+        debug_assert!(!self.pooled);
         // SAFETY: the caller's contract; a chunk has room for a block wherever `cur` is not
         // at its link.
         unsafe {
@@ -217,18 +261,37 @@ impl<T: Copy> Chunks<T> {
         }
     }
 
-    /// A new chunk for list `list`, linked after the one whose link is at `link` (`NONE` for
-    /// the list's first).
+    /// `flush` of pooled lists (`pool`): the block to the pool's next 192 bytes with plain
+    /// stores (the chunk was given just after it was read, so its lines are in this core's
+    /// caches, which a streaming store would first have to empty of them), its address to the
+    /// list's index.
+    ///
+    /// # Safety
+    /// As `flush`.
+    #[inline(never)]
+    unsafe fn flush_pooled(&mut self, list: usize) {
+        debug_assert!(self.pooled);
+        if self.slot == self.slot_end {
+            let chunk = self.take();
+            (self.slot, self.slot_end) = (chunk, chunk + LINK);
+        }
+        let to = self.slot;
+        // SAFETY: the caller's contract; the pool's chunk has room for a block below its link,
+        // and no list has a block there yet.
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.stage.ptr.add(list * STAGE), to as *mut u8, STAGE);
+            self.index.get_unchecked_mut(list).push(to);
+            *self.blocks.get_unchecked_mut(list) += 1;
+            *self.fill.get_unchecked_mut(list) = 0;
+        }
+        self.slot = to + STAGE;
+    }
+
+    /// A chunk to write: the one given last, else the block's next.
     #[cold]
     #[inline(never)]
-    fn chunk(&mut self, list: usize, link: usize) -> usize {
+    fn take(&mut self) -> usize {
         if let Some(new) = self.spare.pop() {
-            if link == NONE {
-                self.head[list] = new;
-            } else {
-                // SAFETY: `link` is the link of the list's last chunk.
-                unsafe { (link as *mut usize).write(new) };
-            }
             return new;
         }
         if self.next == self.end {
@@ -248,6 +311,15 @@ impl<T: Copy> Chunks<T> {
             // holds a record yet.
             unsafe { crate::mem::back(new as *mut u8, window.min(self.end - new)) };
         }
+        new
+    }
+
+    /// A new chunk for list `list`, linked after the one whose link is at `link` (`NONE` for
+    /// the list's first).
+    #[cold]
+    #[inline(never)]
+    fn chunk(&mut self, list: usize, link: usize) -> usize {
+        let new = self.take();
         if link == NONE {
             self.head[list] = new;
         } else {
@@ -281,6 +353,7 @@ impl<T: Copy> Chunks<T> {
 
     /// The address of every chunk of list `list`, for `give` once the list has been read.
     pub fn chunks_of(&self, list: usize, mut each: impl FnMut(usize)) {
+        assert!(!self.pooled, "Chunks::chunks_of on pooled lists");
         let head = self.head[list];
         if head != 0 {
             let last = (self.cur[list] - 1) & !(CHUNK - 1);
@@ -300,6 +373,7 @@ impl<T: Copy> Chunks<T> {
     /// chunk again.
     #[inline(always)]
     pub fn for_each_chunk<'a>(&'a self, list: usize, mut piece: impl FnMut(&'a [T], usize)) {
+        assert!(!self.pooled, "Chunks::for_each_chunk on pooled lists");
         let head = self.head[list];
         // SAFETY: as `for_each`.
         unsafe {
@@ -339,6 +413,9 @@ impl<T: Copy> Chunks<T> {
     /// List `list` in order of appending, a piece at a time: its chunks, then what is staged.
     #[inline(always)]
     pub fn for_each<'a>(&'a self, list: usize, mut piece: impl FnMut(&'a [T])) {
+        if self.pooled {
+            return self.for_each_pooled(list, piece);
+        }
         let head = self.head[list];
         // SAFETY: a list's chunks hold records up to `cur`, each chunk but the last full and
         // linked to the next; chunks are aligned to 4 KB, the staging to 2 MB.
@@ -364,6 +441,73 @@ impl<T: Copy> Chunks<T> {
                 piece(std::slice::from_raw_parts(self.stage.ptr.add(list * STAGE).cast::<T>(), staged / Self::SIZE));
             }
         }
+    }
+
+    /// `for_each` of pooled lists: a block at a time, the blocks a few on asked for.
+    #[inline(always)]
+    fn for_each_pooled<'a>(&'a self, list: usize, mut piece: impl FnMut(&'a [T])) {
+        let index = &self.index[list];
+        for (at, &block) in index.iter().enumerate() {
+            if let Some(&coming) = index.get(at + POOL_AHEAD) {
+                for line in [0, 64, 128] {
+                    crate::mem::prefetch((coming + line) as *const u8);
+                }
+            }
+            // SAFETY: each address is of a full block written by `flush_pooled`.
+            piece(unsafe { std::slice::from_raw_parts(block as *const T, STAGE / Self::SIZE) });
+        }
+        let staged = self.fill[list] as usize;
+        if staged != 0 {
+            // SAFETY: the staging holds `staged` bytes of the list's records.
+            piece(unsafe { std::slice::from_raw_parts(self.stage.ptr.add(list * STAGE).cast::<T>(), staged / Self::SIZE) });
+        }
+    }
+
+    /// Where the first `sixteenths` of the chunks the lists have taken from their first block
+    /// end, on a 2 MB step: `(start, cut)`, the block's chunks from `start` to below `cut`.
+    /// For `give` of only those, and `release_above` of the rest.
+    pub fn kept(&self, sixteenths: usize) -> (usize, usize) {
+        let first = &self.arenas[0];
+        let start = first.ptr as usize;
+        let used = if self.arenas.len() == 1 { self.next - start } else { first.layout.size() };
+        (start, (start + (used * sixteenths.min(16) / 16).next_multiple_of(HUGE)).min(start + first.layout.size()))
+    }
+
+    /// Empties the lists and hands back to the kernel the chunks they took from `cut` (of
+    /// `kept`) on: of the first block, and every further block. The chunks below `cut` are
+    /// left as they are (`give` may have handed them to other lists), and no list takes one of
+    /// the first block again.
+    ///
+    /// # Safety
+    /// `cut` is of `kept`, and nothing reads a chunk of these lists from `cut` on again.
+    pub unsafe fn release_above(&mut self, cut: usize) {
+        self.fill.fill(0);
+        self.extra = 0;
+        self.cur.fill(NONE);
+        self.head.fill(0);
+        self.blocks.fill(0);
+        self.spare.clear();
+        let first = &self.arenas[0];
+        let end = first.ptr as usize + first.layout.size();
+        let used = if self.arenas.len() == 1 { self.next } else { end };
+        debug_assert!((first.ptr as usize..=end).contains(&cut));
+        // SAFETY: the caller's: nothing reads these chunks again.
+        unsafe {
+            if used > cut {
+                crate::mem::release(cut as *const u8, used - cut);
+            }
+            for more in &self.arenas[1..] {
+                crate::mem::release(more.ptr, more.layout.size());
+            }
+        }
+        self.arenas.truncate(1);
+        (self.next, self.end) = (end, end);
+    }
+
+    /// Chunks the lists took from the first block (not given ones).
+    pub fn fresh(&self) -> usize {
+        let first = &self.arenas[0];
+        if self.arenas.len() == 1 { (self.next - first.ptr as usize) / CHUNK } else { first.layout.size() / CHUNK }
     }
 
     /// Records in list `list`.
@@ -409,6 +553,8 @@ impl<T: Copy> Chunks<T> {
         self.blocks.fill(0);
         // Chunks that were given are other lists' pages: not handed back here, and not kept.
         self.spare.clear();
+        self.index.iter_mut().for_each(Vec::clear);
+        (self.slot, self.slot_end) = (0, 0);
         // The first block's used part; any further block whole.
         let first = &self.arenas[0];
         let used = if self.arenas.len() == 1 { self.next - first.ptr as usize } else { first.layout.size() };
@@ -540,6 +686,61 @@ mod tests {
         used.dedup();
         assert_eq!(used.len() + to.spare(), had);
         assert!(used.iter().all(|chunk| given.contains(chunk)));
+    }
+
+    /// Pooled lists hold what was appended, write the chunks given last first, a block of
+    /// each once, and keep them through `release_above` of the lists they came from.
+    #[test]
+    fn pooled_lists_write_given_chunks_and_keep_them() {
+        let mut from: Chunks<[u64; 2]> = Chunks::new(4, 8 << 20);
+        for n in 0..200_000u64 {
+            from.push((n % 4) as usize, [n, !n]);
+        }
+        from.fence();
+        let (start, cut) = from.kept(8);
+        assert!(cut > start && cut % super::HUGE == 0);
+        let mut to: Chunks<u64> = Chunks::new(5, 1 << 20);
+        to.pool(1000);
+        let mut given = Vec::new();
+        let mut expected = vec![Vec::new(); 5];
+        for list in 0..4 {
+            from.chunks_of(list, |chunk| {
+                if (start..cut).contains(&chunk) {
+                    given.push(chunk);
+                    // SAFETY: `from` outlives `to`, and nothing reads its chunks below `cut` again.
+                    unsafe { to.give(chunk) };
+                }
+            });
+            for n in 0..15_000u64 {
+                let rec = n * 7 + list as u64;
+                to.push_as::<true>((n % 5) as usize, rec);
+                expected[(n % 5) as usize].push(rec);
+            }
+        }
+        // SAFETY: nothing reads `from`'s lists again.
+        unsafe { from.release_above(cut) };
+        let mut blocks = Vec::new();
+        for (list, want) in expected.iter().enumerate() {
+            let mut got = Vec::new();
+            to.for_each(list, |piece| got.extend_from_slice(piece));
+            assert_eq!(&got, want, "list {list}");
+            assert_eq!(to.len_of(list), want.len());
+            blocks.extend(to.index[list].iter().copied());
+        }
+        // 60,000 records are 2,500 blocks, 120 chunks: all given ones while there were.
+        let chunks: std::collections::BTreeSet<usize> = blocks.iter().map(|block| block & !(super::CHUNK - 1)).collect();
+        assert!(chunks.iter().all(|chunk| given.contains(chunk)) || to.fresh() > 0);
+        blocks.sort_unstable();
+        blocks.dedup();
+        assert_eq!(blocks.len(), to.index.iter().map(Vec::len).sum::<usize>());
+        // More than the given chunks hold: the rest from the block.
+        for n in 0..(given.len() as u64 * 600) {
+            to.push_as::<true>(0, n);
+        }
+        assert!(to.fresh() > 0);
+        let mut count = 0;
+        to.for_each(0, |piece| count += piece.len());
+        assert_eq!(count, to.len_of(0));
     }
 
     /// A pair's two records are always in one piece, whatever was pushed before it.

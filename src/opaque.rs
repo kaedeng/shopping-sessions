@@ -39,9 +39,15 @@ pub struct DenseBuckets {
 
 impl DenseBuckets {
     /// Room for a worker's share of `events` and `clicks`, and a chunk a list to begin with.
-    fn new(buckets: usize, events: usize, clicks: usize, workers: usize) -> DenseBuckets {
+    /// `pooled`: the keys' and the purchases' lists write a pool (`Chunks::pool`).
+    fn new(buckets: usize, events: usize, clicks: usize, workers: usize, pooled: bool) -> DenseBuckets {
         let share = |rows: usize, size: usize| rows / workers * size * 9 / 8 + buckets * 4096 + (2 << 20);
-        DenseBuckets { keys: Chunks::new(buckets, share(events, 8)), pays: Chunks::new(buckets, share(events / 16, 16)), clicks: Chunks::new(buckets, share(clicks, 24)) }
+        let mut ranges = DenseBuckets { keys: Chunks::new(buckets, share(events, 8)), pays: Chunks::new(buckets, share(events / 16, 16)), clicks: Chunks::new(buckets, share(clicks, 24)) };
+        if pooled {
+            ranges.keys.pool(events / workers / buckets * 9 / 8);
+            ranges.pays.pool(events / 16 / workers / buckets * 9 / 8);
+        }
+        ranges
     }
 }
 
@@ -748,9 +754,10 @@ fn scatter<R: Row, M: Mode>(kept: &[R], persons: &Persons, bucket_bits: u32, out
 }
 
 /// `scatter` into buckets that are ranges of the persons' numbers: bucket
-/// `(person - 1) >> shift`, an event the key `person << 32 | ts`.
+/// `(person - 1) >> shift`, an event the key `person << 32 | ts`. `POOLED`: the lists write a
+/// pool (`Chunks::pool`).
 #[inline(always)]
-fn scatter_dense<R: Row>(kept: &[R], persons: &Persons, shift: u32, out: &mut DenseBuckets) {
+fn scatter_dense<R: Row, const POOLED: bool>(kept: &[R], persons: &Persons, shift: u32, out: &mut DenseBuckets) {
     for row in kept.iter().take(AHEAD_ROWS) {
         persons.prefetch(row.words().0 as u32);
     }
@@ -763,10 +770,10 @@ fn scatter_dense<R: Row>(kept: &[R], persons: &Persons, shift: u32, out: &mut De
         if ts != 0 {
             let root = persons.of(user_ts as u32);
             let (list, key) = ((root >> shift) as usize, u64::from(root + 1) << 32 | u64::from(ts));
-            out.keys.push(list, key);
+            out.keys.push_as::<POOLED>(list, key);
             let pay = (ingest_pay >> 32) as u32;
             if pay != 0 {
-                out.pays.push(list, sessions::DensePay { key, pay, pad: 0 });
+                out.pays.push_as::<POOLED>(list, sessions::DensePay { key, pay, pad: 0 });
             }
         }
     }
@@ -814,6 +821,20 @@ fn give_chunks<R: Copy>(parsed: &[Out], of: impl Fn(&Out) -> &Chunks<R>, list: u
             // run ends), a list is read by the one task that deduplicates it, and that
             // task has read it.
             unsafe { if ranges.pays.spare() < 4 { ranges.pays.give(chunk) } else { ranges.keys.give(chunk) } };
+        });
+    }
+}
+
+/// `give_chunks` of only the chunks below each worker's cut (`Chunks::kept`, `cuts` a worker's
+/// `(start, cut)`): the rest are handed back to the kernel after the stage.
+fn give_below<R: Copy>(parsed: &[Out], of: impl Fn(&Out) -> &Chunks<R>, cuts: impl Iterator<Item = (usize, usize)>, list: usize, ranges: &mut DenseBuckets) {
+    for (out, (start, cut)) in parsed.iter().zip(cuts) {
+        of(out).chunks_of(list, |chunk| {
+            if (start..cut).contains(&chunk) {
+                // SAFETY: as `give_chunks`; a chunk below the cut is not handed back with
+                // the rest (`Chunks::release_above`).
+                unsafe { if ranges.pays.spare() < 4 { ranges.pays.give(chunk) } else { ranges.keys.give(chunk) } };
+            }
         });
     }
 }
@@ -1038,13 +1059,18 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
         let shift = plan.placing.get().map_or((usize::BITS - (count - 1).leading_zeros()).saturating_sub(ctx.bucket_bits), |placing| placing.shift);
         (shift, ((count - 1) >> shift) + 1)
     });
+    // `SS_RECYCLE=off|on`, `SS_DEDUP_WARM=off|on|chunk` (below): whether the buckets' lists
+    // write into the parse's chunks, and how.
+    let recycle = dense.is_some() && types::env::pick("SS_RECYCLE", &["off", "on"]) == 1;
+    let warm = if dense.is_some() && !recycle { types::env::pick("SS_DEDUP_WARM", &["off", "on", "chunk"]) } else { 0 };
+    let pooled = warm == 1;
     let mut scattered: Vec<Scattered> = par::init(ctx.workers, parallel_alloc, |_| match dense {
         Some((_, lists)) => Scattered {
             events: Parts::new(1, 64, scatter_mode),
             clicks: Parts::new(1, 64, scatter_mode),
             scratch: Default::default(),
             opaque: Default::default(),
-            dense: Some(DenseBuckets::new(lists, events, clicks, ctx.workers)),
+            dense: Some(DenseBuckets::new(lists, events, clicks, ctx.workers, pooled)),
             placed: None,
         },
         None => Scattered {
@@ -1066,9 +1092,24 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     // kernel after the stage. On 4 KB pages here `on` is 4% faster; on the scorer it was not
     // (0.6122 s against 0.6076 without, one submission each). The likely reason: a list is
     // written with streaming stores, and a chunk the task has just read is in its caches,
-    // which an Intel core has to empty of the line first.
-    let recycle = dense.is_some() && types::env::pick("SS_RECYCLE", &["off", "on"]) == 1;
+    // which an Intel core has to empty of the line first. A likelier one: with `on` none of
+    // the parse's lists is handed back after the stage (their chunks are everywhere among the
+    // buckets'), so the one thread that exits unmaps all of them (`SS_FREE=exit` lost 22 ms
+    // there).
+    //
+    // `SS_DEDUP_WARM=off|on|chunk`: `on` and `chunk` give a list's chunks to the buckets as
+    // `recycle` does, as soon as it is read, but only those below a cut on a 2 MB step a part
+    // of the way into each worker's block (`SS_WARM_KEEP` sixteenths of what it used, 10
+    // unless set; the buckets' lists are about half the size of the parse's), and after the
+    // stage the workers hand back what is above the cut, as with `off`. `on` also has the
+    // keys' and purchases' lists write a pool (`Chunks::pool`): each 192-byte block into the
+    // chunk given last, with plain stores, while the lines this task has just read are still
+    // in its caches. `chunk`: each list a chunk of its own, with streaming stores, as
+    // `recycle`. `SS_RECYCLE=on` wins over both.
+    let keep = types::env::number("SS_WARM_KEEP", 10).clamp(1, 16);
+    let cuts: Vec<[(usize, usize); 3]> = if warm != 0 { parsed.iter().map(|out| [out.narrow.kept(keep), out.events.kept(keep), out.long_events.kept(keep)]).collect() } else { Vec::new() };
     {
+        let cuts = &cuts[..];
         let (parsed, persons) = (&parsed[..], &persons);
         // The clicks' tasks are taken first: each is a worker's whole list, as long as
         // hundreds of the lists' tasks, and taken last they were what the round ended on,
@@ -1083,15 +1124,25 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
                     dedup_short(parsed, task, &plan, table, kept_narrow, kept);
                     if recycle {
                         give_chunks(parsed, |out| &out.narrow, task, ranges);
+                    } else if warm != 0 {
+                        give_below(parsed, |out| &out.narrow, cuts.iter().map(|cut| cut[0]), task, ranges);
+                        give_below(parsed, |out| &out.events, cuts.iter().map(|cut| cut[1]), task, ranges);
                     }
-                    scatter_dense(kept_narrow, persons, shift, ranges);
-                    scatter_dense(kept, persons, shift, ranges);
+                    if pooled {
+                        scatter_dense::<_, true>(kept_narrow, persons, shift, ranges);
+                        scatter_dense::<_, true>(kept, persons, shift, ranges);
+                    } else {
+                        scatter_dense::<_, false>(kept_narrow, persons, shift, ranges);
+                        scatter_dense::<_, false>(kept, persons, shift, ranges);
+                    }
                 } else if task < parts + long_parts {
                     dedup(parsed.iter().map(|out| &out.long_events), task - parts, plan.long_bits, table, kept_long);
                     if recycle {
                         give_chunks(parsed, |out| &out.long_events, task - parts, ranges);
+                    } else if warm != 0 {
+                        give_below(parsed, |out| &out.long_events, cuts.iter().map(|cut| cut[2]), task - parts, ranges);
                     }
-                    scatter_dense(kept_long, persons, shift, ranges);
+                    if pooled { scatter_dense::<_, true>(kept_long, persons, shift, ranges) } else { scatter_dense::<_, false>(kept_long, persons, shift, ranges) }
                 } else {
                     scatter_clicks_dense(&parsed[task - parts - long_parts], persons, shift, recycle, ranges);
                 }
@@ -1117,7 +1168,24 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     // The parse's lists are dead. Where their chunks went to the buckets' lists they stay,
     // with those, to the end of the run; else each worker hands its own back now.
     if types::mem::free_early() && !recycle {
-        par::each(&mut parsed, |_, out| out.release());
+        if warm != 0 {
+            // SAFETY: the stage is over, so nothing reads the parse's lists again; the chunks
+            // below a cut were the only ones given.
+            par::each(&mut parsed, |worker, out| unsafe {
+                let [narrow, events, long] = cuts[worker];
+                out.narrow.release_above(narrow.1);
+                out.events.release_above(events.1);
+                out.long_events.release_above(long.1);
+                out.clicks.release();
+            });
+        } else {
+            par::each(&mut parsed, |_, out| out.release());
+        }
+    }
+    if warm != 0 && std::env::var_os("SS_TIMING").is_some() {
+        let ranges = || scattered.iter().filter_map(|mine| mine.dense.as_ref());
+        let (fresh, left): (usize, usize) = ranges().map(|r| (r.keys.fresh() + r.pays.fresh(), r.keys.spare() + r.pays.spare())).fold((0, 0), |a, b| (a.0 + b.0, a.1 + b.1));
+        eprintln!("opaque: SS_DEDUP_WARM keep {keep}/16: {fresh} fresh bucket chunks, {left} given chunks left");
     }
     // The exit path skips destructors (`fast-exit`), and these are large.
     std::mem::forget(parsed);
