@@ -7,7 +7,18 @@
 //! Everything is read from `/proc` and `/sys`; what the container does not show is left out.
 
 use std::fmt::Write as _;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::time::Instant;
+
+/// `SS_PROBE=init`: nanoseconds of the opaque stages' first round so far (`init_took`).
+static INIT_NS: AtomicU64 = AtomicU64::new(0);
+
+/// `SS_PROBE=init`: the opaque stages' first round took `took` (the workers' pieces of the
+/// directory touched, with `SS_COLLAPSE=on` collapsed, and their lists made); summed when the
+/// stages start over.
+pub fn init_took(took: std::time::Duration) {
+    INIT_NS.fetch_add(took.as_nanos() as u64, Relaxed);
+}
 
 /// What is read before the run, to set beside the same after it.
 pub struct Probe {
@@ -207,13 +218,28 @@ fn code2() -> u64 {
 impl Probe {
     /// `Some` when `SS_PROBE` is set. Call before the workers are started.
     pub fn start() -> Option<Probe> {
-        std::env::var_os("SS_PROBE")?;
+        let probe = std::env::var_os("SS_PROBE")?;
+        // `init` reads nothing, so that the run is the plain one up to its wait.
+        if probe == "init" {
+            return Some(Probe { vmstat: String::new(), stat: String::new(), allowed: Vec::new(), started: Instant::now() });
+        }
         Some(Probe { vmstat: read("/proc/vmstat").unwrap_or_default(), stat: read("/proc/stat").unwrap_or_default(), allowed: types::par::pin::allowed(), started: Instant::now() })
     }
 
     /// The report. `data` is the input folder. With `SS_PROBE=sleep`, the machine's number
     /// (`code`) as a wait instead.
+    ///
+    /// `SS_PROBE=init`: the run waits ten times its opaque stages' first round (`init_took`)
+    /// before it exits. With the same build's plain score beside it, the score less that one,
+    /// over 10, is that round's time on the scorer: with `SS_COLLAPSE=on`, what the
+    /// directory's collapses cost while every worker waits for them.
     pub fn finish(&self, data: &std::path::Path) {
+        if std::env::var_os("SS_PROBE").is_some_and(|value| value == "init") {
+            let took = std::time::Duration::from_nanos(INIT_NS.load(Relaxed));
+            eprintln!("probe: init {:.2} ms, waiting ten times that", took.as_secs_f64() * 1e3);
+            std::thread::sleep(took * 10);
+            return;
+        }
         if std::env::var_os("SS_PROBE").is_some_and(|value| value == "sleep") {
             let code = code(&self.allowed);
             eprintln!("probe: code {code}");

@@ -426,12 +426,16 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     // lookups). All of it before the first lookup: a piece touched while another worker
     // was already looking users up was read first where that worker had been.
     let touch = types::env::pick("SS_TOUCH", &["on", "off"]) == 0;
+    let started = std::time::Instant::now();
     let mut parsed: Vec<Out> = par::init(ctx.workers, parallel_alloc, |worker| {
         if touch {
             plan.users.touch(worker, ctx.workers);
         }
         ingest.opaque_out(&plan, ctx.workers)
     });
+    // `SS_PROBE=init`: the round in which every worker touches its piece of the directory,
+    // with `SS_COLLAPSE=on` its collapses, and makes its lists.
+    crate::probe::init_took(started.elapsed());
     types::tl::mark("lists");
     // The links' chunks first, then one task that joins them into persons once they are
     // all read, beside the tasks that parse the events and the clicks. (Read and joined by
