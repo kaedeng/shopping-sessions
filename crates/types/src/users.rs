@@ -213,6 +213,13 @@ impl Users {
         Users::new(short, short / 4)
     }
 
+    /// Piece `piece` of `pieces` of both tables onto whole 2 MB pages (`mem::touch`): a
+    /// lookup reads a slot before anything is written to it. At any time, by any thread.
+    pub fn touch(&self, piece: usize, pieces: usize) {
+        crate::mem::touch(&self.short, piece, pieces, |slot| &slot[0]);
+        crate::mem::touch(&self.long, piece, pieces, |slot| &slot[0]);
+    }
+
     /// A bound on the numbers: every user's is below this. Far more than the users there
     /// are; an array of this many entries is touched only where a user's number is.
     pub fn bound(&self) -> usize {

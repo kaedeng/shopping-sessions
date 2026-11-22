@@ -43,6 +43,50 @@ impl<T> Zeroed<T> {
     }
 }
 
+/// Bytes of a huge page.
+const HUGE: usize = 2 << 20;
+
+impl<T> Zeroed<T> {
+    /// The indexes of one value in each 2 MB of the memory, those of piece `piece` of
+    /// `pieces`.
+    fn firsts(&self, piece: usize, pieces: usize) -> impl Iterator<Item = usize> + use<T> {
+        let step = (HUGE / size_of::<T>().max(1)).max(1);
+        let steps = self.len.div_ceil(step);
+        (steps * piece / pieces..steps * (piece + 1) / pieces).map(move |at| at * step)
+    }
+
+    /// `touch` for memory no other thread has yet: the first `len` values onto whole 2 MB
+    /// pages.
+    pub fn touch_first(&mut self, len: usize) {
+        let step = (HUGE / size_of::<T>().max(1)).max(1);
+        for at in (0..len.min(self.len)).step_by(step) {
+            // SAFETY: inside the memory, which is zeros there: the write changes nothing.
+            // Volatile, or the compiler drops a zero written to zeroed memory.
+            unsafe { self.at.as_ptr().add(at).cast::<u8>().write_volatile(0) };
+        }
+    }
+}
+
+/// Writes to piece `piece` of `pieces` of a table of atomics, changing nothing: one word in
+/// every 2 MB is swapped for 0 if it is 0. At any time, by any thread.
+///
+/// What the kernel maps at an untouched address depends on the first access. A read gets
+/// the shared zero page, for 2 MB at once where huge pages are on; the first write under
+/// that mapping then breaks it into 4 KB pages, each faulted in by its own first write, and
+/// every lookup after pays a page walk. A table that is probed before it is written (find
+/// the key, or claim the slot) goes that way: at 20M events the users' directory and the
+/// persons' arrays took 21,000 of a run's 34,000 page faults. A write to an untouched
+/// address gets a whole 2 MB page, zeroed once.
+///
+/// The write is a compare-and-swap, which writes whether or not it succeeds. An atomic `or`
+/// of 0 does not: the compiler knows it changes nothing and makes it a fenced load.
+pub fn touch<T>(table: &Zeroed<T>, piece: usize, pieces: usize, word: impl Fn(&T) -> &std::sync::atomic::AtomicU64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for at in table.firsts(piece, pieces) {
+        let _ = word(&table[at]).compare_exchange(0, std::hint::black_box(0), Relaxed, Relaxed);
+    }
+}
+
 impl<T> std::ops::Deref for Zeroed<T> {
     type Target = [T];
 

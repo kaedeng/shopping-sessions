@@ -249,9 +249,11 @@ impl Ingest {
     /// The plan for this input; `grow` doubles the directory that many times (after one
     /// that overflowed), `whole_clicks` keeps every `click_id` whole (`click_id_at`).
     pub fn opaque_plan(&self, grow: u32, whole_clicks: bool) -> Plan {
-        // About 8,000 lines a list, and no more than 8,192 lists: a worker stages 192 bytes
-        // a list, and the lists' rows are deduplicated in a table that should stay in L2.
-        let part_bits = (self.event_rows / 8192).next_power_of_two().trailing_zeros().clamp(6, 13);
+        // About 8,000 lines a list, so that a list's rows are deduplicated in a table that
+        // stays in L2, but no more than 2,048 lists: a worker stages 192 bytes a list, and
+        // with 8,192 of them at 60M events that staging was past the caches (a run was
+        // 1,711 ms, and 1,502 with 2,048 lists of four times the rows).
+        let part_bits = (self.event_rows / 8192).next_power_of_two().trailing_zeros().clamp(6, 11);
         let part_bits = types::env::number("SS_PART_BITS_OPAQUE", part_bits as usize).clamp(1, 16) as u32;
         Plan {
             users: Users::for_rows(self.event_rows + self.click_rows + self.link_rows, grow),

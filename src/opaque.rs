@@ -67,6 +67,12 @@ impl Persons {
         // numbers are dense, so that is the arrays' first few megabytes.
         // SAFETY: all zeros is a valid integer, and a valid pair of them.
         let (mut up, mut names) = unsafe { (Zeroed::<u32>::new(users.bound()), Zeroed::<(u32, u64)>::new(users.bound())) };
+        // The unions read an entry before they write it, which would leave the arrays on
+        // 4 KB pages (`types::mem::touch`). The users the links name have the numbers given
+        // out so far; the entries past them are only ever read.
+        let numbered = users.count();
+        up.touch_first(numbered);
+        names.touch_first(numbered);
         // The root of `x`, every user on the way pointed at its grandparent.
         fn find(up: &mut [u32], mut x: u32) -> u32 {
             loop {
@@ -386,7 +392,17 @@ const NAMES_HELD: usize = 32;
 /// caller starts over with a larger `grow`. `whole_clicks`: `ingest::opaque::click_id_at`.
 pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, parallel_alloc: bool, scatter_mode: Option<usize>, lap: &mut dyn FnMut(&'static str)) -> Option<Staged> {
     let plan = ingest.opaque_plan(grow, whole_clicks);
-    let mut parsed: Vec<Out> = par::init(ctx.workers, parallel_alloc, |_| ingest.opaque_out(&plan, ctx.workers));
+    // Each worker makes its lists, and before that puts its piece of the directory onto
+    // whole 2 MB pages (`types::mem::touch`; `SS_TOUCH=off` leaves that to the first
+    // lookups). All of it before the first lookup: a piece touched while another worker
+    // was already looking users up was read first where that worker had been.
+    let touch = types::env::pick("SS_TOUCH", &["on", "off"]) == 0;
+    let mut parsed: Vec<Out> = par::init(ctx.workers, parallel_alloc, |worker| {
+        if touch {
+            plan.users.touch(worker, ctx.workers);
+        }
+        ingest.opaque_out(&plan, ctx.workers)
+    });
     types::tl::mark("lists");
     // The links' chunks first, then one task that joins them into persons once they are
     // all read, beside the tasks that parse the events and the clicks. (Read and joined by
