@@ -29,9 +29,10 @@ use types::id::{self, Id, pack_at};
 use types::record::PAY_CATEGORY_SHIFT;
 use types::time::DAY;
 use types::users::{NO_USER, UserKey, Users, key_at_wide, long_key_at, mix_long, short_key_at};
+use types::width::{Narrow, Wide, Width};
 use types::Ctx;
 
-use crate::tok::{Field, Mask, Scalar, Scratch, Tok};
+use crate::tok::{Field, Mask, NarrowMask, Scalar, Scratch, Tok};
 use crate::ts::{Dates, rd};
 use crate::{Ingest, ingest_slow, price_cents};
 
@@ -171,10 +172,10 @@ impl Ev {
 /// # Safety
 /// 16 bytes readable at `p`, and `len` of them the ID's.
 #[inline(always)]
-pub(crate) unsafe fn click_id_at(p: *const u8, len: usize, whole: bool) -> Id {
+pub(crate) unsafe fn click_id_at<W: Width>(p: *const u8, len: usize, whole: bool) -> Id {
     // SAFETY: the caller's contract.
     unsafe {
-        if len == 33 && !whole && long_key_at(p, len, b'k').is_some() {
+        if len == 33 && !whole && long_key_at::<W>(p, len, b'k').is_some() {
             return pack_at(p, 9);
         }
         pack_at(p, len)
@@ -208,6 +209,9 @@ pub struct Plan {
     /// `batch` every bit, which no count of rows clears, and a batch's users are asked for
     /// when it is full.
     pub(crate) ask_step: usize,
+    /// The parse made for `types::width::Narrow` (`SS_PARSE_WIDTH=256`): the kernel, the row
+    /// code and the links with no instruction that takes a core off its base clock.
+    pub(crate) narrow: bool,
 }
 
 impl Plan {
@@ -267,6 +271,7 @@ impl Ingest {
             kernel: DECODES[types::env::pick("SS_DECODE", DECODES)] == "kernel",
             whole_clicks,
             ask_step: if types::env::pick("SS_ASK", &["rows", "batch"]) == 0 { 63 } else { usize::MAX },
+            narrow: types::width::narrow_from_env(),
         }
     }
 
@@ -316,6 +321,13 @@ impl Ingest {
     /// Chunk `task` (`0..link_tasks()`) of the links files: each well-formed line with both
     /// sides non-empty. Called concurrently, one `out` a worker.
     pub fn opaque_links(&self, plan: &Plan, task: usize, out: &mut Out) -> Vec<LinkRec> {
+        if plan.narrow { self.links_of::<Narrow>(plan, task, out) } else { self.links_of::<Wide>(plan, task, out) }
+    }
+
+    /// `opaque_links` made for one width: a function of its own for each, so that the
+    /// narrow one holds no wide instruction (`types::width`).
+    #[inline(never)]
+    fn links_of<W: Width>(&self, plan: &Plan, task: usize, out: &mut Out) -> Vec<LinkRec> {
         let seg = &self.links[task];
         let mut links = Vec::with_capacity((seg.end - seg.start) / 16 + 16);
         let mut input = std::mem::take(&mut out.input);
@@ -332,23 +344,24 @@ impl Ingest {
                 users.prefetch(keys[0]);
                 users.prefetch(keys[1]);
             }
-            links.extend(held.iter().map(|&(keys, order)| LinkRec { users: [users.get(keys[0]), users.get(keys[1])], order }));
+            links.extend(held.iter().map(|&(keys, order)| LinkRec { users: [users.get::<W>(keys[0]), users.get::<W>(keys[1])], order }));
         };
         // SAFETY: a segment, and a segment's fields have 16 bytes readable after them.
         // (The lines by their masks and the keys a word at a time: through the byte-by-byte
         // tokenizer and `key_at`, 0.9M link lines were 4.7% of a run's instructions at 20M
         // events, 730 a line.)
         unsafe {
-            Mask::lines::<2>(p, len, &mut out.scratch, |&[a, b]| {
+            let row = |&[a, b]: &[Field; 2]| {
                 if a.len != 0 && b.len != 0 {
-                    held[count] = ([key_at_wide(a.p, a.len), key_at_wide(b.p, b.len)], [order_at(a.p, a.len), order_at(b.p, b.len)]);
+                    held[count] = ([key_at_wide::<W>(a.p, a.len), key_at_wide::<W>(b.p, b.len)], [order_at(a.p, a.len), order_at(b.p, b.len)]);
                     count += 1;
                     if count == LINKS_HELD {
                         flush(&held, &mut links);
                         count = 0;
                     }
                 }
-            })
+            };
+            if W::NARROW { NarrowMask::lines::<2>(p, len, &mut out.scratch, row) } else { Mask::lines::<2>(p, len, &mut out.scratch, row) }
         };
         flush(&held[..count], &mut links);
         if read.is_none() {
@@ -375,10 +388,16 @@ unsafe fn events(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &Plan
     ))]
     if plan.kernel && dates.few_months() {
         let lead = out.lead;
-        return unsafe { kern::events(p, len, lead, ctx, dates, plan, out) };
+        return unsafe { if plan.narrow { kern::events::<Narrow>(p, len, lead, ctx, dates, plan, out) } else { kern::events::<Wide>(p, len, lead, ctx, dates, plan, out) } };
     }
     let Out { events, long_events, scratch, .. } = out;
-    unsafe { Scalar::lines::<7>(p, len, scratch, |fields| event_row(ctx, dates, plan, fields, events, long_events)) };
+    unsafe {
+        if plan.narrow {
+            Scalar::lines::<7>(p, len, scratch, |fields| event_row::<Narrow>(ctx, dates, plan, fields, events, long_events))
+        } else {
+            Scalar::lines::<7>(p, len, scratch, |fields| event_row::<Wide>(ctx, dates, plan, fields, events, long_events))
+        }
+    };
     events.fence();
     long_events.fence();
 }
@@ -399,11 +418,11 @@ unsafe fn clicks(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, campaigns: 
     ))]
     if plan.kernel && dates.few_months() {
         let lead = out.lead;
-        return unsafe { kern::clicks(p, len, lead, ctx, dates, campaigns, plan, out) };
+        return unsafe { if plan.narrow { kern::clicks::<Narrow>(p, len, lead, ctx, dates, campaigns, plan, out) } else { kern::clicks::<Wide>(p, len, lead, ctx, dates, campaigns, plan, out) } };
     }
     let _ = campaigns;
     let Out { clicks, scratch, .. } = out;
-    unsafe { Scalar::lines::<4>(p, len, scratch, |fields| click_row(ctx, dates, plan, fields, clicks)) };
+    unsafe { if plan.narrow { Scalar::lines::<4>(p, len, scratch, |fields| click_row::<Narrow>(ctx, dates, plan, fields, clicks)) } else { Scalar::lines::<4>(p, len, scratch, |fields| click_row::<Wide>(ctx, dates, plan, fields, clicks)) } };
     clicks.fence();
 }
 
@@ -412,7 +431,7 @@ unsafe fn clicks(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, campaigns: 
 /// # Safety
 /// The fields are from a segment.
 #[inline(always)]
-unsafe fn event_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 7], events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>) {
+unsafe fn event_row<W: Width>(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 7], events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>) {
     let [id, user, ts, ingest, kind, product, price] = *fields;
     if id.len == 0 {
         return;
@@ -443,11 +462,11 @@ unsafe fn event_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 7], 
         & ingest_ok
         & (ingest_ms - ts <= DAY);
     // A row that is not valid names no user: nothing reads it.
-    let place = if valid { unsafe { plan.users.at(user.p, user.len) } } else { NO_USER };
+    let place = if valid { unsafe { plan.users.at::<W>(user.p, user.len) } } else { NO_USER };
     let (user_ts, ingest_pay) = words(place, ts as u32, valid, ingest_rel, pay);
     // SAFETY: the fields' bytes are readable; a list is below the lists' count by its bits.
     unsafe {
-        if let Some((hi, lo)) = long_key_at(id.p, id.len, b'e') {
+        if let Some((hi, lo)) = long_key_at::<W>(id.p, id.len, b'e') {
             long_events.push_at(plan.long_part(hi, lo), EvL { hi, lo, user_ts, ingest_pay });
         } else {
             let key = short_key_at(id.p, id.len, b'e').unwrap_or_else(|| id::intern_any(std::slice::from_raw_parts(id.p, id.len)));
@@ -461,7 +480,7 @@ unsafe fn event_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 7], 
 /// # Safety
 /// The fields are from a segment.
 #[inline(always)]
-unsafe fn click_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 4], clicks: &mut Chunks<Ck>) {
+unsafe fn click_row<W: Width>(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 4], clicks: &mut Chunks<Ck>) {
     let [click, user, campaign, ts] = *fields;
     let (ok, ts) = unsafe { dates.ts(ts.p, ts.len) };
     if (click.len != 0) & (user.len != 0) & ok & (ts >= 0) & (ts < i64::from(ctx.ts_end))
@@ -469,8 +488,8 @@ unsafe fn click_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 4], 
     {
         // SAFETY: the fields' bytes are readable; the clicks are one list.
         unsafe {
-            let place = plan.users.at(user.p, user.len);
-            clicks.push_at(0, Ck { click: click_id_at(click.p, click.len, plan.whole_clicks), user_ts: u64::from(place) | (ts as u64) << 32, campaign: u64::from(campaign) });
+            let place = plan.users.at::<W>(user.p, user.len);
+            clicks.push_at(0, Ck { click: click_id_at::<W>(click.p, click.len, plan.whole_clicks), user_ts: u64::from(place) | (ts as u64) << 32, campaign: u64::from(campaign) });
         }
     }
 }
@@ -487,7 +506,7 @@ mod tests {
     fn rows_go_by_their_ids_spelling() {
         let ctx = Ctx::new(parse_f1(b"2026-10-08T00:00:00Z").unwrap(), parse_f1(b"2026-10-22T00:00:00Z").unwrap(), &[], &[]).unwrap();
         let dates = Dates::new(&ctx);
-        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, whole_clicks: false, ask_step: 63 };
+        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, whole_clicks: false, ask_step: 63, narrow: false };
         let (mut events, mut long_events) = (Chunks::<Ev>::new(8, 1 << 16), Chunks::<EvL>::new(2, 1 << 16));
         let text = b"\ne1,u1,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,view,p1,\n\
 e02423c3d84ab053af78764ce49f23b5c,u02423c3d84ab053af78764ce49f23b5c,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,cart,p1,\n\
@@ -496,7 +515,7 @@ e2,u1,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,refund,p1,\n";
         let mut buf = text.to_vec();
         buf.extend([0u8; 64]);
         // SAFETY: whole lines after the first byte, 64 bytes readable after them.
-        unsafe { Scalar::lines::<7>(buf.as_ptr().add(1), text.len() - 1, &mut Scratch::new(), |fields| event_row(&ctx, &dates, &plan, fields, &mut events, &mut long_events)) };
+        unsafe { Scalar::lines::<7>(buf.as_ptr().add(1), text.len() - 1, &mut Scratch::new(), |fields| event_row::<Wide>(&ctx, &dates, &plan, fields, &mut events, &mut long_events)) };
         events.fence();
         long_events.fence();
         let (mut short, mut long) = (Vec::new(), Vec::new());

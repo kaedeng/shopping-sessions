@@ -77,9 +77,9 @@ impl Tok for Scalar {
 }
 
 #[cfg(all(feature = "tok-mask", any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64")))]
-pub(crate) use mask::Mask;
+pub(crate) use mask::{Mask, NarrowMask};
 #[cfg(all(feature = "tok-mask", not(any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64"))))]
-pub(crate) use Scalar as Mask;
+pub(crate) use {Scalar as Mask, Scalar as NarrowMask};
 
 /// Each batch in two passes. Index: 64-byte blocks to comma, newline and quote bitmasks, the comma
 /// and newline positions written out (simdjson's flattening). Rows: per line, its comma count and
@@ -91,44 +91,66 @@ mod mask {
 
     pub(crate) struct Mask;
 
+    /// `Mask` for the narrow parse (`types::width`): the same masks and positions, with no
+    /// 512-bit instruction. (Left to the compiler, `masks`' two 256-bit compares become one
+    /// 512-bit compare, and `flatten`'s eight positions the lanes of a 512-bit register.)
+    pub(crate) struct NarrowMask;
+
     impl Tok for Mask {
-        unsafe fn lines<const N: usize>(p: *const u8, len: usize, s: &mut Scratch, mut row: impl FnMut(&[Field; N])) {
-            let mut start = 0;
-            while start < len {
-                let mut size = s.batch;
-                let lines = loop {
-                    let end = len.min(start + size);
-                    if s.commas.len() < end - start + 64 {
-                        s.commas.resize(end - start + 64, 0);
-                        s.newlines.resize(end - start + 64, 0);
-                        s.blocks.resize((end - start) / 64 + 2, Block::default());
-                    }
-                    // SAFETY: `start..end` is inside the segment, and the buffers were sized for it.
-                    let lines = unsafe { index(p.add(start), end - start, s) };
-                    if lines > 0 {
-                        break lines;
-                    }
-                    // A line longer than the batch, never generated: index again with room for it.
-                    // shortcut: the scratch grows to ~9 bytes per byte of the longest line, and
-                    // positions are u32; hand such a line to `Scalar` if multi-GB lines ever occur.
-                    size *= 2;
-                };
-                // SAFETY: as above; the batch ends at its last `\n`, the rest is indexed again.
-                unsafe { rows(p.add(start), s, lines, &mut row) };
-                start += s.newlines[lines - 1] as usize + 1;
-            }
+        unsafe fn lines<const N: usize>(p: *const u8, len: usize, s: &mut Scratch, row: impl FnMut(&[Field; N])) {
+            // SAFETY: the caller's contract.
+            unsafe { lines::<N, false>(p, len, s, row) }
+        }
+    }
+
+    impl Tok for NarrowMask {
+        unsafe fn lines<const N: usize>(p: *const u8, len: usize, s: &mut Scratch, row: impl FnMut(&[Field; N])) {
+            // SAFETY: the caller's contract.
+            unsafe { lines::<N, true>(p, len, s, row) }
+        }
+    }
+
+    /// `Tok::lines`, with only licence-0 instructions when `NARROW`.
+    ///
+    /// # Safety
+    /// As `Tok::lines`.
+    #[inline(always)]
+    unsafe fn lines<const N: usize, const NARROW: bool>(p: *const u8, len: usize, s: &mut Scratch, mut row: impl FnMut(&[Field; N])) {
+        let mut start = 0;
+        while start < len {
+            let mut size = s.batch;
+            let lines = loop {
+                let end = len.min(start + size);
+                if s.commas.len() < end - start + 64 {
+                    s.commas.resize(end - start + 64, 0);
+                    s.newlines.resize(end - start + 64, 0);
+                    s.blocks.resize((end - start) / 64 + 2, Block::default());
+                }
+                // SAFETY: `start..end` is inside the segment, and the buffers were sized for it.
+                let lines = unsafe { index::<NARROW>(p.add(start), end - start, s) };
+                if lines > 0 {
+                    break lines;
+                }
+                // A line longer than the batch, never generated: index again with room for it.
+                // shortcut: the scratch grows to ~9 bytes per byte of the longest line, and
+                // positions are u32; hand such a line to `Scalar` if multi-GB lines ever occur.
+                size *= 2;
+            };
+            // SAFETY: as above; the batch ends at its last `\n`, the rest is indexed again.
+            unsafe { rows(p.add(start), s, lines, &mut row) };
+            start += s.newlines[lines - 1] as usize + 1;
         }
     }
 
     /// Fills `s` for the `len` bytes at `p`; returns the number of newlines.
     #[inline(always)]
-    unsafe fn index(p: *const u8, len: usize, s: &mut Scratch) -> usize {
+    unsafe fn index<const NARROW: bool>(p: *const u8, len: usize, s: &mut Scratch) -> usize {
         let blocks = len.div_ceil(64);
         let (commas, newlines, out) = (s.commas.as_mut_ptr(), s.newlines.as_mut_ptr(), s.blocks.as_mut_ptr());
         let (mut n_commas, mut n_newlines, mut quotes_before) = (0, 0, 0);
         for b in 0..blocks {
             // SAFETY: a block starts inside the batch, and PAD bytes after it are readable.
-            let [mut c, mut n, mut q] = unsafe { masks(p.add(64 * b)) };
+            let [mut c, mut n, mut q] = unsafe { if NARROW { narrow_masks(p.add(64 * b)) } else { masks(p.add(64 * b)) } };
             if b + 1 == blocks {
                 let keep = !0u64 >> (64 * blocks - len);
                 (c, n, q) = (c & keep, n & keep, q & keep);
@@ -137,8 +159,8 @@ mod mask {
             // flatten writes at most 64 past the positions so far.
             unsafe {
                 *out.add(b) = Block { commas: c, quotes: q, commas_before: n_commas as u32, quotes_before };
-                flatten::<8>(c, 64 * b as u32, commas, &mut n_commas);
-                flatten::<2>(n, 64 * b as u32, newlines, &mut n_newlines);
+                flatten::<8, NARROW>(c, 64 * b as u32, commas, &mut n_commas);
+                flatten::<2, NARROW>(n, 64 * b as u32, newlines, &mut n_newlines);
             }
             quotes_before += q.count_ones();
         }
@@ -148,12 +170,12 @@ mod mask {
     /// Appends the positions of the set bits. Always `W` stores, so a block with at most `W`
     /// takes no data-dependent branch; the extra stores land past the end and are overwritten.
     #[inline(always)]
-    unsafe fn flatten<const W: usize>(mut bits: u64, base: u32, out: *mut u32, n: &mut usize) {
+    unsafe fn flatten<const W: usize, const NARROW: bool>(mut bits: u64, base: u32, out: *mut u32, n: &mut usize) {
         let count = bits.count_ones() as usize;
         // SAFETY: the caller sized `out` for `*n + 64`.
         let at = unsafe { out.add(*n) };
         for i in 0..W {
-            unsafe { *at.add(i) = base + bits.trailing_zeros() };
+            unsafe { *at.add(i) = base + if NARROW { trailing_zeros(bits) } else { bits.trailing_zeros() } };
             bits &= bits.wrapping_sub(1);
         }
         if count > W {
@@ -234,6 +256,57 @@ mod mask {
                 lo | hi << 32
             };
             [bits(b','), bits(b'\n'), bits(b'"')]
+        }
+    }
+
+    /// `masks` with no 512-bit instruction: each byte's two 256-bit compares written as the
+    /// instructions they are, which the compiler would make one 512-bit compare.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl"))]
+    #[inline(always)]
+    unsafe fn narrow_masks(p: *const u8) -> [u64; 3] {
+        use core::arch::x86_64::*;
+        let bits = |byte: u8| {
+            let bits: u64;
+            // SAFETY: the caller guarantees 64 readable bytes; AVX-512BW and VL are compiled in.
+            unsafe {
+                core::arch::asm!(
+                    "vpcmpeqb {low}, {byte}, ymmword ptr [{p}]",
+                    "vpcmpeqb {high}, {byte}, ymmword ptr [{p} + 32]",
+                    "kunpckdq {low}, {high}, {low}",
+                    p = in(reg) p,
+                    byte = in(ymm_reg) _mm256_set1_epi8(byte as i8),
+                    low = out(kreg) bits,
+                    high = out(kreg) _,
+                    options(pure, readonly, nostack, preserves_flags),
+                )
+            };
+            bits
+        };
+        [bits(b','), bits(b'\n'), bits(b'"')]
+    }
+
+    /// Where the build has no AVX-512 the compiler makes no 512-bit compare.
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512bw", target_feature = "avx512vl")))]
+    #[inline(always)]
+    unsafe fn narrow_masks(p: *const u8) -> [u64; 3] {
+        // SAFETY: the caller's contract.
+        unsafe { masks(p) }
+    }
+
+    /// `bits.trailing_zeros()` as one instruction the compiler cannot put in a vector lane:
+    /// `flatten`'s eight of them were the eight lanes of a 512-bit count.
+    #[inline(always)]
+    fn trailing_zeros(bits: u64) -> u32 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "bmi1"))]
+        {
+            let zeros: u64;
+            // SAFETY: one BMI1 instruction on registers.
+            unsafe { core::arch::asm!("tzcnt {zeros}, {bits}", bits = in(reg) bits, zeros = lateout(reg) zeros, options(pure, nomem, nostack)) };
+            zeros as u32
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi1")))]
+        {
+            bits.trailing_zeros()
         }
     }
 }

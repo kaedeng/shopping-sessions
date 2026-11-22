@@ -28,6 +28,7 @@ pub mod time;
 pub mod tl;
 #[cfg(feature = "pipe-positional")]
 pub mod users;
+pub mod width;
 
 pub use ctx::Ctx;
 pub use id::Id;
