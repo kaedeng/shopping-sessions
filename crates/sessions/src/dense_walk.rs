@@ -167,11 +167,14 @@ pub(crate) fn fits(ctx: &Ctx) -> bool {
 /// `NARROW`: in registers of 256 bits and fewer, with the kernels' narrow forms
 /// (`sort_times::sort_narrow`, `attr_wide::Attr::person_narrow`).
 ///
+/// `CUT` (with `NARROW` off): a person's times by `sort_times::cut`, which leaves each time as
+/// its session's first and sorts none of a person with more than `sort_times::NET`.
+///
 /// # Safety
 /// `ends` and `click_ends` hold `span` ascending positions inside `ts` and `clicks`; `fits`.
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-pub(crate) unsafe fn walk<const NARROW: bool>(
+pub(crate) unsafe fn walk<const NARROW: bool, const CUT: bool>(
     ctx: &Ctx,
     base: u32,
     span: usize,
@@ -220,6 +223,9 @@ pub(crate) unsafe fn walk<const NARROW: bool>(
         let (from, end) = stretch(p as usize);
         if NARROW {
             sort_times::sort_narrow(&mut ts[from..end], sorter);
+        } else if CUT {
+            // The cut reads only where a session begins, and a session only its first time.
+            sort_times::cut(&mut ts[from..end], sorter);
         } else {
             sort_times::sort(&mut ts[from..end], sorter);
         }

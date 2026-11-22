@@ -294,24 +294,16 @@ fn matches_the_reference_on_random_buckets() {
                     wide.push(*click);
                 }
             }
-            for (net, wide_walk, narrow) in [(true, true, false), (false, true, false), (true, false, false), (false, false, false), (true, true, true), (false, true, true), (true, false, true)] {
+            // Every way, with one counter a person and with four, and the walk's times cut or sorted.
+            let ways = [(true, true, false), (false, true, false), (true, false, false), (false, false, false), (true, true, true), (false, true, true), (true, false, true)];
+            for ((net, wide_walk, narrow), four, time_cut) in ways.into_iter().flat_map(|way| [(way, false, false), (way, true, false), (way, false, true), (way, true, true)]) {
                 let mut agg = Agg::new(&ctx);
-                crate::partitioned::bucket_dense_as(
-                    &ctx,
-                    base,
-                    span,
-                    &|each| {
-                        each(&keys[..cut]);
-                        each(&keys[cut..]);
-                    },
-                    &|each| each(&paid),
-                    &|each| each(&wide),
-                    &|each| each(&placed),
-                    &mut agg,
-                    net,
-                    wide_walk,
-                    narrow,
-                );
+                let (head, tail) = keys.split_at(cut);
+                if four {
+                    crate::partitioned::bucket_dense_as::<4>(&ctx, base, span, &|each| { each(head); each(tail) }, &|each| each(&paid), &|each| each(&wide), &|each| each(&placed), &mut agg, net, wide_walk, narrow, time_cut);
+                } else {
+                    crate::partitioned::bucket_dense_as::<1>(&ctx, base, span, &|each| { each(head); each(tail) }, &|each| each(&paid), &|each| each(&wide), &|each| each(&placed), &mut agg, net, wide_walk, narrow, time_cut);
+                }
                 // The rows of either table: the walk's are narrow.
                 let walked = agg.user_narrow.widen(ctx.day0);
                 let mut user_rows: Vec<UserRow> = [&agg.user_daily, &walked]
@@ -325,8 +317,8 @@ fn matches_the_reference_on_random_buckets() {
                     .map(|i| (rows.campaign[i], rows.day[i], rows.sessions[i], rows.purchasing_sessions[i], rows.revenue_cents[i], rows.assisted_sessions[i]))
                     .collect();
                 campaign_rows.sort();
-                assert_eq!(user_rows, want.0, "dense user_daily, seed {seed}, sort {net}, walk {wide_walk}, narrow {narrow}");
-                assert_eq!(campaign_rows, want.1, "dense campaign_daily, seed {seed}, sort {net}, walk {wide_walk}, narrow {narrow}");
+                assert_eq!(user_rows, want.0, "dense user_daily, seed {seed}, sort {net}, walk {wide_walk}, narrow {narrow}, four {four}, cut {time_cut}");
+                assert_eq!(campaign_rows, want.1, "dense campaign_daily, seed {seed}, sort {net}, walk {wide_walk}, narrow {narrow}, four {four}, cut {time_cut}");
             }
         }
     }
