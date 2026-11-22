@@ -74,6 +74,8 @@ pub struct Chunks<T> {
     arenas: Vec<Arena>,
     /// Chunks of other lists that those are done with (`give`): taken before the block's.
     spare: Vec<usize>,
+    /// Records `push_pair_at` appended beyond one a pair: a pair's second, and each pad.
+    extra: usize,
     _records: PhantomData<T>,
 }
 
@@ -102,6 +104,7 @@ impl<T: Copy> Chunks<T> {
             end: arena.ptr as usize + arena.layout.size(),
             arenas: vec![arena],
             spare: Vec::new(),
+            extra: 0,
             _records: PhantomData,
         }
     }
@@ -133,6 +136,34 @@ impl<T: Copy> Chunks<T> {
             self.stage.ptr.add(list * STAGE + fill).cast::<T>().write_unaligned(rec);
             *self.fill.get_unchecked_mut(list) = (fill + Self::SIZE) as u16;
         }
+    }
+
+    /// Appends `first` and `second` to list `list` so that both lie in one staging block,
+    /// and so in one piece of `for_each`: where the block has room for one record only,
+    /// `pad` goes there first. For a row that is two records, read as one.
+    ///
+    /// # Safety
+    /// `list < self.lists()`.
+    #[inline(always)]
+    pub unsafe fn push_pair_at(&mut self, list: usize, pad: T, first: T, second: T) {
+        debug_assert!(STAGE >= 2 * Self::SIZE);
+        // SAFETY: the caller keeps `list` in range.
+        unsafe {
+            if *self.fill.get_unchecked(list) as usize == STAGE - Self::SIZE {
+                self.push_at(list, pad);
+                self.extra += 1;
+            }
+            // A full block is written out by the first of them: both are in the next.
+            self.push_at(list, first);
+            self.push_at(list, second);
+            self.extra += 1;
+        }
+    }
+
+    /// Records `push_pair_at` appended beyond one a pair: `len` less this is the pairs and
+    /// the records pushed alone.
+    pub fn extra(&self) -> usize {
+        self.extra
     }
 
     /// Appends `count` records: record `at` is `record(at)`, its list first. `push_at` in a
@@ -372,6 +403,7 @@ impl<T: Copy> Chunks<T> {
     /// the calling thread (`mem::release`). The lists can be filled again afterwards.
     pub fn release(&mut self) {
         self.fill.fill(0);
+        self.extra = 0;
         self.cur.fill(NONE);
         self.head.fill(0);
         self.blocks.fill(0);
@@ -508,6 +540,43 @@ mod tests {
         used.dedup();
         assert_eq!(used.len() + to.spare(), had);
         assert!(used.iter().all(|chunk| given.contains(chunk)));
+    }
+
+    /// A pair's two records are always in one piece, whatever was pushed before it.
+    #[test]
+    fn pairs_stay_in_one_piece() {
+        for lead in 0..40u64 {
+            let mut chunks: Chunks<[u64; 2]> = Chunks::new(3, 1 << 20);
+            let mut rows = 0u64;
+            for n in 0..5_000u64 {
+                let list = (n % 3) as usize;
+                // SAFETY: the list is below 3.
+                unsafe {
+                    if n < lead || n % 7 != 0 { chunks.push_at(list, [n, 0]) } else { chunks.push_pair_at(list, [u64::MAX, 0], [n, 1], [n, 2]) }
+                }
+                rows += 1;
+            }
+            chunks.fence();
+            assert_eq!(chunks.len() - chunks.extra(), rows as usize);
+            let mut seen = 0u64;
+            for list in 0..3 {
+                chunks.for_each(list, |piece| {
+                    let mut at = 0;
+                    while at < piece.len() {
+                        match piece[at] {
+                            [u64::MAX, 0] => at += 1,
+                            [n, 1] => {
+                                assert_eq!(piece[at + 1], [n, 2], "a pair cut in two");
+                                (seen, at) = (seen + 1, at + 2);
+                            }
+                            [_, 0] => (seen, at) = (seen + 1, at + 1),
+                            other => panic!("a second record alone: {other:?}"),
+                        }
+                    }
+                });
+            }
+            assert_eq!(seen, rows);
+        }
     }
 
     #[test]

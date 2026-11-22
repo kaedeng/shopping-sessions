@@ -21,7 +21,7 @@
 //!   rows at a time in registers (`prepare`); the loop of a kind looks the user up and puts
 //!   the record in its list's staging block. No second batch, no held records. Five rows
 //!   in six become a narrow record of 16 bytes (`EvN`); a purchase, and a row whose ingest
-//!   a narrow record cannot hold, the wider one.
+//!   a narrow record cannot hold, two records in the same list (`super::push_wide`).
 //! - **One batch of 64 rows**, 7 KB with its lists (5 KB of it in use), where `kern` keeps two batches and the
 //!   held records (12 KB) in a first-level cache that two workers share on the scorer. A
 //!   short user's line of the directory is asked for eight rows at a time as they are
@@ -132,8 +132,6 @@ struct Env<'a> {
     ingest_add: i64,
     /// 64 less the lists' bits: a key's list is the top bits of its hash.
     shift: u32,
-    /// The same for the lists of the wider records (`Plan::wide_part`).
-    wide_shift: u32,
     /// Whether a row may be a narrow record: the plan allows it, and every valid `ts` is
     /// below 2^31.
     narrow: bool,
@@ -219,7 +217,6 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
         first_ms: memo.first_ms,
         ingest_add: (memo.first_ms + ctx.origin).div_euclid(1000) - ctx.ingest_base(),
         shift: 64 - plan.part_bits,
-        wide_shift: 64 - plan.wide_bits,
         narrow: plan.narrow && u64::from(ctx.ts_end) <= 1 << 31,
     };
     // SAFETY: plain integers and pointers that are not read before they are written.
@@ -303,7 +300,7 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 // A line with no end in reach, or one of the segment's last or first.
                 *slow += 1;
                 let at = line.offset_from(p) as usize;
-                slow_line(p, len, at, ctx, dates, plan, events, long_events);
+                slow_line(p, len, at, ctx, dates, plan, narrow, events, long_events);
                 line = p.add(line_end(p, len, at));
             }
         }
@@ -421,13 +418,13 @@ unsafe fn split(batch: &mut Batch, rows: usize) {
 /// `row` is a row of the batch, whose lines are in `env`'s segment.
 #[cold]
 #[inline(never)]
-unsafe fn row_code(batch: &Batch, row: usize, env: &Env, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>, slow: &mut usize) {
+unsafe fn row_code(batch: &Batch, row: usize, env: &Env, narrow: &mut Chunks<EvN>, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>, slow: &mut usize) {
     // SAFETY: the caller's contract.
     unsafe {
         let (mut at, to) = (batch.lines[row].offset_from(env.base) as usize, batch.lines[row + 1].offset_from(env.base) as usize);
         while at < to {
             *slow += 1;
-            slow_line(env.base, env.bytes, at, env.ctx, env.dates, env.plan, events, long_events);
+            slow_line(env.base, env.bytes, at, env.ctx, env.dates, env.plan, narrow, events, long_events);
             at = line_end(env.base, env.bytes, at);
         }
     }
@@ -446,7 +443,7 @@ unsafe fn finish(batch: &mut Batch, rows: usize, env: &Env, lanes: &Lanes, narro
     unsafe {
         prepare(batch, rows, env);
         split(batch, rows);
-        let (users, plan, shift, wide_shift) = (env.users, env.plan, env.shift, env.wide_shift);
+        let (users, plan, shift) = (env.users, env.plan, env.shift);
 
         // The IDs that are not short first: looked at as long ones, and a long user's line
         // of the directory asked for, which then has every other kind's work to arrive in.
@@ -480,7 +477,7 @@ unsafe fn finish(batch: &mut Batch, rows: usize, env: &Env, lanes: &Lanes, narro
         }
 
         for at in 0..batch.len[ROW_CODE] {
-            row_code(batch, *batch.of[ROW_CODE].get_unchecked(at) as usize, env, events, long_events, slow);
+            row_code(batch, *batch.of[ROW_CODE].get_unchecked(at) as usize, env, narrow, events, long_events, slow);
         }
 
         // A purchase's price and product are read here (`event_row`: the row is valid when
@@ -496,8 +493,7 @@ unsafe fn finish(batch: &mut Batch, rows: usize, env: &Env, lanes: &Lanes, narro
             if batch.words[row] & BUY != 0 {
                 (stamp, ingest_pay) = bought(batch.lines[row + 1], stamp, ingest_pay);
             }
-            let key = _pext_u64(batch.keys[row], SIX);
-            events.push_at((types::hash::hash(key) >> wide_shift) as usize, Ev { key, user_ts: stamp | u64::from(user), ingest_pay });
+            super::push_wide(plan, narrow, events, _pext_u64(batch.keys[row], SIX), stamp | u64::from(user), ingest_pay);
         }
 
         // Three rows in four: nothing to decide.
@@ -512,7 +508,7 @@ unsafe fn finish(batch: &mut Batch, rows: usize, env: &Env, lanes: &Lanes, narro
             let row = *batch.of[LONG_USER].get_unchecked(at) as usize;
             let word = batch.words[row];
             if word & LATE != 0 {
-                row_code(batch, row, env, events, long_events, slow);
+                row_code(batch, row, env, narrow, events, long_events, slow);
                 continue;
             }
             let user = users.long(batch.rows[row][2], batch.lows[row][1]);
@@ -525,14 +521,14 @@ unsafe fn finish(batch: &mut Batch, rows: usize, env: &Env, lanes: &Lanes, narro
             if word & BUY != 0 {
                 (stamp, ingest_pay) = bought(batch.lines[row + 1], stamp, ingest_pay);
             }
-            events.push_at((types::hash::hash(key) >> wide_shift) as usize, Ev { key, user_ts: stamp | u64::from(user), ingest_pay });
+            super::push_wide(plan, narrow, events, key, stamp | u64::from(user), ingest_pay);
         }
         for kind in [LONG_EVENT, LONG_BOTH] {
             for at in 0..batch.len[kind] {
                 let row = *batch.of[kind].get_unchecked(at) as usize;
                 let word = batch.words[row];
                 if word & LATE != 0 {
-                    row_code(batch, row, env, events, long_events, slow);
+                    row_code(batch, row, env, narrow, events, long_events, slow);
                     continue;
                 }
                 let digits = batch.rows[row][2];

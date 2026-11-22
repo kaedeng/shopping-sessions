@@ -994,7 +994,7 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 SLOW_LINES.with(|count| count.set(count.get() + 1));
                 *slow += 1;
                 let at = line.offset_from(p) as usize;
-                slow_line(p, len, at, ctx, dates, plan, events, long_events);
+                slow_line(p, len, at, ctx, dates, plan, narrow, events, long_events);
                 line = p.add(line_end(p, len, at));
             }
         }
@@ -1086,7 +1086,7 @@ unsafe fn finish(
             held.len = to + fast.count_ones() as usize;
 
             if fast != live {
-                others(batch, first, live & !fast, user_ts, ingest_rel, base, bytes, ctx, dates, plan, events, long_events, slow);
+                others(batch, first, live & !fast, user_ts, ingest_rel, base, bytes, ctx, dates, plan, narrow, events, long_events, slow);
             }
             first += 8;
         }
@@ -1217,6 +1217,7 @@ unsafe fn others(
     ctx: &Ctx,
     dates: &Dates,
     plan: &Plan,
+    narrow: &mut Chunks<EvN>,
     events: &mut Chunks<Ev>,
     long_events: &mut Chunks<EvL>,
     slow: &mut usize,
@@ -1240,7 +1241,7 @@ unsafe fn others(
                     #[cfg(test)]
                     SLOW_LINES.with(|count| count.set(count.get() + 1));
                     *slow += 1;
-                    slow_line(base, bytes, at, ctx, dates, plan, events, long_events);
+                    slow_line(base, bytes, at, ctx, dates, plan, narrow, events, long_events);
                     at = line_end(base, bytes, at);
                 }
                 continue;
@@ -1258,8 +1259,7 @@ unsafe fn others(
                 let (hi, lo) = (batch.rows[row][0], batch.lows[row][0]);
                 long_events.push_at(plan.long_part(hi, lo), EvL { hi, lo, user_ts, ingest_pay });
             } else {
-                let key = super::canon(batch.rows[row][0] + 1);
-                events.push_at(plan.wide_part(key), Ev { key, user_ts, ingest_pay });
+                super::push_wide(plan, narrow, events, super::canon(batch.rows[row][0] + 1), user_ts, ingest_pay);
             }
         }
     }
@@ -1281,11 +1281,11 @@ pub(super) unsafe fn line_end(p: *const u8, len: usize, at: usize) -> usize {
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn slow_line(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>) {
+pub(super) unsafe fn slow_line(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, narrow: &mut Chunks<EvN>, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>) {
     // SAFETY: one line of the segment.
     unsafe {
         let bytes = line_end(p, len, at) - at;
-        Scalar::lines::<7>(p.add(at), bytes, &mut Scratch::new(), |fields| event_row(ctx, dates, plan, fields, events, long_events));
+        Scalar::lines::<7>(p.add(at), bytes, &mut Scratch::new(), |fields| event_row(ctx, dates, plan, fields, narrow, events, long_events));
     }
 }
 

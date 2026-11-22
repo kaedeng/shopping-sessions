@@ -157,7 +157,11 @@ pub fn canon(key: u64) -> u64 {
 ///
 /// The ingest is `Ctx::ingest_rel` less `NARROW_INGEST`, in 24 bits: 194 days from 12 days
 /// before the origin. A row that does not fit (a purchase, a key that is an interned `Id`, a
-/// place past 2^25, a `ts` past 2^31, an ingest outside those days) is an `Ev`.
+/// place past 2^25, a `ts` past 2^31, an ingest outside those days) is written to the same
+/// list as two records, an `Ev`'s three words behind a mark (`EvN::head`): a row in 25.
+/// The narrow records and those rows are then one list a dedup task reads once. (In
+/// lists of their own, an eighth as many, the wider rows were read by eight tasks each,
+/// twice: once to count a task's share, once to take it.)
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
 #[repr(C)]
 pub struct EvN {
@@ -168,6 +172,33 @@ pub struct EvN {
 impl EvN {
     /// The `ts` in `b`.
     pub const TS: u64 = ((1 << 31) - 1) << 25;
+
+    /// In `a`, the six bits of a key's last digit all set: no narrow record has that (a
+    /// digit is at most 35), so a record with them is the first of a wider row's two, or
+    /// a pad.
+    pub const HEAD: u64 = 63 << 42;
+
+    /// A record that only fills a staging block, so that the two of a wider row lie in one
+    /// (`Chunks::push_pair_at`).
+    pub const PAD: EvN = EvN { a: Self::HEAD | 1, b: 0 };
+
+    /// The first record of a wider row: its key, as `canon` gives it. The second is the
+    /// row's `user_ts` and `ingest_pay`, as an `Ev` has them.
+    #[inline(always)]
+    pub fn head(key: u64) -> EvN {
+        EvN { a: Self::HEAD, b: key }
+    }
+
+    /// Whether this is a narrow record, and not a wider row's first or a pad.
+    #[inline(always)]
+    pub fn is_narrow(&self) -> bool {
+        self.a & Self::HEAD != Self::HEAD
+    }
+
+    #[inline(always)]
+    pub fn is_pad(&self) -> bool {
+        self.a == Self::PAD.a
+    }
 
     /// The record of a row, or `None` for one that does not fit: `key`, `user_ts` and
     /// `ingest_pay` as an `Ev` has them.
@@ -411,14 +442,9 @@ pub struct Plan {
     lean: bool,
     /// Long `click_id`s kept whole (`click_id_at`).
     pub(crate) whole_clicks: bool,
-    /// Lists of the short-keyed events that are an `Ev` and not an `EvN` = `1 << wide_bits`:
-    /// the top bits of the same hash, so a list of them holds what `1 << (part_bits -
-    /// wide_bits)` lists of narrow records would. They are few (a row in 25), and a list
-    /// each would be as much staging again as the narrow ones'. `part_bits` where no row
-    /// is narrow.
-    pub wide_bits: u32,
     /// Whether rows may be narrow records at all (`SS_RECORDS=narrow|wide`): every place of
-    /// the directory is below 2^25.
+    /// the directory is below 2^25. Where not, every short-keyed row is an `Ev` in
+    /// `Out::events`, as before there were narrow records.
     pub narrow: bool,
     /// Set by the stage's caller once the links are joined, when clicks are to be written
     /// to their persons' buckets (`Placing`).
@@ -434,17 +460,10 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The list of the narrow record with key `key`, as `canon` has it.
+    /// The list of the short-keyed row with key `key`, as `canon` has it.
     #[inline(always)]
     pub fn part(&self, key: u64) -> usize {
         (hash(key) >> (64 - self.part_bits)) as usize
-    }
-
-    /// The list of the `Ev` with key `key`, as `canon` has it: the first `wide_bits` bits of
-    /// `part`.
-    #[inline(always)]
-    pub fn wide_part(&self, key: u64) -> usize {
-        (hash(key) >> (64 - self.wide_bits)) as usize
     }
 
     #[inline(always)]
@@ -455,11 +474,12 @@ impl Plan {
 
 /// One worker's parse output.
 pub struct Out {
-    /// List `Plan::part(key)`: the well-formed event lines with a short `event_id` that fit
-    /// an `EvN`, valid or not.
+    /// List `Plan::part(key)`: every well-formed event line with a non-empty `event_id` not
+    /// spelled the long way, valid or not: a narrow record, or two records for a row that
+    /// is none (`push_wide`). Empty where no row may be narrow.
     pub narrow: Chunks<EvN>,
-    /// List `Plan::wide_part(key)`: every other well-formed event line with a non-empty
-    /// `event_id` not spelled the long way.
+    /// List `Plan::part(key)`: the same lines as an `Ev` each, where no row may be narrow
+    /// (`Plan::narrow`); empty otherwise.
     pub events: Chunks<Ev>,
     /// List `Plan::long_part(hi, lo)`: the others.
     pub long_events: Chunks<EvL>,
@@ -505,10 +525,6 @@ impl Ingest {
         Plan {
             users,
             part_bits,
-            // Where no row is narrow every short-keyed row is an `Ev`: a list each, as
-            // before there were narrow records (sharing a list, eight dedup tasks each read
-            // all of it for their own eighth: a run was a quarter slower).
-            wide_bits: if narrow { part_bits.saturating_sub(3).max(1).min(part_bits) } else { part_bits },
             narrow,
             long_bits: part_bits.saturating_sub(3).max(1),
             kernel: DECODES[types::env::pick("SS_DECODE", DECODES)] != "row",
@@ -525,11 +541,11 @@ impl Ingest {
         // A worker's block has room for four times its share of the lines (it is address
         // space until written), a chunk a list and a huge page more.
         let room = |rows: usize, record: usize, lists: usize| (rows + rows / 8) * record * 4 / workers.max(4) + lists * 4096 + (2 << 20);
-        let (parts, wide_parts, long_parts) = (1usize << plan.part_bits, 1usize << plan.wide_bits, 1usize << plan.long_bits);
+        let (parts, long_parts) = (1usize << plan.part_bits, 1usize << plan.long_bits);
         Out {
             narrow: Chunks::new(parts, room(self.event_rows, size_of::<EvN>(), parts)),
-            // The few rows that are not narrow; when none may be, every row.
-            events: Chunks::new(wide_parts, room(if plan.narrow { self.event_rows / 8 } else { self.event_rows }, size_of::<Ev>(), wide_parts)),
+            // Used only when no row may be narrow.
+            events: Chunks::new(parts, room(if plan.narrow { 0 } else { self.event_rows }, size_of::<Ev>(), parts)),
             long_events: Chunks::new(long_parts, room(self.event_rows / 4, size_of::<EvL>(), long_parts)),
             clicks: Chunks::new(1, room(self.click_rows, size_of::<Ck>(), 1)),
             placed: None,
@@ -643,8 +659,9 @@ unsafe fn events(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &Plan
         let lead = out.lead;
         return unsafe { if plan.lean { lean::events(p, len, lead, ctx, dates, plan, out) } else { kern::events(p, len, lead, ctx, dates, plan, out) } };
     }
-    let Out { events, long_events, scratch, .. } = out;
-    unsafe { Scalar::lines::<7>(p, len, scratch, |fields| event_row(ctx, dates, plan, fields, events, long_events)) };
+    let Out { narrow, events, long_events, scratch, .. } = out;
+    unsafe { Scalar::lines::<7>(p, len, scratch, |fields| event_row(ctx, dates, plan, fields, narrow, events, long_events)) };
+    narrow.fence();
     events.fence();
     long_events.fence();
 }
@@ -679,7 +696,7 @@ unsafe fn clicks(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, campaigns: 
 /// # Safety
 /// The fields are from a segment.
 #[inline(always)]
-unsafe fn event_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 7], events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>) {
+unsafe fn event_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 7], narrow: &mut Chunks<EvN>, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>) {
     let [id, user, ts, ingest, kind, product, price] = *fields;
     if id.len == 0 {
         return;
@@ -718,8 +735,23 @@ unsafe fn event_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 7], 
             long_events.push_at(plan.long_part(hi, lo), EvL { hi, lo, user_ts, ingest_pay });
         } else {
             let key = canon(short_key_at(id.p, id.len, b'e').unwrap_or_else(|| id::intern_any(std::slice::from_raw_parts(id.p, id.len))));
-            events.push_at(plan.wide_part(key), Ev { key, user_ts, ingest_pay });
+            push_wide(plan, narrow, events, key, user_ts, ingest_pay);
         }
+    }
+}
+
+/// A short-keyed row that is not written as a narrow record (a purchase, a line the row
+/// code read, an ingest a narrow record cannot hold): two records in the narrow records'
+/// list of its key, or an `Ev` where no row may be narrow. `key` as `canon` gives it.
+///
+/// # Safety
+/// The lists are the plan's.
+#[inline(always)]
+pub(crate) unsafe fn push_wide(plan: &Plan, narrow: &mut Chunks<EvN>, events: &mut Chunks<Ev>, key: u64, user_ts: u64, ingest_pay: u64) {
+    let list = plan.part(key);
+    // SAFETY: a list is below the lists' count by its bits.
+    unsafe {
+        if plan.narrow { narrow.push_pair_at(list, EvN::PAD, EvN::head(key), EvN { a: user_ts, b: ingest_pay }) } else { events.push_at(list, Ev { key, user_ts, ingest_pay }) }
     }
 }
 
@@ -790,8 +822,8 @@ mod tests {
     fn rows_go_by_their_ids_spelling() {
         let ctx = Ctx::new(parse_f1(b"2026-10-08T00:00:00Z").unwrap(), parse_f1(b"2026-10-22T00:00:00Z").unwrap(), &[], &[]).unwrap();
         let dates = Dates::new(&ctx);
-        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, lean: false, whole_clicks: false, wide_bits: 1, narrow: true, placing: OnceLock::new(), wait_for_placing: false, ask_step: 63 };
-        let (mut events, mut long_events) = (Chunks::<Ev>::new(8, 1 << 16), Chunks::<EvL>::new(2, 1 << 16));
+        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, lean: false, whole_clicks: false, narrow: false, placing: OnceLock::new(), wait_for_placing: false, ask_step: 63 };
+        let (mut narrow, mut events, mut long_events) = (Chunks::<EvN>::new(8, 1 << 16), Chunks::<Ev>::new(8, 1 << 16), Chunks::<EvL>::new(2, 1 << 16));
         let text = b"\ne1,u1,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,view,p1,\n\
 e02423c3d84ab053af78764ce49f23b5c,u02423c3d84ab053af78764ce49f23b5c,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,cart,p1,\n\
 E1,U1,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,view,p1,\n\
@@ -799,7 +831,8 @@ e2,u1,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,refund,p1,\n";
         let mut buf = text.to_vec();
         buf.extend([0u8; 64]);
         // SAFETY: whole lines after the first byte, 64 bytes readable after them.
-        unsafe { Scalar::lines::<7>(buf.as_ptr().add(1), text.len() - 1, &mut Scratch::new(), |fields| event_row(&ctx, &dates, &plan, fields, &mut events, &mut long_events)) };
+        unsafe { Scalar::lines::<7>(buf.as_ptr().add(1), text.len() - 1, &mut Scratch::new(), |fields| event_row(&ctx, &dates, &plan, fields, &mut narrow, &mut events, &mut long_events)) };
+        assert!(narrow.is_empty(), "no row is narrow under this plan");
         events.fence();
         long_events.fence();
         let (mut short, mut long) = (Vec::new(), Vec::new());

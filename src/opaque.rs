@@ -297,24 +297,29 @@ fn dedup<'p, R: Row + 'p>(lists: impl Iterator<Item = &'p Chunks<R>> + Clone, li
 /// In a slot of `dedup_short`'s table: the row is one of the wider records kept.
 const WIDE: u32 = 1 << 31;
 
-/// `dedup` for the short-keyed events of list `list`: every worker's narrow records of that
-/// list into `kept`, and of the list of wider records that holds the list's
-/// (`Plan::wide_part`) those whose key's list it is into `wide`. One table for both, by the
-/// key as `canon` has it, which both kinds of record hold: a copy of an `event_id` is found whichever record
-/// its row became. Where a wider record wins over a narrow one that is kept, the narrow one
-/// loses its `ts`: no row any more for the placing loop.
+/// `dedup` for the short-keyed events of list `list`: every worker's records of that list,
+/// the narrow ones into `kept` and the wider rows, which lie among them as two records each
+/// (`EvN::head`), into `wide`. One table for both, by the key as `canon` has it, which both
+/// kinds of record hold: a copy of an `event_id` is found whichever record its row became,
+/// in one pass over the list. A record that loses to one of the other kind loses its `ts`:
+/// no row any more for the placing loop.
+///
+/// Where no row may be narrow (`Plan::narrow`) the rows are an `Ev` each in lists of their
+/// own, and this is `dedup` of those.
+///
+/// The loop keeps what it reads in locals and writes the kept rows through pointers into
+/// room made before it. As a closure over the table, the two vectors, the shift and the
+/// mask it read each of them from memory again for every record (a store through a pointer
+/// may be to the closure's own fields, for all the compiler knows), and every push checked
+/// the vector's room: 17 instructions a record more than this.
 fn dedup_short(parsed: &[Out], list: usize, plan: &Plan, table: &mut Vec<u32>, kept: &mut Vec<EvN>, wide: &mut Vec<Ev>) {
     kept.clear();
-    wide.clear();
-    let wide_list = list >> (plan.part_bits - plan.wide_bits);
-    let narrow_rows: usize = parsed.iter().map(|out| out.narrow.len_of(list)).sum();
-    // The wider list's records of this list, counted: the table is sized for the rows there
-    // are, whatever share of the wider list they turn out to be.
-    let mut wide_rows = 0;
-    for out in parsed {
-        out.events.for_each(wide_list, |piece| wide_rows += piece.iter().filter(|row| plan.part(row.key) == list).count());
+    if !plan.narrow {
+        return dedup(parsed.iter().map(|out| &out.events), list, plan.part_bits, table, wide);
     }
-    let rows = narrow_rows + wide_rows;
+    wide.clear();
+    // Records: a few more than the rows, a wider row being two and a pad one.
+    let rows: usize = parsed.iter().map(|out| out.narrow.len_of(list)).sum();
     if rows == 0 {
         return;
     }
@@ -323,84 +328,121 @@ fn dedup_short(parsed: &[Out], list: usize, plan: &Plan, table: &mut Vec<u32>, k
     let (shift, mask) = (64 - plan.part_bits - slot_bits, (1usize << slot_bits) - 1);
     table.clear();
     table.resize(mask + 1, 0);
-    kept.reserve(narrow_rows);
-    wide.reserve(wide_rows);
+    // A narrow record is kept once at the most, and so is a wider row, which is two records.
+    kept.reserve(rows);
+    wide.reserve(rows / 2 + 1);
     let ahead = ahead_slots();
+    const KEY: u64 = (1 << 48) - 1;
+    let (slots, kept_at, wide_at) = (table.as_mut_ptr(), kept.as_mut_ptr(), wide.as_mut_ptr());
+    let (mut kept_len, mut wide_len) = (0usize, 0usize);
     for out in parsed {
         out.narrow.for_each(list, |piece| {
-            for (number, row) in piece.iter().enumerate() {
-                // `SS_DEDUP_AHEAD`: the slot of the row a few on.
-                if ahead != 0
-                    && let Some(coming) = piece.get(number + ahead)
-                {
-                    types::mem::prefetch(table.as_ptr().wrapping_add((hash(coming.key()) >> shift) as usize & mask));
-                }
-                let key = row.key();
-                let mut at = (hash(key) >> shift) as usize & mask;
-                loop {
-                    // SAFETY: `at` is at most `mask`, and the table has `mask + 1` slots.
-                    let slot = unsafe { table.get_unchecked_mut(at) };
-                    if *slot == 0 {
-                        kept.push(*row);
-                        *slot = kept.len() as u32;
-                        break;
+            let (slots, kept_at, wide_at, shift, mask, ahead) = (slots, kept_at, wide_at, shift, mask, ahead);
+            let (mut kept_n, mut wide_n) = (kept_len, wide_len);
+            let (records, count) = (piece.as_ptr(), piece.len());
+            let mut number = 0;
+            // SAFETY: `number < count` where a record is read, and a wider row's second
+            // record is in the piece its first is in (`Chunks::push_pair_at`). A slot's
+            // index is masked to the table. `kept_n` and `wide_n` grow by one a record or a
+            // pair of them at the most, so they stay inside the room reserved above; a slot
+            // holds one more than the index of a row written before it was set.
+            unsafe {
+                while number < count {
+                    let row = *records.add(number);
+                    // `SS_DEDUP_AHEAD`: the slot of the record a few on (some slot, for a
+                    // record that is no narrow one).
+                    if ahead != 0 {
+                        let coming = (*records.add((number + ahead).min(count - 1))).a & KEY;
+                        types::mem::prefetch(slots.add((hash(coming) >> shift) as usize & mask));
                     }
-                    // SAFETY: only narrow rows are in the table yet, and a slot is set to
-                    // the kept length right after a push.
-                    let first = unsafe { kept.get_unchecked_mut(*slot as usize - 1) };
-                    if first.key() == key {
-                        if row.ingest() < first.ingest() {
-                            *first = *row;
+                    if row.a & EvN::HEAD != EvN::HEAD {
+                        number += 1;
+                        let key = row.a & KEY;
+                        let mut at = (hash(key) >> shift) as usize & mask;
+                        loop {
+                            let slot = slots.add(at);
+                            let held = *slot;
+                            if held == 0 {
+                                kept_at.add(kept_n).write(row);
+                                kept_n += 1;
+                                *slot = kept_n as u32;
+                                break;
+                            }
+                            if held & WIDE == 0 {
+                                let first = &mut *kept_at.add(held as usize - 1);
+                                if first.a & KEY == key {
+                                    if row.ingest() < first.ingest() {
+                                        *first = row;
+                                    }
+                                    break;
+                                }
+                            } else {
+                                let first = &mut *wide_at.add((held & !WIDE) as usize - 1);
+                                if first.key == key {
+                                    if row.ingest() < first.ingest_pay as u32 {
+                                        first.user_ts &= 0xFFFF_FFFF;
+                                        kept_at.add(kept_n).write(row);
+                                        kept_n += 1;
+                                        *slot = kept_n as u32;
+                                    }
+                                    break;
+                                }
+                            }
+                            at = (at + 1) & mask;
                         }
-                        break;
+                        continue;
                     }
-                    at = (at + 1) & mask;
+                    if row.a == EvN::PAD.a {
+                        number += 1;
+                        continue;
+                    }
+                    // A wider row: its key here, its other two words in the record after.
+                    assert!(number + 1 < count, "a wider row's second record is in its piece");
+                    let rest = *records.add(number + 1);
+                    number += 2;
+                    let row = Ev { key: row.b, user_ts: rest.a, ingest_pay: rest.b };
+                    let key = row.key;
+                    let mut at = (hash(key) >> shift) as usize & mask;
+                    loop {
+                        let slot = slots.add(at);
+                        let held = *slot;
+                        if held == 0 {
+                            wide_at.add(wide_n).write(row);
+                            wide_n += 1;
+                            *slot = WIDE | wide_n as u32;
+                            break;
+                        }
+                        if held & WIDE != 0 {
+                            let first = &mut *wide_at.add((held & !WIDE) as usize - 1);
+                            if first.key == key {
+                                if (row.ingest_pay as u32) < (first.ingest_pay as u32) {
+                                    *first = row;
+                                }
+                                break;
+                            }
+                        } else {
+                            let first = &mut *kept_at.add(held as usize - 1);
+                            if first.a & KEY == key {
+                                if (row.ingest_pay as u32) < first.ingest() {
+                                    first.b &= !EvN::TS;
+                                    wide_at.add(wide_n).write(row);
+                                    wide_n += 1;
+                                    *slot = WIDE | wide_n as u32;
+                                }
+                                break;
+                            }
+                        }
+                        at = (at + 1) & mask;
+                    }
                 }
             }
+            (kept_len, wide_len) = (kept_n, wide_n);
         });
     }
-    for out in parsed {
-        out.events.for_each(wide_list, |piece| {
-            for &row in piece {
-                let key = row.key;
-                let slot_hash = hash(key);
-                if (slot_hash >> (64 - plan.part_bits)) as usize != list {
-                    continue;
-                }
-                let mut at = (slot_hash >> shift) as usize & mask;
-                loop {
-                    // SAFETY: as above.
-                    let slot = unsafe { table.get_unchecked_mut(at) };
-                    if *slot == 0 {
-                        wide.push(row);
-                        *slot = WIDE | wide.len() as u32;
-                        break;
-                    }
-                    if *slot & WIDE != 0 {
-                        // SAFETY: a slot is set to the length right after a push.
-                        let first = unsafe { wide.get_unchecked_mut((*slot & !WIDE) as usize - 1) };
-                        if first.key == key {
-                            if (row.ingest_pay as u32) < (first.ingest_pay as u32) {
-                                *first = row;
-                            }
-                            break;
-                        }
-                    } else {
-                        // SAFETY: likewise.
-                        let first = unsafe { kept.get_unchecked_mut(*slot as usize - 1) };
-                        if first.key() == key {
-                            if (row.ingest_pay as u32) < first.ingest() {
-                                first.b &= !EvN::TS;
-                                wide.push(row);
-                                *slot = WIDE | wide.len() as u32;
-                            }
-                            break;
-                        }
-                    }
-                    at = (at + 1) & mask;
-                }
-            }
-        });
+    // SAFETY: that many rows were written into the room reserved, each once.
+    unsafe {
+        kept.set_len(kept_len);
+        wide.set_len(wide_len);
     }
 }
 
@@ -645,7 +687,8 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     lap("parse");
 
     let (parts, long_parts, buckets) = (1usize << plan.part_bits, 1usize << plan.long_bits, 1usize << ctx.bucket_bits);
-    let events: usize = parsed.iter().map(|out| out.narrow.len() + out.events.len() + out.long_events.len()).sum();
+    // (A wider row is two of the narrow lists' records, and a pad is none.)
+    let events: usize = parsed.iter().map(|out| out.narrow.len() - out.narrow.extra() + out.events.len() + out.long_events.len()).sum();
     // A worker's `user_daily` rows get their room once (`types::rows::expect`): generated
     // data has a row for every 8 or 9 events, so a quarter of an even share of the events
     // is twice a worker's rows.
@@ -710,7 +753,6 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
                 if task < parts {
                     dedup_short(parsed, task, &plan, table, kept_narrow, kept);
                     if recycle {
-                        // (The wider lists' chunks are read by several tasks: not given.)
                         give_chunks(parsed, |out| &out.narrow, task, ranges);
                     }
                     scatter_dense(kept_narrow, persons, shift, ranges);
