@@ -21,6 +21,10 @@
 //!
 //! The assists are counted in a table of their own, `[campaign * DAYS + day]`, so that a
 //! campaign's days are one register (`agg_dense::Counters::wide`). Needs at most `DAYS` days.
+//!
+//! `person_narrow` gives the same answers in registers of 256 bits (`dense_walk` says why):
+//! the clicks of a person with at most 8 are one register, with at most 16 two; a campaign's
+//! 16 days are two.
 
 use core::arch::x86_64::*;
 
@@ -91,9 +95,25 @@ impl Attr {
         if clicks.len() <= LIGHT {
             self.light(clicks, starts, days, credits, assisted)
         } else if self.sorted || starts.len() >= usize::from(u16::MAX) {
-            self.heavy(clicks, starts, days, credits, assisted)
+            self.heavy::<false>(clicks, starts, days, credits, assisted)
         } else {
-            self.heavy_table(clicks, starts, days, credits, assisted)
+            self.heavy_table::<false>(clicks, starts, days, credits, assisted)
+        }
+    }
+
+    /// `person` with no register wider than 256 bits.
+    #[inline]
+    pub(crate) fn person_narrow(&mut self, clicks: &[Click], starts: &[u32], days: &[u32], credits: &mut [u32], assisted: &mut [u32]) {
+        debug_assert!(starts.len() == days.len() && starts.len() == credits.len());
+        if clicks.is_empty() || starts.is_empty() {
+            return;
+        }
+        if clicks.len() <= LIGHT {
+            self.light_narrow(clicks, starts, days, credits, assisted)
+        } else if self.sorted || starts.len() >= usize::from(u16::MAX) {
+            self.heavy::<true>(clicks, starts, days, credits, assisted)
+        } else {
+            self.heavy_table::<true>(clicks, starts, days, credits, assisted)
         }
     }
 
@@ -111,7 +131,9 @@ impl Attr {
     ///   `click_id` wins), then the latest so far, session by session.
     /// - A campaign assists the union of its clicks' stretches: a bit per session, and each
     ///   run of bits is a difference of two prefix sums, as in `heavy`.
-    fn heavy_table(&mut self, clicks: &[Click], starts: &[u32], days: &[u32], credits: &mut [u32], assisted: &mut [u32]) {
+    ///
+    /// `NARROW`: a campaign's days in two 256-bit registers, the starts in two.
+    fn heavy_table<const NARROW: bool>(&mut self, clicks: &[Click], starts: &[u32], days: &[u32], credits: &mut [u32], assisted: &mut [u32]) {
         let (n, sessions) = (clicks.len(), starts.len());
         let week = WEEK as u32;
         // Room for a 16-lane load, and two entries past the last start.
@@ -167,15 +189,8 @@ impl Attr {
         // its `stride >= words` words of `cmask` hold bits below `sessions` only; `touched` has
         // room for a campaign per click. AVX-512 F and BMI2 are compiled in.
         unsafe {
-            let mut before = _mm512_setzero_si512();
-            let one = _mm512_set1_epi32(1);
-            for at in 0..sessions {
-                _mm512_storeu_si512(prefix.add(at).cast(), before);
-                before = _mm512_mask_add_epi32(before, (1u32 << (days[at] as usize & (DAYS - 1))) as __mmask16, before, one);
-            }
-            _mm512_storeu_si512(prefix.add(sessions).cast(), before);
+            prefix_rows::<NARROW>(prefix, days);
 
-            let all = _mm512_loadu_si512(st.cast());
             let mut marked = 0usize;
             for (k, click) in clicks.iter().enumerate() {
                 let ts = click.ts;
@@ -193,10 +208,7 @@ impl Attr {
                     }
                     (lo, hi)
                 } else {
-                    (
-                        _mm512_cmplt_epu32_mask(all, _mm512_set1_epi32(ts as i32)).count_ones() as usize,
-                        _mm512_cmple_epu32_mask(all, _mm512_set1_epi32(end as i32)).count_ones() as usize,
-                    )
+                    count_starts::<NARROW>(st, ts, end)
                 };
                 // The latest click of this `lo`.
                 let (held_ts, held) = (*best_ts.add(lo), *best_at.add(lo));
@@ -244,13 +256,24 @@ impl Attr {
             // The assists: each campaign's runs of sessions, a day's count each.
             for &campaign in std::slice::from_raw_parts(touched, marked) {
                 let row = std::slice::from_raw_parts_mut(cmask.add(campaign as usize * stride), words);
-                let cells = assisted.as_mut_ptr().add(campaign as usize * DAYS).cast::<__m512i>();
+                let cells = assisted.as_mut_ptr().add(campaign as usize * DAYS);
                 debug_assert!(campaign as usize * DAYS + DAYS <= assisted.len());
-                let mut sum = _mm512_loadu_si512(cells);
-                each_run(row, |from, to| {
-                    sum = _mm512_add_epi32(sum, _mm512_sub_epi32(_mm512_loadu_si512(prefix.add(to).cast()), _mm512_loadu_si512(prefix.add(from).cast())));
-                });
-                _mm512_storeu_si512(cells, sum);
+                if NARROW {
+                    let (mut low, mut high) = (_mm256_loadu_si256(cells.cast()), _mm256_loadu_si256(cells.add(8).cast()));
+                    each_run(row, |from, to| {
+                        let (from, to) = (prefix.add(from).cast::<u32>(), prefix.add(to).cast::<u32>());
+                        low = _mm256_add_epi32(low, _mm256_sub_epi32(_mm256_loadu_si256(to.cast()), _mm256_loadu_si256(from.cast())));
+                        high = _mm256_add_epi32(high, _mm256_sub_epi32(_mm256_loadu_si256(to.add(8).cast()), _mm256_loadu_si256(from.add(8).cast())));
+                    });
+                    _mm256_storeu_si256(cells.cast(), low);
+                    _mm256_storeu_si256(cells.add(8).cast(), high);
+                } else {
+                    let mut sum = _mm512_loadu_si512(cells.cast());
+                    each_run(row, |from, to| {
+                        sum = _mm512_add_epi32(sum, _mm512_sub_epi32(_mm512_loadu_si512(prefix.add(to).cast()), _mm512_loadu_si512(prefix.add(from).cast())));
+                    });
+                    _mm512_storeu_si512(cells.cast(), sum);
+                }
                 row.fill(0);
             }
         }
@@ -306,8 +329,96 @@ impl Attr {
         }
     }
 
-    /// `person` for any number of clicks.
-    fn heavy(&mut self, clicks: &[Click], starts: &[u32], days: &[u32], credits: &mut [u32], assisted: &mut [u32]) {
+    /// `light` in 256-bit registers: at most 8 clicks are one, at most 16 two. The latest
+    /// click of the window is a maximum over the lanes by three shuffles, and a lane's
+    /// earlier lanes of its campaign are compares against each click's campaign in turn.
+    #[inline]
+    fn light_narrow(&mut self, clicks: &[Click], starts: &[u32], days: &[u32], credits: &mut [u32], assisted: &mut [u32]) {
+        let (n, sessions) = (clicks.len(), starts.len());
+        let mut campaign = [0u32; LIGHT];
+        // A session's cells: at most one per click.
+        self.cells.clear();
+        self.cells.reserve(sessions * LIGHT + LIGHT);
+        let (list, mut cells) = (self.cells.as_mut_ptr(), 0usize);
+        // SAFETY: register arithmetic on the clicks' lanes, the array and the tables; each
+        // store of 8 cells starts at most `sessions * LIGHT + 8` in, inside the room reserved;
+        // AVX-512 F and VL are compiled in (this module's cfg and the caller's).
+        unsafe {
+            let week = _mm256_set1_epi32(WEEK as i32);
+            let (low_ts, low_campaigns) = click_lanes(clicks, 0);
+            _mm256_storeu_si256(campaign.as_mut_ptr().cast(), low_campaigns);
+            let low_rows = _mm256_slli_epi32::<4>(low_campaigns);
+            // The latest time among the lanes of `window` (0 if none), in every lane.
+            let latest = |a: __m256i| {
+                let a = _mm256_max_epu32(a, _mm256_permute4x64_epi64::<0b01_00_11_10>(a));
+                let a = _mm256_max_epu32(a, _mm256_shuffle_epi32::<0b01_00_11_10>(a));
+                _mm256_max_epu32(a, _mm256_shuffle_epi32::<0b10_11_00_01>(a))
+            };
+            if n <= 8 {
+                let live = ((1u32 << n) - 1) as __mmask8;
+                // Per lane, the earlier lanes with its campaign, a bit each.
+                let mut earlier = _mm256_setzero_si256();
+                for lane in 0..7 {
+                    let same = _mm256_cmpeq_epi32(low_campaigns, _mm256_set1_epi32(campaign[lane] as i32));
+                    earlier = _mm256_ternarylogic_epi32::<0xF8>(earlier, same, _mm256_loadu_si256(LATER[lane].as_ptr().cast()));
+                }
+                for at in 0..sessions {
+                    let start = _mm256_set1_epi32(*starts.get_unchecked(at) as i32);
+                    // As in `light`, by lanes of 8.
+                    let window = _mm256_mask_cmple_epu32_mask(live, _mm256_sub_epi32(start, low_ts), week);
+                    let top = _mm256_mask_cmpeq_epi32_mask(window, low_ts, latest(_mm256_maskz_mov_epi32(window, low_ts)));
+                    let lane = if top & top.wrapping_sub(1) == 0 { top.trailing_zeros() as usize & (LIGHT - 1) } else { smallest(clicks, u16::from(top)) };
+                    let credit = credits.get_unchecked_mut(at);
+                    *credit = if window != 0 { *campaign.get_unchecked(lane) } else { *credit };
+                    let repeated = _mm256_mask_test_epi32_mask(window, earlier, _mm256_set1_epi32(i32::from(window)));
+                    let first = window & !repeated;
+                    let day = _mm256_set1_epi32(*days.get_unchecked(at) as i32);
+                    _mm256_storeu_si256(list.add(cells).cast(), _mm256_maskz_compress_epi32(first, _mm256_add_epi32(low_rows, day)));
+                    cells += first.count_ones() as usize;
+                }
+            } else {
+                let live = ((1u32 << (n - 8)) - 1) as __mmask8;
+                let (high_ts, high_campaigns) = click_lanes(clicks, 8);
+                _mm256_storeu_si256(campaign.as_mut_ptr().add(8).cast(), high_campaigns);
+                let high_rows = _mm256_slli_epi32::<4>(high_campaigns);
+                let (mut low_earlier, mut high_earlier) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+                for lane in 0..LIGHT - 1 {
+                    let this = _mm256_set1_epi32(campaign[lane] as i32);
+                    if lane < 7 {
+                        let same = _mm256_cmpeq_epi32(low_campaigns, this);
+                        low_earlier = _mm256_ternarylogic_epi32::<0xF8>(low_earlier, same, _mm256_loadu_si256(LATER[lane].as_ptr().cast()));
+                    }
+                    let same = _mm256_cmpeq_epi32(high_campaigns, this);
+                    high_earlier = _mm256_ternarylogic_epi32::<0xF8>(high_earlier, same, _mm256_loadu_si256(LATER[lane].as_ptr().add(8).cast()));
+                }
+                for at in 0..sessions {
+                    let start = _mm256_set1_epi32(*starts.get_unchecked(at) as i32);
+                    let low = _mm256_cmple_epu32_mask(_mm256_sub_epi32(start, low_ts), week);
+                    let high = _mm256_mask_cmple_epu32_mask(live, _mm256_sub_epi32(start, high_ts), week);
+                    let most = latest(_mm256_max_epu32(_mm256_maskz_mov_epi32(low, low_ts), _mm256_maskz_mov_epi32(high, high_ts)));
+                    let top = u16::from(_mm256_mask_cmpeq_epi32_mask(low, low_ts, most)) | u16::from(_mm256_mask_cmpeq_epi32_mask(high, high_ts, most)) << 8;
+                    let window = u16::from(low) | u16::from(high) << 8;
+                    let lane = if top & top.wrapping_sub(1) == 0 { top.trailing_zeros() as usize & (LIGHT - 1) } else { smallest(clicks, top) };
+                    let credit = credits.get_unchecked_mut(at);
+                    *credit = if window != 0 { *campaign.get_unchecked(lane) } else { *credit };
+                    let window_lanes = _mm256_set1_epi32(i32::from(window));
+                    let low_first = low & !_mm256_mask_test_epi32_mask(low, low_earlier, window_lanes);
+                    let high_first = high & !_mm256_mask_test_epi32_mask(high, high_earlier, window_lanes);
+                    let day = _mm256_set1_epi32(*days.get_unchecked(at) as i32);
+                    _mm256_storeu_si256(list.add(cells).cast(), _mm256_maskz_compress_epi32(low_first, _mm256_add_epi32(low_rows, day)));
+                    cells += low_first.count_ones() as usize;
+                    _mm256_storeu_si256(list.add(cells).cast(), _mm256_maskz_compress_epi32(high_first, _mm256_add_epi32(high_rows, day)));
+                    cells += high_first.count_ones() as usize;
+                }
+            }
+            for at in 0..cells {
+                *assisted.get_unchecked_mut(*list.add(at) as usize) += 1;
+            }
+        }
+    }
+
+    /// `person` for any number of clicks. `NARROW`: a campaign's days in two 256-bit registers.
+    fn heavy<const NARROW: bool>(&mut self, clicks: &[Click], starts: &[u32], days: &[u32], credits: &mut [u32], assisted: &mut [u32]) {
         let (n, sessions) = (clicks.len(), starts.len());
         // The clicks in time order, the winner of a tie last: the smallest `click_id`.
         self.keys.clear();
@@ -344,13 +455,7 @@ impl Attr {
         // `sessions`; a campaign is below the counters' and `last`'s count (the caller's
         // contract), and its row of `assisted` is `DAYS` cells.
         unsafe {
-            let mut before = _mm512_setzero_si512();
-            let one = _mm512_set1_epi32(1);
-            for at in 0..sessions {
-                _mm512_storeu_si512(prefix.as_mut_ptr().add(at).cast(), before);
-                before = _mm512_mask_add_epi32(before, (1u32 << (days[at] as usize & (DAYS - 1))) as __mmask16, before, one);
-            }
-            _mm512_storeu_si512(prefix.as_mut_ptr().add(sessions).cast(), before);
+            prefix_rows::<NARROW>(prefix.as_mut_ptr(), days);
 
             // Click `k` covers sessions `lo..hi`: from the first that starts at or after it
             // to the first that starts more than a week after it. Both only grow.
@@ -372,12 +477,117 @@ impl Attr {
                 let seen = last.get_unchecked_mut(credited as usize);
                 let from = (lo as u32 + base).max(*seen) - base;
                 *seen = hi as u32 + base;
-                let row = assisted.as_mut_ptr().add(credited as usize * DAYS).cast::<__m512i>();
+                let row = assisted.as_mut_ptr().add(credited as usize * DAYS);
                 debug_assert!(credited as usize * DAYS + DAYS <= assisted.len() && from as usize <= hi);
-                let added = _mm512_sub_epi32(_mm512_loadu_si512(prefix.as_ptr().add(hi).cast()), _mm512_loadu_si512(prefix.as_ptr().add(from as usize).cast()));
-                _mm512_storeu_si512(row, _mm512_add_epi32(_mm512_loadu_si512(row), added));
+                let (from, to) = (prefix.as_ptr().add(from as usize).cast::<u32>(), prefix.as_ptr().add(hi).cast::<u32>());
+                if NARROW {
+                    for half in [0, 8] {
+                        let added = _mm256_sub_epi32(_mm256_loadu_si256(to.add(half).cast()), _mm256_loadu_si256(from.add(half).cast()));
+                        _mm256_storeu_si256(row.add(half).cast(), _mm256_add_epi32(_mm256_loadu_si256(row.add(half).cast()), added));
+                    }
+                } else {
+                    let added = _mm512_sub_epi32(_mm512_loadu_si512(to.cast()), _mm512_loadu_si512(from.cast()));
+                    _mm512_storeu_si512(row.cast(), _mm512_add_epi32(_mm512_loadu_si512(row.cast()), added));
+                }
             }
             credits[held_lo..held_hi].fill(held);
+        }
+    }
+}
+
+/// The times and the campaigns of clicks `from..from + 8` (of at most 16), a lane each, 0 in
+/// the lanes past the last click: four loads of two clicks, the fields picked by shuffles.
+/// The compiler made the plain copy into arrays a gather of 512-bit loads and permutes.
+///
+/// # Safety
+/// AVX-512 F and VL compiled in; `from` is 0 or 8.
+#[inline(always)]
+unsafe fn click_lanes(clicks: &[Click], from: usize) -> (__m256i, __m256i) {
+    const _: () = assert!(size_of::<Click>() == 16 && align_of::<Click>() >= 4);
+    const TS: i32 = (core::mem::offset_of!(Click, ts) / 4) as i32;
+    const CAMPAIGN: i32 = (core::mem::offset_of!(Click, campaign) / 4) as i32;
+    // SAFETY: the masked loads read the clicks that are there; the pointers are formed by
+    // `wrapping_add`.
+    unsafe {
+        // Of two registers of two clicks each: the four times, then the four campaigns.
+        let pick = _mm256_setr_epi32(TS, TS + 4, TS + 8, TS + 12, CAMPAIGN, CAMPAIGN + 4, CAMPAIGN + 8, CAMPAIGN + 12);
+        let live = ((1u64 << (2 * clicks.len())) - 1) >> (2 * from);
+        let load = |pair: usize| _mm256_maskz_loadu_epi64((live >> (4 * pair)) as __mmask8 & 0xF, clicks.as_ptr().wrapping_add(from + 2 * pair).cast());
+        let low = _mm256_permutex2var_epi32(load(0), pick, load(1));
+        let high = _mm256_permutex2var_epi32(load(2), pick, load(3));
+        (_mm256_permute2x128_si256::<0x20>(low, high), _mm256_permute2x128_si256::<0x31>(low, high))
+    }
+}
+
+/// `LATER[j]`: in lane `i` (of 16), the bit of lane `j` if `i` is past it. A lane's earlier
+/// lanes of its campaign are those `j` whose campaign it equals, each with its bit here.
+static LATER: [[u32; LIGHT]; LIGHT] = {
+    let mut table = [[0; LIGHT]; LIGHT];
+    let mut j = 0;
+    while j < LIGHT {
+        let mut i = j + 1;
+        while i < LIGHT {
+            table[j][i] = 1 << j;
+            i += 1;
+        }
+        j += 1;
+    }
+    table
+};
+
+/// `prefix[at]` for each session `at` and one more: the sessions before it on each day, 16
+/// days a row, in one 512-bit register or (`NARROW`) two of 256.
+///
+/// # Safety
+/// `days.len() + 1` rows at `prefix`; AVX-512 F (and VL for `NARROW`) compiled in.
+#[inline(always)]
+unsafe fn prefix_rows<const NARROW: bool>(prefix: *mut [u32; DAYS], days: &[u32]) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if NARROW {
+            let (mut low, mut high) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+            let one = _mm256_set1_epi32(1);
+            for (at, &day) in days.iter().enumerate() {
+                let row = prefix.add(at).cast::<u32>();
+                _mm256_storeu_si256(row.cast(), low);
+                _mm256_storeu_si256(row.add(8).cast(), high);
+                let bit = 1u32 << (day as usize & (DAYS - 1));
+                low = _mm256_mask_add_epi32(low, bit as __mmask8, low, one);
+                high = _mm256_mask_add_epi32(high, (bit >> 8) as __mmask8, high, one);
+            }
+            let row = prefix.add(days.len()).cast::<u32>();
+            _mm256_storeu_si256(row.cast(), low);
+            _mm256_storeu_si256(row.add(8).cast(), high);
+        } else {
+            let mut before = _mm512_setzero_si512();
+            let one = _mm512_set1_epi32(1);
+            for (at, &day) in days.iter().enumerate() {
+                _mm512_storeu_si512(prefix.add(at).cast(), before);
+                before = _mm512_mask_add_epi32(before, (1u32 << (day as usize & (DAYS - 1))) as __mmask16, before, one);
+            }
+            _mm512_storeu_si512(prefix.add(days.len()).cast(), before);
+        }
+    }
+}
+
+/// Of the 16 starts at `st`: how many are before `ts`, and how many at or before `end`.
+///
+/// # Safety
+/// 16 values at `st`; AVX-512 F (and VL for `NARROW`) compiled in.
+#[inline(always)]
+unsafe fn count_starts<const NARROW: bool>(st: *const u32, ts: u32, end: u32) -> (usize, usize) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        if NARROW {
+            let (low, high) = (_mm256_loadu_si256(st.cast()), _mm256_loadu_si256(st.add(8).cast()));
+            let (ts, end) = (_mm256_set1_epi32(ts as i32), _mm256_set1_epi32(end as i32));
+            (
+                (_mm256_cmplt_epu32_mask(low, ts).count_ones() + _mm256_cmplt_epu32_mask(high, ts).count_ones()) as usize,
+                (_mm256_cmple_epu32_mask(low, end).count_ones() + _mm256_cmple_epu32_mask(high, end).count_ones()) as usize,
+            )
+        } else {
+            let all = _mm512_loadu_si512(st.cast());
+            (_mm512_cmplt_epu32_mask(all, _mm512_set1_epi32(ts as i32)).count_ones() as usize, _mm512_cmple_epu32_mask(all, _mm512_set1_epi32(end as i32)).count_ones() as usize)
         }
     }
 }
@@ -463,6 +673,9 @@ mod tests {
                 attr.person(&twins(n, ids), &starts, &days, &mut credits, &mut assisted);
                 assert!(crate::ambiguous_tie(), "{n} clicks");
                 crate::reset_tie();
+                attr.person_narrow(&twins(n, ids), &starts, &days, &mut credits, &mut assisted);
+                assert!(crate::ambiguous_tie(), "{n} clicks, narrow");
+                crate::reset_tie();
                 sort_clicks_for_test(&mut twins(n, ids));
                 assert!(crate::ambiguous_tie(), "{n} clicks sorted");
             }
@@ -487,6 +700,10 @@ mod tests {
         let (mut wide, mut by_sort) = (Attr::new(ctx.campaigns.len()), Attr::new(ctx.campaigns.len()));
         (wide.sorted, by_sort.sorted) = (false, true);
         let mut by_sorted = vec![0u32; ctx.campaigns.len() * DAYS];
+        // And both in 256-bit registers.
+        let (mut narrow, mut narrow_sort) = (Attr::new(ctx.campaigns.len()), Attr::new(ctx.campaigns.len()));
+        (narrow.sorted, narrow_sort.sorted) = (false, true);
+        let (mut by_narrow, mut by_narrow_sorted) = (vec![0u32; ctx.campaigns.len() * DAYS], vec![0u32; ctx.campaigns.len() * DAYS]);
         let mut interval = attr_interval::Attr::new(&ctx);
         let cells = ctx.campaigns.len() * ctx.n_days;
         let (mut by_wide, mut by_interval) = (vec![0u32; ctx.campaigns.len() * DAYS], vec![0u32; cells]);
@@ -529,6 +746,11 @@ mod tests {
             let mut got_sorted = vec![organic; starts.len()];
             by_sort.person(&clicks, &starts, &days, &mut got_sorted, &mut by_sorted);
             assert_eq!(got, got_sorted, "person {person}: {clicks_n} clicks, {} sessions, table against sort", starts.len());
+            for (attr, assisted, what) in [(&mut narrow, &mut by_narrow, "narrow"), (&mut narrow_sort, &mut by_narrow_sorted, "narrow sort")] {
+                let mut got_narrow = vec![organic; starts.len()];
+                attr.person_narrow(&clicks, &starts, &days, &mut got_narrow, assisted);
+                assert_eq!(got, got_narrow, "person {person}: {clicks_n} clicks, {} sessions, {what}", starts.len());
+            }
             let sorted = sort_clicks_for_test(&mut clicks);
             let want: Vec<u32> = starts.iter().zip(&days).map(|(&start, &day)| interval.session(&sorted, start, day as usize, organic, &mut by_interval)).collect();
             interval.end_person(&mut by_interval);
@@ -538,6 +760,8 @@ mod tests {
             for day in 0..ctx.n_days {
                 assert_eq!(by_wide[campaign * DAYS + day], by_interval[day * ctx.campaigns.len() + campaign], "campaign {campaign}, day {day}");
                 assert_eq!(by_sorted[campaign * DAYS + day], by_interval[day * ctx.campaigns.len() + campaign], "sorted: campaign {campaign}, day {day}");
+                assert_eq!(by_narrow[campaign * DAYS + day], by_interval[day * ctx.campaigns.len() + campaign], "narrow: campaign {campaign}, day {day}");
+                assert_eq!(by_narrow_sorted[campaign * DAYS + day], by_interval[day * ctx.campaigns.len() + campaign], "narrow sorted: campaign {campaign}, day {day}");
             }
             assert!(by_wide[campaign * DAYS + ctx.n_days..(campaign + 1) * DAYS].iter().all(|&count| count == 0));
         }

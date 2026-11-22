@@ -12,6 +12,10 @@
 //!   every time is skipped).
 //!
 //! Without AVX-512 F at build time this is `sort_unstable`.
+//!
+//! `sort_narrow` is the same in 256-bit registers (`dense_walk` says why): up to 8 times are
+//! one register through a network of six layers, up to 16 two registers, each sorted so and
+//! then merged by four layers more.
 
 /// From this many times on, by bytes.
 const RADIX: usize = 384;
@@ -28,18 +32,52 @@ pub(crate) fn sort(times: &mut [u32], _scratch: &mut Scratch) {
     times.sort_unstable();
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl")))]
+pub(crate) fn sort_narrow(times: &mut [u32], scratch: &mut Scratch) {
+    sort(times, scratch)
+}
+
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 pub(crate) fn sort(times: &mut [u32], scratch: &mut Scratch) {
+    sort_as::<false>(times, scratch)
+}
+
+/// `sort` with no register wider than 256 bits.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"))]
+pub(crate) fn sort_narrow(times: &mut [u32], scratch: &mut Scratch) {
+    sort_as::<true>(times, scratch)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+fn sort_as<const NARROW: bool>(times: &mut [u32], scratch: &mut Scratch) {
     let n = times.len();
     if n <= 16 {
         if n >= 2 {
             // SAFETY: `n` lanes at `times`.
-            unsafe { leaf(times.as_mut_ptr(), n) };
+            unsafe { leaf_as::<NARROW>(times.as_mut_ptr(), n) };
         }
     } else if n < RADIX {
-        merged(times, &mut scratch.spare);
+        merged::<NARROW>(times, &mut scratch.spare);
     } else {
         by_bytes(times, scratch);
+    }
+}
+
+/// `leaf`, or `leaf_narrow` for `NARROW`.
+///
+/// # Safety
+/// As `leaf`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+#[inline(always)]
+unsafe fn leaf_as<const NARROW: bool>(at: *mut u32, n: usize) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        #[cfg(target_feature = "avx512vl")]
+        if NARROW {
+            return leaf_narrow(at, n);
+        }
+        leaf(at, n)
     }
 }
 
@@ -134,15 +172,110 @@ unsafe fn leaf(at: *mut u32, n: usize) {
     }
 }
 
+/// One layer of a sorting network on 8 lanes: each lane against its `partner`, the lanes of
+/// `LARGER` keeping the larger of the two.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"))]
+#[inline(always)]
+fn layer<const LARGER: i32>(v: core::arch::x86_64::__m256i, partner: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::*;
+    // SAFETY: AVX2 is compiled in.
+    unsafe { _mm256_blend_epi32::<LARGER>(_mm256_min_epu32(v, partner), _mm256_max_epu32(v, partner)) }
+}
+
+/// Each lane's partner in a layer of 8: lane `i ^ 1`, `i ^ 2`, `i ^ 3`, `i ^ 4` or `i ^ 7`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"))]
+mod partner {
+    use core::arch::x86_64::*;
+
+    #[inline(always)]
+    pub(super) fn one(v: __m256i) -> __m256i {
+        // SAFETY: AVX2 is compiled in.
+        unsafe { _mm256_shuffle_epi32::<0b10_11_00_01>(v) }
+    }
+
+    #[inline(always)]
+    pub(super) fn two(v: __m256i) -> __m256i {
+        // SAFETY: as above.
+        unsafe { _mm256_shuffle_epi32::<0b01_00_11_10>(v) }
+    }
+
+    #[inline(always)]
+    pub(super) fn three(v: __m256i) -> __m256i {
+        // SAFETY: as above.
+        unsafe { _mm256_shuffle_epi32::<0b00_01_10_11>(v) }
+    }
+
+    #[inline(always)]
+    pub(super) fn four(v: __m256i) -> __m256i {
+        // SAFETY: as above.
+        unsafe { _mm256_permute4x64_epi64::<0b01_00_11_10>(v) }
+    }
+
+    #[inline(always)]
+    pub(super) fn seven(v: __m256i) -> __m256i {
+        // SAFETY: as above.
+        unsafe { _mm256_permutevar8x32_epi32(v, _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0)) }
+    }
+}
+
+/// 8 lanes sorted: the bitonic sorter's first six layers, as `network` lays them out for 16.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"))]
+#[inline(always)]
+fn sort8(v: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
+    let v = layer::<0b1010_1010>(v, partner::one(v));
+    let v = layer::<0b1100_1100>(v, partner::three(v));
+    let v = layer::<0b1010_1010>(v, partner::one(v));
+    clean8(layer::<0b1111_0000>(v, partner::seven(v)))
+}
+
+/// 8 lanes in a bitonic order sorted: each lane against the one 4, 2 and 1 lanes away.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"))]
+#[inline(always)]
+fn clean8(v: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
+    let v = layer::<0b1111_0000>(v, partner::four(v));
+    let v = layer::<0b1100_1100>(v, partner::two(v));
+    layer::<0b1010_1010>(v, partner::one(v))
+}
+
+/// `leaf` in 256-bit registers. Up to 8 times are one register through `sort8`. Up to 16 are
+/// two, each through `sort8`, then lane `i` of the first against lane `7 - i` of the second
+/// (the sorter's layer of 16): the 8 smaller and the 8 larger are then each in a bitonic
+/// order, and `clean8` sorts each.
+///
+/// # Safety
+/// As `leaf`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"))]
+#[inline(always)]
+unsafe fn leaf_narrow(at: *mut u32, n: usize) {
+    use core::arch::x86_64::*;
+    // SAFETY: masked loads and stores touch the `n` live lanes only; the rest is registers.
+    unsafe {
+        // The lanes past the times hold the largest value, and stay behind them.
+        let max = _mm256_set1_epi32(-1);
+        if n <= 8 {
+            let live = ((1u32 << n) - 1) as __mmask8;
+            let v = sort8(_mm256_mask_loadu_epi32(max, live, at.cast()));
+            _mm256_mask_storeu_epi32(at.cast(), live, v);
+        } else {
+            let live = ((1u32 << (n - 8)) - 1) as __mmask8;
+            let low = sort8(_mm256_loadu_si256(at.cast()));
+            let high = partner::seven(sort8(_mm256_mask_loadu_epi32(max, live, at.add(8).cast())));
+            let (small, large) = (clean8(_mm256_min_epu32(low, high)), clean8(_mm256_max_epu32(low, high)));
+            _mm256_storeu_si256(at.cast(), small);
+            _mm256_mask_storeu_epi32(at.add(8).cast(), live, large);
+        }
+    }
+}
+
 /// 17 to `RADIX` times: leaves of 16, then merges of twice the width each round.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
-fn merged(times: &mut [u32], spare: &mut Vec<u32>) {
+fn merged<const NARROW: bool>(times: &mut [u32], spare: &mut Vec<u32>) {
     let n = times.len();
     // SAFETY: a leaf is at most 16 lanes inside `times`.
     unsafe {
         let mut at = 0;
         while at < n {
-            leaf(times.as_mut_ptr().add(at), (n - at).min(16));
+            leaf_as::<NARROW>(times.as_mut_ptr().add(at), (n - at).min(16));
             at += 16;
         }
     }
@@ -263,8 +396,11 @@ mod tests {
                     let mut times: Vec<u32> = (0..n).map(|_| base + (next() % spread) as u32).collect();
                     let mut want = times.clone();
                     want.sort_unstable();
+                    let mut narrow = times.clone();
                     sort(&mut times, &mut scratch);
                     assert_eq!(times, want, "{n} times over {spread}");
+                    sort_narrow(&mut narrow, &mut scratch);
+                    assert_eq!(narrow, want, "{n} times over {spread}, narrow");
                 }
             }
         }

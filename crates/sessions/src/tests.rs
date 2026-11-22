@@ -284,7 +284,7 @@ fn matches_the_reference_on_random_buckets() {
                 numbered.swap(at, rng.below(at as u64 + 1) as usize);
             }
             let cut = rng.below(keys.len() as u64 + 1) as usize;
-            for (net, wide_walk) in [(true, true), (false, true), (true, false), (false, false)] {
+            for (net, wide_walk, narrow) in [(true, true, false), (false, true, false), (true, false, false), (false, false, false), (true, true, true), (false, true, true), (true, false, true)] {
                 let mut agg = Agg::new(&ctx);
                 crate::partitioned::bucket_dense_as(
                     &ctx,
@@ -299,6 +299,7 @@ fn matches_the_reference_on_random_buckets() {
                     &mut agg,
                     net,
                     wide_walk,
+                    narrow,
                 );
                 let rows = &agg.user_daily;
                 let mut user_rows: Vec<UserRow> = (0..rows.person.len())
@@ -310,8 +311,8 @@ fn matches_the_reference_on_random_buckets() {
                     .map(|i| (rows.campaign[i], rows.day[i], rows.sessions[i], rows.purchasing_sessions[i], rows.revenue_cents[i], rows.assisted_sessions[i]))
                     .collect();
                 campaign_rows.sort();
-                assert_eq!(user_rows, want.0, "dense user_daily, seed {seed}, sort {net}, walk {wide_walk}");
-                assert_eq!(campaign_rows, want.1, "dense campaign_daily, seed {seed}, sort {net}, walk {wide_walk}");
+                assert_eq!(user_rows, want.0, "dense user_daily, seed {seed}, sort {net}, walk {wide_walk}, narrow {narrow}");
+                assert_eq!(campaign_rows, want.1, "dense campaign_daily, seed {seed}, sort {net}, walk {wide_walk}, narrow {narrow}");
             }
         }
     }
