@@ -243,6 +243,18 @@ impl<T: Copy> Chunks<T> {
         self.spare.push(chunk);
     }
 
+    /// Every stretch of memory the lists own and have written, as `(address, bytes)`: the
+    /// staging, the first block's used part, any further block whole. For a thread that hands
+    /// them back once the lists are dead (`SS_REAP`); chunks given by other lists are theirs.
+    pub fn used(&self, mut each: impl FnMut(usize, usize)) {
+        each(self.stage.ptr as usize, self.stage.layout.size());
+        for (at, arena) in self.arenas.iter().enumerate() {
+            let last = at + 1 == self.arenas.len();
+            let bytes = if last { self.next - arena.ptr as usize } else { arena.layout.size() };
+            each(arena.ptr as usize, bytes);
+        }
+    }
+
     /// Chunks given and not yet taken.
     pub fn spare(&self) -> usize {
         self.spare.len()

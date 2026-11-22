@@ -37,6 +37,13 @@ pub struct DenseBuckets {
 }
 
 impl DenseBuckets {
+    /// The lists' own stretches (`Chunks::used`).
+    pub fn used(&self, mut each: impl FnMut(usize, usize)) {
+        self.keys.used(&mut each);
+        self.pays.used(&mut each);
+        self.clicks.used(&mut each);
+    }
+
     /// Room for a worker's share of `events` and `clicks`, and a chunk a list to begin with.
     fn new(buckets: usize, events: usize, clicks: usize, workers: usize) -> DenseBuckets {
         let share = |rows: usize, size: usize| rows / workers * size * 9 / 8 + buckets * 4096 + (2 << 20);
@@ -396,6 +403,14 @@ pub struct Staged {
     /// The buckets as ranges of the persons' numbers (`Scattered::dense`): the shift from a
     /// number less one to its bucket, and the buckets.
     pub dense: Option<(u32, usize)>,
+    /// The parse's lists, as `(address, bytes)` stretches (`Chunks::used`): never read
+    /// again once the sessions stage is done (where their chunks went to the buckets' lists,
+    /// those are done with them too), and never freed to the allocator, so nothing else can
+    /// come to live there (`SS_REAP`).
+    pub parsed: Vec<(usize, usize)>,
+    /// Whether those are dead already, with the dedup stage: none of their chunks went to
+    /// the buckets' lists (`SS_RECYCLE=off`).
+    pub parsed_dead: bool,
 }
 
 /// What a person's place is called.
@@ -568,10 +583,18 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     lap("dedup");
     // The parse's lists are dead. Where their chunks went to the buckets' lists they stay,
     // with those, to the end of the run; else each worker hands its own back now.
-    if types::mem::free_early() && !recycle {
+    // With `SS_REAP=on` the reaper hands them back beside the sessions stage instead (`main`).
+    if types::mem::free_early() && !recycle && types::env::pick("SS_REAP", &["off", "on"]) == 0 {
         par::each(&mut parsed, |_, out| out.release());
     }
-    // The exit path skips destructors (`fast-exit`), and these are large.
+    let mut stretches = Vec::new();
+    for out in &parsed {
+        out.events.used(|at, bytes| stretches.push((at, bytes)));
+        out.long_events.used(|at, bytes| stretches.push((at, bytes)));
+        out.clicks.used(|at, bytes| stretches.push((at, bytes)));
+    }
+    // The exit path skips destructors (`fast-exit`), and these are large. Forgotten, their
+    // memory is never given out again (`Staged::parsed`).
     std::mem::forget(parsed);
-    Some(Staged { scattered, names: Names { plan, persons }, dense })
+    Some(Staged { scattered, names: Names { plan, persons }, dense, parsed: stretches, parsed_dead: !recycle })
 }

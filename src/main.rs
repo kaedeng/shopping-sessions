@@ -124,6 +124,10 @@ fn hand_back(workers: usize) {
             // workers come out even.
             const PIECE: usize = 8 << 20;
             let mut states = vec![(); workers.max(1)];
+            // `SS_EXIT_WORKERS=N`: that many of them (all when unset). Eight threads handing
+            // pages back at once share the kernel's locks on the page lists and the
+            // container's counters, and each one's TLB flushes interrupt the other seven.
+            par::limit(types::env::number("SS_EXIT_WORKERS", usize::MAX).max(1));
             par::run(&mut states, (to - from).div_ceil(PIECE), |_, _, piece| {
                 let start = from + piece * PIECE;
                 // SAFETY: whole pages of the reservation; nothing reads a large block after
@@ -142,6 +146,88 @@ fn hand_back(workers: usize) {
     }
     #[cfg(not(feature = "alloc-region"))]
     let _ = workers;
+}
+
+/// `SS_REAP=on|off` (off by default): a thread of its own that hands dead stretches back to
+/// the kernel (`MADV_DONTNEED`, 4 MB at a time) while the workers go on: the parse's lists
+/// once the dedup stage is done with them (with `SS_RECYCLE=off`; else once the sessions
+/// stage is, since their chunks hold the buckets' lists), the buckets' lists once the
+/// sessions stage is.
+///
+/// The exit unmaps what a run still holds on one thread, after the output, and that thread's
+/// time is in the run's (51 ms at 20M events on the x86 box with 4 KB pages). Handed back by
+/// all eight workers first (`hand_back`) it was 8% faster there and 19 ms slower on the
+/// scorer, where eight threads freeing pages at once share the kernel's locks and flush each
+/// other's TLBs. One thread beside the output stage pays the exit's price per page, not
+/// eight times it, and pays it before the exit. The exit stops it wherever it is: what it
+/// handed back by then is what the exit does not unmap.
+struct Reaper {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Bytes handed back so far.
+    done: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    started: Instant,
+    handle: std::thread::JoinHandle<()>,
+    /// Where more stretches go (`give`).
+    more: std::sync::mpsc::Sender<Vec<(usize, usize)>>,
+    bytes: usize,
+}
+
+impl Reaper {
+    const PIECE: usize = 4 << 20;
+
+    /// A thread that waits for stretches (`give`) and hands each back as it comes.
+    fn start() -> Reaper {
+        use std::sync::atomic::Ordering::Relaxed;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (more, coming) = std::sync::mpsc::channel::<Vec<(usize, usize)>>();
+        let (stopping, counting) = (stop.clone(), done.clone());
+        let handle = std::thread::Builder::new()
+            .name("reaper".into())
+            .stack_size(64 << 10)
+            .spawn(move || {
+                for stretches in coming {
+                    for (at, bytes) in stretches {
+                        let mut from = at;
+                        while from < at + bytes {
+                            if stopping.load(Relaxed) {
+                                return;
+                            }
+                            let piece = Self::PIECE.min(at + bytes - from);
+                            // SAFETY: dead memory of the run (`give`'s contract).
+                            unsafe { types::mem::release(from as *const u8, piece) };
+                            counting.fetch_add(piece, Relaxed);
+                            from += piece;
+                        }
+                    }
+                }
+            })
+            .expect("the reaper's thread");
+        Reaper { stop, done, started: Instant::now(), handle, more, bytes: 0 }
+    }
+
+    /// More stretches to hand back, after those given before.
+    ///
+    /// # Safety
+    /// Nothing reads them again, and the allocator never gives them out again.
+    unsafe fn give(&mut self, stretches: Vec<(usize, usize)>) {
+        self.bytes += stretches.iter().map(|&(_, bytes)| bytes).sum::<usize>();
+        drop(self.more.send(stretches));
+    }
+
+    /// Before the exit: under `SS_TIMING`, how far it got; with `join`, it is stopped and
+    /// waited for (so that `hand_back` does not run beside it).
+    fn finish(self, timing: bool, join: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if join {
+            self.stop.store(true, Relaxed);
+            drop(self.more);
+            drop(self.handle.join());
+        }
+        if timing {
+            eprintln!("reaper: {} of {} MB handed back by {:.1} ms into the run", self.done.load(Relaxed) >> 20, self.bytes >> 20, self.started.elapsed().as_secs_f64() * 1e3);
+        }
+    }
 }
 
 fn main() {
@@ -242,6 +328,14 @@ fn run() -> Result<(), String> {
     // clicks open (`ingest::opaque::click_id_at`): then with those IDs whole.
     #[cfg(feature = "pipe-positional")]
     let mut whole_clicks = types::env::pick("SS_CLICK_IDS", &["first", "whole"]) == 1;
+    // `SS_REAP=on`: one more thread hands dead lists back while the workers go on (`Reaper`):
+    // the parse's lists as soon as nothing reads them (after the dedup stage where their
+    // chunks were not recycled into the buckets' lists, else after the sessions stage), the
+    // buckets' lists after the sessions stage.
+    #[allow(unused_mut)]
+    let mut reaper: Option<Reaper> = (free_early && opaque && types::env::pick("SS_REAP", &["off", "on"]) == 1).then(Reaper::start);
+    #[allow(unused_mut)]
+    let mut reapable: Vec<(usize, usize)> = Vec::new();
     let (mut scattered, mut aggs, names, spilled_partitions, spilled_events, spilled_clicks) = loop {
         // Stages 1 and 2: the person buckets, by the pipeline picked.
         #[cfg(feature = "pipe-positional")]
@@ -270,6 +364,11 @@ fn run() -> Result<(), String> {
             {
                 dense_plan = staged.dense;
                 names = Some(staged.names);
+                match &mut reaper {
+                    // SAFETY: the parse's lists, forgotten and dead (`Staged::parsed`).
+                    Some(reaper) if staged.parsed_dead => unsafe { reaper.give(staged.parsed) },
+                    _ => reapable.extend(staged.parsed),
+                }
                 (staged.scattered, spilled(0, 0))
             }
             #[cfg(not(feature = "pipe-positional"))]
@@ -380,6 +479,19 @@ fn run() -> Result<(), String> {
         break (scattered, aggs, names, spilled_partitions, spilled_events, spilled_clicks);
     };
 
+    // `SS_REAP=on`: the buckets' lists are dead now, and the parse's that were held back.
+    #[cfg(feature = "pipe-positional")]
+    if let Some(reaper) = &mut reaper {
+        for mine in &scattered {
+            if let Some(dense) = &mine.dense {
+                dense.used(|at, bytes| reapable.push((at, bytes)));
+            }
+        }
+        // SAFETY: read by the sessions stage, which is done; `scattered` is never dropped
+        // before the exit, and the parse's lists are forgotten.
+        unsafe { reaper.give(std::mem::take(&mut reapable)) };
+    }
+
     let (user_folder, campaign_folder) = (out.join("user_daily"), out.join("campaign_daily"));
     for folder in [&user_folder, &campaign_folder] {
         std::fs::create_dir_all(folder).map_err(|error| format!("{}: {error}", folder.display()))?;
@@ -433,8 +545,12 @@ fn run() -> Result<(), String> {
     // Slot `fast-exit`: the files are written, so skip the destructors and let the kernel
     // reclaim; what is large goes back first, on all the workers (`hand_back`).
     if cfg!(feature = "fast-exit") {
+        if let Some(reaper) = reaper {
+            reaper.finish(timing, types::env::pick("SS_EXIT", &["leave", "release"]) == 1);
+        }
         hand_back(workers);
         std::process::exit(0);
     }
+    drop(reaper);
     Ok(())
 }
