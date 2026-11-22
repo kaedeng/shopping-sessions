@@ -24,7 +24,7 @@ COPY src/ src/
 #   Cascade Lake Xeons the microcode fix for the jump erratum (SKX102) keeps such a jump out
 #   of the decoded-instruction cache. No use on Ice Lake or later, nor on AMD.
 ARG CPU=cascadelake
-ARG EXTRA_RUSTFLAGS="-C llvm-args=-x86-branches-within-32B-boundaries"
+ARG EXTRA_RUSTFLAGS="-C llvm-args=-x86-branches-within-32B-boundaries -C llvm-args=-x86-pad-max-prefix-size=5"
 # One static, non-relocatable binary: the C library is linked in, so the image below is the
 # binary alone, and a start is an exec with no loader, no libraries to map and no relocations
 # to apply (about 1 ms of a 17 ms run at 1M events, and what `docker run` adds on top).
@@ -71,5 +71,5 @@ WORKDIR /app
 #
 # The two set here are what scored best on the scorer: 0.6351 s without them, 0.6115 s
 # with them, 0.6076 s with the two parse and sessions commits that followed.
-ENV SS_RUN=1 SS_POPULATE=1024 SS_PART_BITS_OPAQUE=10
+ENV SS_RUN=1 SS_POPULATE=1024 SS_COLLAPSE=on SS_DECODE=lean SS_PART_BITS_OPAQUE=11 SS_CHUNK_KB=128 SS_TAIL=small SS_SESS_WIDTH=256 SS_ATTR_HEAVY=flat
 CMD ["/app/shopping-sessions"]
