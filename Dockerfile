@@ -1,7 +1,14 @@
 # Shopping Sessions: a custom Rust engine (no Polars). implementation.md describes it.
 # The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
 # no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
-FROM rust:1.98-slim-trixie AS build
+#
+# The build image by its digest, not by its tag alone: a tag is moved when the image is
+# rebuilt (a new Debian point release, a new C library patch), and the C library is linked
+# into the binary. This is the image the tag named on 2026-11-22, which the measured and
+# scored builds up to then were made with. The digest is of the tag's whole list of
+# platforms, so the line still pins none. To move it: `docker buildx imagetools inspect
+# rust:<tag>`, then check and measure the result.
+FROM rust:1.98-slim-trixie@sha256:4cd829461bd5c4d511c32e269da9cb8929223b666519d8004e35fc8d1d771ab7 AS build
 WORKDIR /src
 
 COPY Cargo.toml Cargo.lock ./
@@ -53,6 +60,9 @@ WORKDIR /app
 #                            sleeps (300): a watching thread slows its core's other thread.
 # - SS_PART_BITS_OPAQUE=N    log2 of the event lists (11 at 20M events): two workers on
 #                            one core share its 1 MB L2.
+# - SS_FALLBACK=on|off       a run that dies (a fault, a panic, an error) starts over as the
+#                            classic pipeline, seconds where this one takes tenths
+#                            (`src/fallback.rs`); `off` lets it die.
 # - SS_PROBE=sleep           the machine as a number: the run takes 0.1 s times it longer
 #                            (`probe::code` has the digits). The scorer shows no stderr.
 # `scripts/variant.sh NAME SWITCH...` makes the branch `runner/NAME` with the line below
