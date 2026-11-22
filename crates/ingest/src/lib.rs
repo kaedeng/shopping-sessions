@@ -510,6 +510,16 @@ fn read_at(file: &File, buf: &mut [u8], at: usize) -> std::io::Result<()> {
 #[cfg(feature = "pipe-positional")]
 const READ_SLACK: usize = 4096;
 
+/// Bytes `Ingest::read` leaves readable before the chunk it reads, at least: a kernel may
+/// read a few bytes before a line (`pos`).
+#[cfg(feature = "pipe-positional")]
+pub(crate) const READ_LEAD: usize = 64;
+
+/// Room a read buffer needs beyond the bytes read and `PAD`: the lead, and up to a page more
+/// to put the bytes at the file's own offset within a page (`Ingest::read`).
+#[cfg(feature = "pipe-positional")]
+pub(crate) const READ_ROOM: usize = READ_LEAD + 4096;
+
 /// The lines of a buffer that begin in bytes `start..end`: a cut by bytes, so planning reads
 /// none of the file but its ends. `Ingest::seg` finds the lines when the segment is parsed, by
 /// the worker that then reads those bytes anyway. Byte `start - 1` is readable, byte
@@ -637,6 +647,9 @@ pub struct Ingest {
     /// The positional parse reads its chunks with `pread` (`read`); `SS_POS_READER`.
     #[cfg(feature = "pipe-positional")]
     pread: bool,
+    /// Where `read` puts a chunk within a page, past the file's own offset; `SS_READ_ALIGN`.
+    #[cfg(feature = "pipe-positional")]
+    read_align: usize,
     /// How the partitions are written: `types::parts::mode_from_env` (slot `scatter-wc`).
     scatter: Option<usize>,
     /// Slot `reader-populate`, picked by `SS_READER=populate`.
@@ -717,6 +730,8 @@ impl Ingest {
             campaigns: prepared.campaigns,
             #[cfg(feature = "pipe-positional")]
             pread: env::pick("SS_POS_READER", &["pread", "mmap"]) == 0,
+            #[cfg(feature = "pipe-positional")]
+            read_align: env::number("SS_READ_ALIGN", 0),
             scatter: types::parts::mode_from_env(),
             #[cfg(all(feature = "reader-populate", target_os = "linux"))]
             populate: false,
@@ -795,9 +810,16 @@ impl Ingest {
         let bytes = to - from;
         // The bytes past the read are an earlier read's or zeros: readable, like a
         // mapping's bytes past a segment.
-        if buf.len() < bytes + PAD {
-            buf.resize(bytes + PAD, 0);
+        if buf.len() < READ_ROOM + bytes + PAD {
+            buf.resize(READ_ROOM + bytes + PAD, 0);
         }
+        // The bytes go where their offset within a page is the file's (plus `SS_READ_ALIGN`,
+        // for measurements): the kernel copies page by page, and how fast depends on how the
+        // two line up. With the chunk 64 bytes into a page-aligned buffer the copy took twice
+        // as long as with it 0 or 1 byte in (x86 box, 20M: 870 against 450 ms of system time).
+        let align = self.read_align.wrapping_add(from).wrapping_sub(buf.as_ptr() as usize) % 4096;
+        let lead = if align < READ_LEAD { align + 4096 } else { align };
+        let buf = &mut buf[lead..];
         read_at(file, &mut buf[..bytes], from).ok()?;
         // As `seg`: after the first `\n` at or after byte `start - 1`, to after the first
         // at or after byte `end - 1`.

@@ -15,8 +15,9 @@ use crate::id::{self, Id};
 pub const MASK: u64 = (1 << 40) - 1;
 const A: u64 = 0x9E37_79B9_7F4B;
 const B: u64 = 0xD6E8_FEB8_6659;
-const INV_A: u64 = inverse(A);
-const INV_B: u64 = inverse(B);
+/// The multipliers' inverses modulo 2^40, for kernels that undo the scramble themselves.
+pub const INV_A: u64 = inverse(A);
+pub const INV_B: u64 = inverse(B);
 /// A user number is `person << ALIAS_BITS | alias` (`ALIAS_SLOTS` in `generator/src/user.rs`).
 pub const ALIAS_BITS: u32 = 9;
 pub const ALIAS_MASK: u32 = (1 << ALIAS_BITS) - 1;

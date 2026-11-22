@@ -127,6 +127,18 @@ impl Dates {
         unreachable!("a multiplier separating {} dates", keys.len())
     }
 
+    /// Every date of the table: its text `YYYY-MM-DDT` and its midnight in ms after
+    /// `Ctx::origin` (a date may come more than once).
+    #[cfg_attr(not(feature = "pipe-positional"), allow(dead_code))]
+    pub(crate) fn each(&self, mut date: impl FnMut([u8; 11], i64)) {
+        for slot in self.slots.iter() {
+            let mut text = [0u8; 11];
+            text[..8].copy_from_slice(&slot.head.to_le_bytes());
+            text[3..].copy_from_slice(&slot.tail.to_le_bytes());
+            date(text, slot.ms);
+        }
+    }
+
     /// Bytes 0..19, `YYYY-MM-DDTHH:MM:SS`: (valid with a date in the table, ms after origin, epoch seconds).
     ///
     /// # Safety

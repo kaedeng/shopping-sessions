@@ -34,9 +34,11 @@ use crate::{Ingest, ingest_slow, price_cents};
     target_feature = "avx512bw",
     target_feature = "avx512dq",
     target_feature = "avx512cd",
-    target_feature = "bmi2"
+    target_feature = "avx512vl",
+    target_feature = "bmi2",
+    target_feature = "lzcnt"
 ))]
-const DECODES: &[&str] = &["fused", "wide", "row"];
+const DECODES: &[&str] = &["kernel", "fused", "wide", "row"];
 #[cfg(all(
     target_arch = "x86_64",
     target_feature = "avx512f",
@@ -119,8 +121,9 @@ impl PosOut {
             odd_clicks: Vec::new(),
             scratch: Scratch::new(),
             // What `Ingest::read` takes for a chunk: untouched until read into, or `touch`.
-            input: vec![0; chunk + crate::READ_SLACK + 1 + crate::PAD],
+            input: vec![0; crate::READ_ROOM + chunk + crate::READ_SLACK + 1 + crate::PAD],
             file: None,
+            lead: 0,
         }
     }
 
@@ -188,6 +191,9 @@ pub struct PosPlan {
     /// Event lines read by their shape straight into the wide decode (`fused`), no tokenizer
     /// between; `SS_POS_DECODE`.
     pub fused: bool,
+    /// Event lines turned into numbers where they are read, by tables (`kern`);
+    /// `SS_POS_DECODE`. The click lines are then read as `fused` reads them.
+    pub kernel: bool,
 }
 
 impl PosPlan {
@@ -217,6 +223,8 @@ pub struct PosOut {
     /// it was read from, kept open for the next.
     input: Vec<u8>,
     file: Option<(usize, std::fs::File)>,
+    /// Bytes readable before the chunk being parsed (`parse_with`).
+    lead: usize,
 }
 
 impl PosOut {
@@ -415,7 +423,8 @@ impl Ingest {
             click_parts: shape.click_parts,
             wide: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "wide",
             // The fused decode finds a date among the table's months, one step each.
-            fused: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "fused" && self.few_months(),
+            fused: ["fused", "kernel"].contains(&DECODES[types::env::pick("SS_POS_DECODE", DECODES)]) && self.few_months(),
+            kernel: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "kernel",
         }
     }
 
@@ -498,6 +507,9 @@ pub(crate) fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, plan: &PosPlan, tas
     let mut input = std::mem::take(&mut out.input);
     let read = ingest.read(seg, &mut input, &mut out.file);
     let (p, len) = read.unwrap_or_else(|| ingest.seg(seg));
+    // A chunk that was read has `READ_LEAD` bytes before it; of a mapped one only the byte
+    // before its lines is known to be there.
+    out.lead = if read.is_some() { crate::READ_LEAD } else { 1 };
     let dates = &ingest.dates;
     // SAFETY: `plan` made every task a segment, and `read` gives one as `seg` does: whole
     // lines, the byte before them and `PAD` bytes after them readable.
@@ -524,6 +536,21 @@ pub(crate) fn parse_with<T: Tok>(ingest: &Ingest, ctx: &Ctx, plan: &PosPlan, tas
 /// `p, len` is a segment.
 #[inline(always)]
 unsafe fn events<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &PosPlan, out: &mut PosOut) {
+    #[cfg(all(
+        feature = "tok-shape",
+        target_arch = "x86_64",
+        target_feature = "avx512f",
+        target_feature = "avx512bw",
+        target_feature = "avx512dq",
+        target_feature = "avx512cd",
+        target_feature = "avx512vl",
+        target_feature = "bmi2",
+        target_feature = "lzcnt"
+    ))]
+    if plan.kernel {
+        let lead = out.lead;
+        return unsafe { wide::fused::kern::events::<M>(p, len, lead, ctx, dates, plan, out) };
+    }
     #[cfg(all(
         feature = "tok-shape",
         target_arch = "x86_64",
@@ -1131,6 +1158,9 @@ pub(crate) mod wide {
     pub(super) mod fused {
         use super::*;
         use crate::tok::fused::{EVENT_WINDOW, click_shape, event_shape, masks};
+
+        #[cfg(all(target_feature = "avx512vl", target_feature = "lzcnt"))]
+        pub(in super::super) mod kern;
 
         /// The words of an event row, one array per word.
         const R_AT: usize = 0;
