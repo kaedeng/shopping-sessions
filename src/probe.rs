@@ -219,8 +219,8 @@ impl Probe {
     /// `Some` when `SS_PROBE` is set. Call before the workers are started.
     pub fn start() -> Option<Probe> {
         let probe = std::env::var_os("SS_PROBE")?;
-        // `init` reads nothing, so that the run is the plain one up to its wait.
-        if probe == "init" {
+        // `init` and `huge` read nothing, so that the run is the plain one up to its wait.
+        if probe == "init" || probe == "huge" {
             return Some(Probe { vmstat: String::new(), stat: String::new(), allowed: Vec::new(), started: Instant::now() });
         }
         Some(Probe { vmstat: read("/proc/vmstat").unwrap_or_default(), stat: read("/proc/stat").unwrap_or_default(), allowed: types::par::pin::allowed(), started: Instant::now() })
@@ -233,7 +233,21 @@ impl Probe {
     /// before it exits. With the same build's plain score beside it, the score less that one,
     /// over 10, is that round's time on the scorer: with `SS_COLLAPSE=on`, what the
     /// directory's collapses cost while every worker waits for them.
+    ///
+    /// `SS_PROBE=huge`: the run waits 20 ms for every 2 MB page of anonymous memory it holds at
+    /// the end (`AnonHugePages`), so (score - the plain score) / 0.02 s is how many of its
+    /// collapses (`SS_COLLAPSE`) the scorer made, which has no other huge pages: about 63
+    /// with `SS_COLLAPSE=on` at 20M events when every one succeeds, 0 when none does.
     pub fn finish(&self, data: &std::path::Path) {
+        if std::env::var_os("SS_PROBE").is_some_and(|value| value == "huge") {
+            let kb: u64 = read("/proc/self/smaps_rollup")
+                .and_then(|text| text.lines().find(|line| line.starts_with("AnonHugePages:")).and_then(|line| line.split_whitespace().nth(1)?.parse().ok()))
+                .unwrap_or(0);
+            let pages = kb / 2048;
+            eprintln!("probe: {pages} huge pages ({kb} kB), waiting 20 ms each");
+            std::thread::sleep(std::time::Duration::from_millis(20 * pages));
+            return;
+        }
         if std::env::var_os("SS_PROBE").is_some_and(|value| value == "init") {
             let took = std::time::Duration::from_nanos(INIT_NS.load(Relaxed));
             eprintln!("probe: init {:.2} ms, waiting ten times that", took.as_secs_f64() * 1e3);
