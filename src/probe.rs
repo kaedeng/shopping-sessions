@@ -207,13 +207,28 @@ fn code2() -> u64 {
 impl Probe {
     /// `Some` when `SS_PROBE` is set. Call before the workers are started.
     pub fn start() -> Option<Probe> {
-        std::env::var_os("SS_PROBE")?;
+        let probe = std::env::var("SS_PROBE").ok()?;
+        // `total` reads nothing, so that the run is the plain one up to its wait.
+        if probe == "total" {
+            return Some(Probe { vmstat: String::new(), stat: String::new(), allowed: Vec::new(), started: Instant::now() });
+        }
         Some(Probe { vmstat: read("/proc/vmstat").unwrap_or_default(), stat: read("/proc/stat").unwrap_or_default(), allowed: types::par::pin::allowed(), started: Instant::now() })
     }
 
     /// The report. `data` is the input folder. With `SS_PROBE=sleep`, the machine's number
     /// (`code`) as a wait instead.
+    ///
+    /// `SS_PROBE=total`: the run waits ten times its own time, from `main` to the output
+    /// written, before it exits. With the same build's plain score beside it, the score less
+    /// that one, over 10, is this program's part of the score; the rest is the container's
+    /// start and end and the exit's unmapping.
     pub fn finish(&self, data: &std::path::Path) {
+        if std::env::var_os("SS_PROBE").is_some_and(|value| value == "total") {
+            let took = self.started.elapsed();
+            eprintln!("probe: total {:.1} ms, waiting ten times that", took.as_secs_f64() * 1e3);
+            std::thread::sleep(took * 10);
+            return;
+        }
         if std::env::var_os("SS_PROBE").is_some_and(|value| value == "sleep") {
             let code = code(&self.allowed);
             eprintln!("probe: code {code}");
