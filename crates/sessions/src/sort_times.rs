@@ -15,7 +15,9 @@
 //!
 //! `sort_narrow` is the same in 256-bit registers (`dense_walk` says why): up to 8 times are
 //! one register through a network of six layers, up to 16 two registers, each sorted so and
-//! then merged by four layers more.
+//! then merged by four layers more. From 17 on the merges are of registers too: the merge
+//! above took one value a step, and each step waited for the loads the step before chose (7
+//! cycles a value, the larger part of the stage's sorting).
 
 /// From this many times on, by bytes.
 const RADIX: usize = 384;
@@ -25,6 +27,8 @@ const RADIX: usize = 384;
 pub(crate) struct Scratch {
     spare: Vec<u32>,
     counts: Vec<[u32; 256]>,
+    /// `merged_narrow`'s second buffer.
+    other: Vec<u32>,
 }
 
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
@@ -58,6 +62,10 @@ fn sort_as<const NARROW: bool>(times: &mut [u32], scratch: &mut Scratch) {
             unsafe { leaf_as::<NARROW>(times.as_mut_ptr(), n) };
         }
     } else if n < RADIX {
+        #[cfg(target_feature = "avx512vl")]
+        if NARROW {
+            return merged_narrow(times, &mut scratch.spare, &mut scratch.other);
+        }
         merged::<NARROW>(times, &mut scratch.spare);
     } else {
         by_bytes(times, scratch);
@@ -267,6 +275,97 @@ unsafe fn leaf_narrow(at: *mut u32, n: usize) {
     }
 }
 
+/// Two sorted registers as their 16 values sorted, the 8 smaller first: lane `i` of `a`
+/// against lane `7 - i` of `b`, then `clean8` of each (as in `leaf_narrow`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"))]
+#[inline(always)]
+fn merge16(a: core::arch::x86_64::__m256i, b: core::arch::x86_64::__m256i) -> (core::arch::x86_64::__m256i, core::arch::x86_64::__m256i) {
+    use core::arch::x86_64::*;
+    let b = partner::seven(b);
+    // SAFETY: AVX2 is compiled in.
+    unsafe { (clean8(_mm256_min_epu32(a, b)), clean8(_mm256_max_epu32(a, b))) }
+}
+
+/// 17 to `RADIX` times in 256-bit registers. The times go to `spare` with the largest value
+/// after them up to a multiple of 16, so that every run is a multiple of 8 long; leaves of
+/// 16 are sorted as in `leaf_narrow`, the runs merged pair by pair (`merge_narrow`) between
+/// `spare` and `other`, and the first `n` copied back.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"))]
+fn merged_narrow(times: &mut [u32], spare: &mut Vec<u32>, other: &mut Vec<u32>) {
+    use core::arch::x86_64::*;
+    let n = times.len();
+    let padded = n.next_multiple_of(16);
+    // 8 more: a merge reads the value after its second run.
+    spare.clear();
+    spare.extend_from_slice(times);
+    spare.resize(padded + 8, u32::MAX);
+    other.clear();
+    other.resize(padded + 8, u32::MAX);
+    // SAFETY: the leaves and the runs lie inside the `padded` values of both buffers; every
+    // round writes all of its target before the next reads it.
+    unsafe {
+        let mut at = 0;
+        while at < padded {
+            let leaf = spare.as_mut_ptr().add(at);
+            let (small, large) = merge16(sort8(_mm256_loadu_si256(leaf.cast())), sort8(_mm256_loadu_si256(leaf.add(8).cast())));
+            _mm256_storeu_si256(leaf.cast(), small);
+            _mm256_storeu_si256(leaf.add(8).cast(), large);
+            at += 16;
+        }
+        let (mut from, mut to) = (spare.as_mut_ptr(), other.as_mut_ptr());
+        let mut width = 16;
+        while width < padded {
+            let mut at = 0;
+            while at < padded {
+                let (middle, end) = ((at + width).min(padded), (at + 2 * width).min(padded));
+                if middle == end {
+                    std::ptr::copy_nonoverlapping(from.add(at), to.add(at), end - at);
+                } else {
+                    merge_narrow(from.add(at), middle - at, from.add(middle), end - middle, to.add(at));
+                }
+                at = end;
+            }
+            (from, to) = (to, from);
+            width *= 2;
+        }
+        std::ptr::copy_nonoverlapping(from, times.as_mut_ptr(), n);
+    }
+}
+
+/// `a` then `b`, each ascending and a multiple of 8 long, merged into `out` 8 values a step.
+/// A register holds the 8 largest values merged so far; each step merges it with the next 8
+/// of the run whose next value is the smaller (`merge16`), writes the 8 smaller and keeps the
+/// 8 larger. Every value it holds came before the next value of its own run, which is at
+/// least the chosen run's next, so the 8 written are below everything not yet written. The
+/// choice is a select of a pointer, not a jump.
+///
+/// # Safety
+/// `na` values at `a` and `nb` at `b`, both at least 8, and one more readable after them;
+/// room for `na + nb` at `out`, which overlaps neither.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl"))]
+#[inline(always)]
+unsafe fn merge_narrow(a: *const u32, na: usize, b: *const u32, nb: usize, out: *mut u32) {
+    use core::arch::x86_64::*;
+    // SAFETY: the caller's contract: a pointer read is at most one past its run (`a`'s is
+    // `b`'s first), a register load is of 8 values of the run that has them.
+    unsafe {
+        let (low, mut high) = merge16(_mm256_loadu_si256(a.cast()), _mm256_loadu_si256(b.cast()));
+        _mm256_storeu_si256(out.cast(), low);
+        let (mut i, mut j) = (8usize, 8usize);
+        for step in 1..(na + nb) / 8 - 1 {
+            let (left_a, left_b) = (i < na, j < nb);
+            let take_a = left_a & (!left_b | (*a.add(i) <= *b.add(j)));
+            let next = core::hint::select_unpredictable(take_a, a.wrapping_add(i), b.wrapping_add(j));
+            i += 8 * usize::from(take_a);
+            j += 8 * usize::from(!take_a);
+            let low;
+            (low, high) = merge16(high, _mm256_loadu_si256(next.cast()));
+            _mm256_storeu_si256(out.add(8 * step).cast(), low);
+        }
+        _mm256_storeu_si256(out.add(na + nb - 8).cast(), high);
+    }
+}
+
 /// 17 to `RADIX` times: leaves of 16, then merges of twice the width each round.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 fn merged<const NARROW: bool>(times: &mut [u32], spare: &mut Vec<u32>) {
@@ -331,7 +430,7 @@ unsafe fn merge(a: *const u32, na: usize, b: *const u32, nb: usize, out: *mut u3
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 fn by_bytes(times: &mut [u32], scratch: &mut Scratch) {
     let n = times.len();
-    let Scratch { spare, counts } = scratch;
+    let Scratch { spare, counts, .. } = scratch;
     counts.clear();
     counts.resize(4, [0; 256]);
     for &time in times.iter() {
