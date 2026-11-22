@@ -33,6 +33,13 @@
 //! fields lie between the last two commas before the newline, the one found from the end
 //! must be the one the type's width gives from the front, and the 32 bytes before the
 //! newline hold no other newline.
+//!
+//! The kernel is made twice (`types::width`, `SS_PARSE_WIDTH`): `Wide` as it was, and
+//! `Narrow` with no instruction that takes a Cascade Lake core off its base clock: the
+//! multiplies of `tail` on 128-bit halves (`tail_narrow`), `finish` and `finish_clicks` in
+//! 256-bit registers (`finish_narrow`, `finish_clicks_narrow`), and the compares the compiler
+//! would join into one 512-bit compare written as `asm!` (`first64`, `clean_rows`,
+//! `classes`).
 
 use core::arch::x86_64::*;
 
@@ -1559,11 +1566,11 @@ unsafe fn split_narrow(batch: &Batch, rows: usize, short: *mut u32, long: *mut u
         let mut number = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
         let mut first = 0;
         while first < rows {
-            let (taken, wide) = classes(batch.class.as_ptr().add(first), _bzhi_u32(0xFF, (rows - first) as u32) as u8);
-            _mm256_storeu_si256(short.add(shorts).cast(), _mm256_maskz_compress_epi32(taken & !wide, number));
-            _mm256_storeu_si256(long.add(longs).cast(), _mm256_maskz_compress_epi32(taken & wide, number));
-            shorts += (taken & !wide).count_ones() as usize;
-            longs += (taken & wide).count_ones() as usize;
+            let (to_short, to_long) = classes(batch.class.as_ptr().add(first), _bzhi_u32(0xFF, (rows - first) as u32) as u8);
+            _mm256_storeu_si256(short.add(shorts).cast(), _mm256_maskz_compress_epi32(to_short, number));
+            _mm256_storeu_si256(long.add(longs).cast(), _mm256_maskz_compress_epi32(to_long, number));
+            shorts += to_short.count_ones() as usize;
+            longs += to_long.count_ones() as usize;
             number = _mm256_add_epi32(number, _mm256_set1_epi32(8));
             first += 8;
         }
@@ -1571,15 +1578,15 @@ unsafe fn split_narrow(batch: &Batch, rows: usize, short: *mut u32, long: *mut u
     }
 }
 
-/// Of the eight classes at `class`, those of `live`'s rows that are records with nothing
-/// set but perhaps a long user (`split`'s `taken`), and those with a long user: two
-/// compares of each half, written as the instructions they are (`types::width`).
+/// Of the eight classes at `class`, `live`'s rows that are records with nothing set but
+/// perhaps a long user (`split`'s `taken`): those with a short user, and those with a long
+/// one. Two tests of each half, written as the instructions they are (`types::width`).
 ///
 /// # Safety
 /// 64 bytes readable at `class`.
 #[inline(always)]
 unsafe fn classes(class: *const u64, live: __mmask8) -> (__mmask8, __mmask8) {
-    let (taken, wide): (__mmask8, __mmask8);
+    let (to_short, to_long): (__mmask8, __mmask8);
     // SAFETY: the caller's contract; AVX-512F, VL and DQ are compiled in.
     unsafe {
         core::arch::asm!(
@@ -1592,18 +1599,21 @@ unsafe fn classes(class: *const u64, live: __mmask8) -> (__mmask8, __mmask8) {
             "korb {t2}, {t2}, {t}",
             "korb {w}, {w}, {w2}",
             "kandb {t}, {t2}, {live}",
+            "kandnb {s}, {w}, {t}",
+            "kandb {w}, {w}, {t}",
             p = in(reg) class,
             low = in(zmm_reg) _mm256_set1_epi64x(0xFFFF_FFFF),
             long = in(zmm_reg) _mm256_set1_epi64x(LONG_USER as i64),
             live = in(kreg) live,
-            t = out(kreg) taken,
+            t = out(kreg) _,
             t2 = out(kreg) _,
-            w = out(kreg) wide,
+            w = out(kreg) to_long,
             w2 = out(kreg) _,
+            s = out(kreg) to_short,
             options(pure, readonly, nostack, preserves_flags),
         )
     };
-    (taken, wide)
+    (to_short, to_long)
 }
 
 /// `split` or `split_narrow`, into lists of room for `BATCH + 8` words each.
