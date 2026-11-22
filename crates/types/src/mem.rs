@@ -60,8 +60,13 @@ impl<T> Zeroed<T> {
     pub fn touch_first(&mut self, len: usize) {
         // `SS_POPULATE`: every page of them backed in one call (`populate`), for a machine
         // without huge pages.
-        if populate_window() != 0 {
-            let bytes = (len.min(self.len) * size_of::<T>()).next_multiple_of(4096).min(self.layout.size() & !4095);
+        let bytes = (len.min(self.len) * size_of::<T>()).next_multiple_of(4096).min(self.layout.size() & !4095);
+        // `SS_COLLAPSE`: 2 MB pages asked for by name (`collapse`), after the writes below.
+        let huge = collapse_on().then(|| bytes.next_multiple_of(HUGE).min(self.layout.size() & !(HUGE - 1)));
+        if let Some(whole) = huge {
+            // SAFETY: whole 2 MB steps of the memory, which starts on one.
+            unsafe { advise_huge(self.at.as_ptr().cast(), whole) };
+        } else if populate_window() != 0 {
             // SAFETY: whole pages of the memory, which starts on a page.
             if bytes != 0 && unsafe { populate(self.at.as_ptr().cast(), bytes) } {
                 return;
@@ -72,6 +77,13 @@ impl<T> Zeroed<T> {
             // SAFETY: inside the memory, which is zeros there: the write changes nothing.
             // Volatile, or the compiler drops a zero written to zeroed memory.
             unsafe { self.at.as_ptr().add(at).cast::<u8>().write_volatile(0) };
+        }
+        if let Some(whole) = huge {
+            // SAFETY: as above; each step has a page written.
+            if whole != 0 && !unsafe { collapse(self.at.as_ptr().cast(), whole) } && populate_window() != 0 {
+                // SAFETY: whole pages of the memory.
+                unsafe { populate(self.at.as_ptr().cast(), bytes) };
+            }
         }
     }
 }
@@ -94,10 +106,15 @@ pub fn touch<T>(table: &Zeroed<T>, piece: usize, pieces: usize, word: impl Fn(&T
     // `SS_POPULATE`: every page of the piece backed in one call (`populate`), for a machine
     // without huge pages: there each page of the table is otherwise a fault of its own, at
     // the first key that lands on it.
-    if populate_window() != 0 {
-        let bytes = table.len * size_of::<T>();
-        let steps = bytes.div_ceil(HUGE);
-        let (from, to) = (steps * piece / pieces * HUGE, (steps * (piece + 1) / pieces * HUGE).min(bytes & !4095));
+    let bytes = table.len * size_of::<T>();
+    let steps = bytes.div_ceil(HUGE);
+    let (from, to) = (steps * piece / pieces * HUGE, (steps * (piece + 1) / pieces * HUGE).min(bytes & !4095));
+    // `SS_COLLAPSE`: 2 MB pages asked for by name (`collapse`), after the writes below.
+    let huge = collapse_on() && to > from;
+    if huge {
+        // SAFETY: whole pages inside the table, which starts on a 2 MB step.
+        unsafe { advise_huge(table.at.as_ptr().cast::<u8>().add(from), to - from) };
+    } else if populate_window() != 0 {
         // SAFETY: whole pages inside the table, which starts on a page.
         if to > from && unsafe { populate(table.at.as_ptr().cast::<u8>().add(from), to - from) } {
             return;
@@ -105,6 +122,13 @@ pub fn touch<T>(table: &Zeroed<T>, piece: usize, pieces: usize, word: impl Fn(&T
     }
     for at in table.firsts(piece, pieces) {
         let _ = word(&table[at]).compare_exchange(0, std::hint::black_box(0), Relaxed, Relaxed);
+    }
+    if huge {
+        // SAFETY: as above; every 2 MB step of the piece has a page written.
+        if !unsafe { collapse(table.at.as_ptr().cast::<u8>().add(from), to - from) } && populate_window() != 0 {
+            // SAFETY: as above.
+            unsafe { populate(table.at.as_ptr().cast::<u8>().add(from), to - from) };
+        }
     }
 }
 
@@ -230,6 +254,63 @@ pub unsafe fn populate(addr: *mut u8, len: usize) -> bool {
             REFUSED.store(true, Relaxed);
         }
         false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (addr, len);
+        false
+    }
+}
+
+/// `SS_COLLAPSE=off|on`: whether the tables that are looked up at random (the directory of
+/// the users, the arrays of the persons) are put onto 2 MB pages by `collapse`. Read once.
+///
+/// For the scorer: its transparent huge pages are `never`, its kernel is 6.4 or later, and
+/// a timing probe saw `MADV_COLLAPSE` make a 2 MB page there all the same. A lookup in a
+/// 67 MB table on 4 KB pages is a page walk each time; on 2 MB pages the table is 34 entries
+/// of the TLB.
+pub fn collapse_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::env::pick("SS_COLLAPSE", &["off", "on"]) == 1)
+}
+
+/// Marks `addr..addr + len` as wanting huge pages (`MADV_HUGEPAGE`): where the machine gives
+/// them on a first write, the writes that follow get them, and `collapse` has nothing left
+/// to do.
+///
+/// # Safety
+/// Whole pages of anonymous memory the caller owns.
+unsafe fn advise_huge(addr: *mut u8, len: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: core::ffi::c_int) -> core::ffi::c_int;
+        }
+        const MADV_HUGEPAGE: core::ffi::c_int = 14;
+        // SAFETY: the range of the caller; a refusal changes nothing.
+        unsafe { madvise(addr.cast(), len, MADV_HUGEPAGE) };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (addr, len);
+}
+
+/// Has the kernel make every whole 2 MB step inside `addr..addr + len` one 2 MB page now
+/// (`MADV_COLLAPSE`, Linux 6.1; it does not ask the huge-page setting of the machine). A
+/// step needs at least one page written already. Each step is done under the address-space
+/// lock held for writing, the rest of its 2 MB zeroed there: for a few tables before the
+/// workers start, not for the lists. Returns whether every step became one page.
+///
+/// # Safety
+/// Whole pages of anonymous memory the caller owns; their contents stay.
+unsafe fn collapse(addr: *mut u8, len: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: core::ffi::c_int) -> core::ffi::c_int;
+        }
+        const MADV_COLLAPSE: core::ffi::c_int = 25;
+        // SAFETY: the range of the caller; a failure leaves the pages as they are.
+        unsafe { madvise(addr.cast(), len, MADV_COLLAPSE) == 0 }
     }
     #[cfg(not(target_os = "linux"))]
     {
