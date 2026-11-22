@@ -219,8 +219,8 @@ impl Probe {
     /// `Some` when `SS_PROBE` is set. Call before the workers are started.
     pub fn start() -> Option<Probe> {
         let probe = std::env::var_os("SS_PROBE")?;
-        // `init` and `huge` read nothing, so that the run is the plain one up to its wait.
-        if probe == "init" || probe == "huge" {
+        // `init`, `huge` and `thp` read nothing, so that the run is the plain one up to its wait.
+        if probe == "init" || probe == "huge" || probe == "thp" {
             return Some(Probe { vmstat: String::new(), stat: String::new(), allowed: Vec::new(), started: Instant::now() });
         }
         Some(Probe { vmstat: read("/proc/vmstat").unwrap_or_default(), stat: read("/proc/stat").unwrap_or_default(), allowed: types::par::pin::allowed(), started: Instant::now() })
@@ -238,7 +238,37 @@ impl Probe {
     /// the end (`AnonHugePages`), so (score - the plain score) / 0.02 s is how many of its
     /// collapses (`SS_COLLAPSE`) the scorer made, which has no other huge pages: about 63
     /// with `SS_COLLAPSE=on` at 20M events when every one succeeds, 0 when none does.
+    ///
+    /// `SS_PROBE=thp`: the same count and the machine's huge-page settings in one wait, for a
+    /// build without collapses: 1 s times `t + 4 p`, plus 1 ms for each 2 MB page (at most
+    /// 950) and 25 ms. `t` is `transparent_hugepage/enabled` (0 unreadable, 1 `always`, 2
+    /// `madvise`, 3 `never`), `p` is `hugepages-2048kB/enabled`, the 2 MB size's own
+    /// setting since Linux 6.8 (0 absent, 1 `always`, 2 `inherit`, 3 `madvise`, 4 `never`).
+    /// So with x = score - the plain score: `t + 4 p` = floor(x), pages = (x mod 1) / 1 ms - 25.
     pub fn finish(&self, data: &std::path::Path) {
+        if std::env::var_os("SS_PROBE").is_some_and(|value| value == "thp") {
+            let kb: u64 = read("/proc/self/smaps_rollup")
+                .and_then(|text| text.lines().find(|line| line.starts_with("AnonHugePages:")).and_then(|line| line.split_whitespace().nth(1)?.parse().ok()))
+                .unwrap_or(0);
+            let pages = (kb / 2048).min(950);
+            let top = match chosen("/sys/kernel/mm/transparent_hugepage/enabled").as_deref() {
+                Some("always") => 1,
+                Some("madvise") => 2,
+                Some("never") => 3,
+                _ => 0,
+            };
+            let pmd = match chosen("/sys/kernel/mm/transparent_hugepage/hugepages-2048kB/enabled").as_deref() {
+                Some("always") => 1,
+                Some("inherit") => 2,
+                Some("madvise") => 3,
+                Some("never") => 4,
+                _ => 0,
+            };
+            let code = top + 4 * pmd;
+            eprintln!("probe: thp code {code} (enabled {top}, 2048kB {pmd}), {pages} huge pages");
+            std::thread::sleep(std::time::Duration::from_millis(1000 * code + pages + 25));
+            return;
+        }
         if std::env::var_os("SS_PROBE").is_some_and(|value| value == "huge") {
             let kb: u64 = read("/proc/self/smaps_rollup")
                 .and_then(|text| text.lines().find(|line| line.starts_with("AnonHugePages:")).and_then(|line| line.split_whitespace().nth(1)?.parse().ok()))
