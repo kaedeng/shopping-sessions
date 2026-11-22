@@ -1002,18 +1002,22 @@ static CAMP: [CampRow; CAMP_ROWS] = camp_rows();
 /// What `finish_clicks` computes with, the same for every row.
 struct ClickConsts {
     user_key: __m512i,
+    click_key: __m512i,
     persons: __m512i,
+    slots: __m512i,
     ts_end: __m512i,
-    shift: __m128i,
 }
 
 /// Bytes the click kernel may read from a line's first.
 const CLICK_WINDOW: usize = 96;
+/// Clicks held back from the table when the others are stored: the last asked for.
+const CLICKS_AHEAD: usize = 32;
 
 /// One click chunk, as `events`: the line's layout picks a row for both IDs (`IDK`), one for
 /// the `ts` (`TS`, its first lane) and one for the campaign (`CAMP`), and a line whose checks
 /// all leave zero is a click as it stands once its user is a number inside the arrays, its
-/// campaign one of the table and its `ts` in the window. A line with a well-formed `ts`
+/// `click_id` a number inside the click table, its campaign one of the table and its `ts` in
+/// the window: it is stored at its number (`ClickTable`). A line with a well-formed `ts`
 /// outside the window is no click whatever else it holds, as in `click_row`; every other
 /// line goes to `click_row` itself.
 ///
@@ -1021,21 +1025,20 @@ const CLICK_WINDOW: usize = 96;
 /// `p, len` is a segment, and `lead` bytes before `p` are readable.
 #[inline(never)]
 pub(crate) unsafe fn clicks<M: Mode>(p: *const u8, len: usize, lead: usize, ctx: &Ctx, dates: &Dates, campaigns: &Campaigns, plan: &PosPlan, out: &mut PosOut) {
-    let PosOut { clicks, odd_clicks, odd_id_clicks, odd_ids, .. } = out;
+    let PosOut { odd_clicks, extra_clicks, click_end, .. } = out;
     let memo = Memo::of(ctx, dates);
     // SAFETY: register arithmetic.
     #[allow(unused_unsafe)]
     let consts = unsafe {
         ClickConsts {
             user_key: _mm512_set1_epi64((plan.user_key & MASK40) as i64),
+            click_key: _mm512_set1_epi64((plan.click_key & MASK40) as i64),
             persons: _mm512_set1_epi64(i64::from(plan.persons)),
+            slots: _mm512_set1_epi64(plan.clicks.slots() as i64),
             ts_end: _mm512_set1_epi64(i64::from(ctx.ts_end)),
-            shift: _mm_cvtsi32_si128(plan.click_shift as i32),
         }
     };
     let mut held = Held::new();
-    // The clicks of the rows left to the row code.
-    let mut pending = Pending::new();
     // SAFETY: plain integers, bytes and pointers that are not read before they are written.
     let mut batch: Batch = unsafe { std::mem::zeroed() };
     // SAFETY: a line the kernel runs on begins at `line < stop`, so `CLICK_WINDOW` bytes from
@@ -1126,7 +1129,7 @@ pub(crate) unsafe fn clicks<M: Mode>(p: *const u8, len: usize, lead: usize, ctx:
                     k += 8;
                     line = end.add(1);
                     if k == 8 * BATCH {
-                        finish_clicks::<M>(batch, BATCH, line, p, len, &consts, &mut held, campaigns, ctx, dates, plan, &mut pending, clicks, odd_clicks, odd_id_clicks, odd_ids);
+                        finish_clicks(batch, BATCH, line, p, len, &consts, &mut held, campaigns, ctx, dates, plan, odd_clicks, extra_clicks, click_end);
                         k = 0;
                     }
                     if line >= stop {
@@ -1134,7 +1137,7 @@ pub(crate) unsafe fn clicks<M: Mode>(p: *const u8, len: usize, lead: usize, ctx:
                     }
                 }
                 if k != 0 {
-                    finish_clicks::<M>(batch, k / 8, line, p, len, &consts, &mut held, campaigns, ctx, dates, plan, &mut pending, clicks, odd_clicks, odd_id_clicks, odd_ids);
+                    finish_clicks(batch, k / 8, line, p, len, &consts, &mut held, campaigns, ctx, dates, plan, odd_clicks, extra_clicks, click_end);
                 }
             }
             if line < last {
@@ -1142,14 +1145,12 @@ pub(crate) unsafe fn clicks<M: Mode>(p: *const u8, len: usize, lead: usize, ctx:
                 #[cfg(test)]
                 SLOW_LINES.with(|count| count.set(count.get() + 1));
                 let at = line.offset_from(p) as usize;
-                slow_click::<M>(p, len, at, ctx, dates, plan, &mut pending, clicks, odd_clicks, odd_id_clicks, odd_ids);
+                slow_click(p, len, at, ctx, dates, plan, odd_clicks, extra_clicks, click_end);
                 line = p.add(line_end(p, len, at));
             }
         }
     }
-    held.flush_clicks(clicks);
-    pending.flush::<M>(clicks);
-    clicks.fence();
+    held.store_clicks(&plan.clicks, 0, click_end, extra_clicks);
 }
 
 /// `pack_words` for one lane.
@@ -1167,7 +1168,7 @@ fn pack_words_128(parts: __m128i) -> __m128i {
 /// As `finish`.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn finish_clicks<M: Mode>(
+unsafe fn finish_clicks(
     batch: *mut Batch,
     rows: usize,
     next: *const u8,
@@ -1179,11 +1180,9 @@ unsafe fn finish_clicks<M: Mode>(
     ctx: &Ctx,
     dates: &Dates,
     plan: &PosPlan,
-    pending: &mut Pending<PosClick>,
-    clicks: &mut Chunks<PosClick>,
     odd_clicks: &mut Vec<ClickRec>,
-    odd_id_clicks: &mut Vec<OddIdClick>,
-    odd_ids: &mut Vec<Id>,
+    extra_clicks: &mut Vec<ExtraClick>,
+    click_end: &mut usize,
 ) {
     let mut first = 0;
     // SAFETY: as `finish`; the campaigns' table is read only at numbers below its count.
@@ -1194,7 +1193,7 @@ unsafe fn finish_clicks<M: Mode>(
         let (even, odd) = (_mm512_setr_epi64(0, 4, 8, 12, 1, 5, 9, 13), _mm512_setr_epi64(2, 6, 10, 14, 3, 7, 11, 15));
         while first < rows {
             if held.len + 8 > HELD {
-                held.flush_clicks(clicks);
+                held.store_clicks(&plan.clicks, CLICKS_AHEAD, click_end, extra_clicks);
             }
             let live: __mmask8 = if rows - first >= 8 { 0xFF } else { (1u8 << (rows - first)) - 1 };
             let at = batch.rows.as_ptr().add(first).cast::<__m512i>();
@@ -1202,6 +1201,9 @@ unsafe fn finish_clicks<M: Mode>(
             let (low_a, low_b) = (_mm512_permutex2var_epi64(r0, even, r1), _mm512_permutex2var_epi64(r2, even, r3));
             let (high_a, high_b) = (_mm512_permutex2var_epi64(r0, odd, r1), _mm512_permutex2var_epi64(r2, odd, r3));
             let click = _mm512_shuffle_i64x2::<0b01_00_01_00>(low_a, low_b);
+            // The click's number, its slot in the table.
+            let scrambled = base36(click);
+            let slot = numbers(scrambled, consts.click_key);
             let ts = _mm512_shuffle_i64x2::<0b11_10_11_10>(low_a, low_b);
             let user = base36(_mm512_shuffle_i64x2::<0b01_00_01_00>(high_a, high_b));
             let number = _mm512_shuffle_i64x2::<0b11_10_11_10>(high_a, high_b);
@@ -1229,6 +1231,8 @@ unsafe fn finish_clicks<M: Mode>(
                 & inside
                 & _mm512_cmple_epu64_mask(user, all(MASK40 as i64))
                 & _mm512_cmplt_epu64_mask(person, consts.persons)
+                & _mm512_cmple_epu64_mask(scrambled, all(MASK40 as i64))
+                & _mm512_cmplt_epu64_mask(slot, consts.slots)
                 & _mm512_cmplt_epu64_mask(index, all(CLICK_CAMPAIGNS.min(Campaigns::NONE as usize) as i64));
             // No click whatever the rest says: a well-formed `ts` outside the window.
             let dropped = clean & !inside;
@@ -1236,12 +1240,16 @@ unsafe fn finish_clicks<M: Mode>(
             // `PosClick::new`: u | ts << 32, then key | campaign << CLICK_KEY_BITS.
             let low = _mm512_or_si512(_mm512_and_si512(u, all(0xFFFF_FFFF)), _mm512_slli_epi64::<32>(ts));
             let rest = _mm512_or_si512(key, _mm512_slli_epi64::<{ types::pos::CLICK_KEY_BITS }>(index));
-            let list = _mm512_srl_epi64(person, consts.shift);
             let to = held.len;
-            _mm512_storeu_si512(held.lists.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, list));
+            _mm512_storeu_si512(held.lists.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, slot));
             _mm512_storeu_si512(held.low.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, low));
             _mm512_storeu_si512(held.high.as_mut_ptr().add(to).cast(), _mm512_maskz_compress_epi64(fast, rest));
             held.len = to + fast.count_ones() as usize;
+            // The slots asked for now, stored into later (`Held::store_clicks`). All eight
+            // places: past the clicks just held they read 0, the table's first line.
+            for lane in 0..8 {
+                types::mem::prefetch(plan.clicks.address(*held.lists.get_unchecked(to + lane) as usize));
+            }
 
             // Every other row, through the row code: its line is the row's alone.
             let mut left = live & !fast & !dropped;
@@ -1250,7 +1258,7 @@ unsafe fn finish_clicks<M: Mode>(
                 left &= left - 1;
                 #[cfg(test)]
                 SLOW_LINES.with(|count| count.set(count.get() + 1));
-                slow_click::<M>(base, bytes, batch.line[row].offset_from(base) as usize, ctx, dates, plan, pending, clicks, odd_clicks, odd_id_clicks, odd_ids);
+                slow_click(base, bytes, batch.line[row].offset_from(base) as usize, ctx, dates, plan, odd_clicks, extra_clicks, click_end);
             }
             first += 8;
         }
@@ -1284,6 +1292,9 @@ mod tests {
 
     const EVENT_KEY: u64 = 0x5A_1234_5678;
     const USER_KEY: u64 = 0x3C_8765_4321;
+    const CLICK_KEY: u64 = 0x11_2233_4455;
+    /// Slots of the tests' click table.
+    const CLICK_SLOTS: usize = 1 << 16;
 
     /// An event line much as the generator writes one in October 2026, then perhaps spoiled.
     fn line(rng: &mut Rng) -> Vec<u8> {
@@ -1387,8 +1398,8 @@ mod tests {
         for (start, end) in [("2026-10-08T00:00:00Z", "2026-10-22T00:00:00Z"), ("2026-10-05T00:00:00Z", "2026-11-02T00:00:00Z"), ("2026-09-28T12:00:00Z", "2026-10-12T12:00:00Z")] {
             let ctx = Ctx::new(parse_f1(start.as_bytes()).unwrap(), parse_f1(end.as_bytes()).unwrap(), &products, &[]).unwrap();
             let dates = Dates::new(&ctx);
-            let shape = PosShape { shift: 12, parts: 20, persons: 4096, click_shift: 6, click_parts: 64 };
-            let plan = PosPlan { user_key: USER_KEY, event_key: EVENT_KEY, shift: 12, parts: 20, persons: 4096, click_shift: 6, click_parts: 64, wide: false, fused: false, kernel: true };
+            let shape = PosShape { shift: 12, parts: 20, persons: 4096 };
+            let plan = PosPlan { user_key: USER_KEY, event_key: EVENT_KEY, shift: 12, parts: 20, persons: 4096, click_key: CLICK_KEY, clicks: ClickTable::new(16), wide: false, fused: false, kernel: true };
             for round in 0..300 {
                 // A segment: the byte before it, whole lines, `PAD` bytes after it.
                 let lead = [0usize, 1, 15, 16, 64][round % 5];
@@ -1405,7 +1416,7 @@ mod tests {
                 buf.extend((0..crate::PAD).map(|at| b"\n,\"e1"[at % 5]));
                 let new_out = || {
                     let (events, pays) = event_lists(1, &shape, None);
-                    PosOut::new(events, pays, click_lists(1, &shape, 10), 1)
+                    PosOut::new(events, pays, 1)
                 };
                 let (mut got, mut want) = (new_out(), new_out());
                 // SAFETY: the buffer is a segment with `lead + 1` bytes before it.
@@ -1453,7 +1464,8 @@ mod tests {
         let fields = [
             match rng.below(14) {
                 0 => rng.pick(&["", "K12ab", "k", "k123456789ab", "k\u{e9}1", "k0", "k01", "kzzzzzzzz", "x12"]).to_string(),
-                _ => id(rng, b'k', 0x11_2233_4455, 1 << 30),
+                // Most inside the table, some past it.
+                _ => id(rng, b'k', CLICK_KEY, CLICK_SLOTS as u64 * 9 / 8),
             },
             match rng.below(14) {
                 0 => rng.pick(&["", "U12ab", "u", "anonymous-user-17", "u0123"]).to_string(),
@@ -1503,8 +1515,8 @@ mod tests {
         for (start, end) in [("2026-10-08T00:00:00Z", "2026-10-22T00:00:00Z"), ("2026-10-05T00:00:00Z", "2026-11-02T00:00:00Z")] {
             let ctx = Ctx::new(parse_f1(start.as_bytes()).unwrap(), parse_f1(end.as_bytes()).unwrap(), &[], &listed).unwrap();
             let (dates, campaigns) = (Dates::new(&ctx), Campaigns::new(&ctx));
-            let shape = PosShape { shift: 12, parts: 20, persons: 4096, click_shift: 6, click_parts: 64 };
-            let plan = PosPlan { user_key: USER_KEY, event_key: EVENT_KEY, shift: 12, parts: 20, persons: 4096, click_shift: 6, click_parts: 64, wide: false, fused: false, kernel: true };
+            let shape = PosShape { shift: 12, parts: 20, persons: 4096 };
+            let new_plan = || PosPlan { user_key: USER_KEY, event_key: EVENT_KEY, shift: 12, parts: 20, persons: 4096, click_key: CLICK_KEY, clicks: ClickTable::new(CLICK_SLOTS), wide: false, fused: false, kernel: true };
             for round in 0..300 {
                 let lead = [0usize, 1, 15, 16, 64][round % 5];
                 let mut buf = vec![b'x'; lead];
@@ -1519,37 +1531,46 @@ mod tests {
                 buf.extend((0..crate::PAD).map(|at| b"\n,\"k1"[at % 5]));
                 let new_out = || {
                     let (events, pays) = event_lists(1, &shape, None);
-                    PosOut::new(events, pays, click_lists(1, &shape, 10), 1)
+                    PosOut::new(events, pays, 1)
                 };
+                // A table each: the kernel's and the row code's.
+                let (got_plan, want_plan) = (new_plan(), new_plan());
                 let (mut got, mut want) = (new_out(), new_out());
                 // SAFETY: the buffer is a segment with `lead + 1` bytes before it.
                 unsafe {
                     let p = buf.as_ptr().add(from);
-                    clicks::<Plain>(p, len, lead + 1, &ctx, &dates, &campaigns, &plan, &mut got);
-                    let PosOut { clicks, odd_clicks, odd_id_clicks, odd_ids, scratch, .. } = &mut want;
-                    let mut pending = Pending::new();
-                    Scalar::lines::<4>(p, len, scratch, |fields| click_row::<Plain>(&ctx, &dates, &plan, fields, &mut pending, clicks, odd_clicks, odd_id_clicks, odd_ids));
-                    pending.flush::<Plain>(clicks);
+                    clicks::<Plain>(p, len, lead + 1, &ctx, &dates, &campaigns, &got_plan, &mut got);
+                    let PosOut { odd_clicks, extra_clicks, click_end, scratch, .. } = &mut want;
+                    Scalar::lines::<4>(p, len, scratch, |fields| click_row(&ctx, &dates, &want_plan, fields, odd_clicks, extra_clicks, click_end));
                 }
-                let digest = |out: &PosOut| {
-                    let mut clicks = Vec::new();
-                    for list in 0..out.clicks.lists() {
-                        out.clicks.for_each(list, |piece| clicks.extend(piece.iter().map(|click| (list, click.u(), click.ts(), click.campaign(), click.odd_index().map_or(click.key(), |index| out.odd_ids[index])))));
-                    }
+                let digest = |out: &PosOut, plan: &PosPlan| {
+                    // The clicks of numbered users, each once: in the table or beside it.
+                    // Which of two lines with one `click_id` and different values has the
+                    // slot depends on the order they are stored in, and the kernel stores a
+                    // line the row code takes before the lines it holds.
+                    // SAFETY: every slot of the table.
+                    let mut clicks: Vec<_> = (0..plan.clicks.slots())
+                        .map(|slot| unsafe { plan.clicks.get(slot) })
+                        .filter(PosClick::is_some)
+                        .map(|click| (click.u(), types::pos::click_key_id(click.key()), click.ts(), click.campaign()))
+                        .collect();
                     let mut odd: Vec<_> = out.odd_clicks.iter().map(|click| (click.user, click.click, click.ts, click.campaign)).collect();
-                    let mut odd_id: Vec<_> = out.odd_id_clicks.iter().map(|click| (click.u, click.click, click.ts, click.campaign)).collect();
+                    let extra: Vec<(u32, Id, u32, u32)> = Vec::new();
+                    clicks.extend(out.extra_clicks.iter().map(|click| (click.u, click.click, click.ts, click.campaign)));
                     clicks.sort_unstable();
+                    clicks.dedup();
                     odd.sort_unstable();
-                    odd_id.sort_unstable();
-                    (clicks, odd, odd_id)
+                    // The last slot stored is the last that holds a click.
+                    assert_eq!(out.click_end, (0..plan.clicks.slots()).rev().find(|&slot| unsafe { plan.clicks.get(slot) }.is_some()).map_or(0, |slot| slot + 1));
+                    (clicks, odd, extra)
                 };
-                let (got, want) = (digest(&got), digest(&want));
+                let (got, want) = (digest(&got, &got_plan), digest(&want, &want_plan));
                 taken += got.0.len();
                 if got != want {
                     let extra: Vec<_> = got.0.iter().filter(|click| !want.0.contains(click)).collect();
                     let missing: Vec<_> = want.0.iter().filter(|click| !got.0.contains(click)).collect();
                     panic!(
-                        "round {round}: {} against {} clicks, {} against {} odd, {} against {} with odd ids\nonly the kernel's: {extra:?}\nonly the row code's: {missing:?}\n{}",
+                        "round {round}: {} against {} clicks, {} against {} odd, {} against {} with no slot\nonly the kernel's: {extra:?}\nonly the row code's: {missing:?}\n{}",
                         got.0.len(),
                         want.0.len(),
                         got.1.len(),
@@ -1617,10 +1638,10 @@ mod tests {
         }
         let len = buf.len() - from;
         buf.extend([0u8; crate::PAD]);
-        let shape = PosShape { shift: 16, parts: 1 << 14, persons: 4096, click_shift: 6, click_parts: 64 };
-        let plan = PosPlan { user_key: USER_KEY, event_key: EVENT_KEY, shift: 16, parts: 1 << 14, persons: 4096, click_shift: 6, click_parts: 64, wide: false, fused: false, kernel: true };
+        let shape = PosShape { shift: 16, parts: 1 << 14, persons: 4096 };
+        let plan = PosPlan { user_key: USER_KEY, event_key: EVENT_KEY, shift: 16, parts: 1 << 14, persons: 4096, click_key: CLICK_KEY, clicks: ClickTable::new(16), wide: false, fused: false, kernel: true };
         let (events_lists, pays) = event_lists(1, &shape, None);
-        let mut out = PosOut::new(events_lists, pays, click_lists(1, &shape, 10), 1);
+        let mut out = PosOut::new(events_lists, pays, 1);
         // SAFETY: a segment with 64 bytes before it.
         unsafe { events::<Plain>(buf.as_ptr().add(from), len, 64, &ctx, &dates, &plan, &mut out) };
         assert_eq!(out.events.len(), 4000);

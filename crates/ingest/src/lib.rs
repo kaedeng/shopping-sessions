@@ -295,6 +295,9 @@ pub fn open(data: &Path, workers: usize, positional: Option<bool>, keep_open: bo
     // The shape with the events' estimated lines, which it is from.
     let (shape, keys): (Cell<Option<(pos::PosShape, usize)>>, Cell<Option<(u64, u64)>>) = (Cell::new(), Cell::new());
     #[cfg(feature = "pipe-positional")]
+    // The click table, and the user and click keys the click files' first lines give.
+    let (click_table, click_keys): (Cell<pos::ClickTable>, Cell<(u64, u64)>) = (Cell::new(), Cell::new());
+    #[cfg(feature = "pipe-positional")]
     let scatter = types::parts::mode_from_env();
     #[cfg(feature = "pipe-positional")]
     let mut outs: Vec<Option<pos::PosOut>> = (0..workers).map(|_| None).collect();
@@ -332,8 +335,24 @@ pub fn open(data: &Path, workers: usize, positional: Option<bool>, keep_open: bo
                     types::tl::mark("products read");
                 }
                 2 => {
-                    folders[1].set(Folder::open(data, 1, chunk, keep_open, ROWS_SAMPLE));
+                    #[cfg(feature = "pipe-positional")]
+                    let sample = if positional.is_some() { pos::SAMPLE_BYTES } else { ROWS_SAMPLE };
+                    #[cfg(not(feature = "pipe-positional"))]
+                    let sample = ROWS_SAMPLE;
+                    let clicks = Folder::open(data, 1, chunk, keep_open, sample);
                     types::tl::mark("clicks open");
+                    #[cfg(feature = "pipe-positional")]
+                    {
+                        // The table first: the workers touch its pages while the key is found.
+                        let rows = clicks.as_ref().map_or(0, |folder| folder.rows);
+                        click_table.set(pos::ClickTable::for_rows(rows));
+                        click_keys.set(match (&clicks, positional) {
+                            (Ok(clicks), Some(_)) => pos::click_key(&pos::click_sample(&clicks.lines), clicks.rows),
+                            _ => (0, 0),
+                        });
+                        types::tl::mark("click key");
+                    }
+                    folders[1].set(clicks);
                 }
                 3 => {
                     base.set(window(data).and_then(|window| {
@@ -370,11 +389,11 @@ pub fn open(data: &Path, workers: usize, positional: Option<bool>, keep_open: bo
         #[cfg(feature = "pipe-positional")]
         if let Some((shape, _)) = shape.wait() {
             let (events, pays) = pos::event_lists(workers, shape, scatter);
-            let click_rows = folders[1].wait().as_ref().map_or(0, |folder| folder.rows);
-            let clicks = pos::click_lists(workers, shape, click_rows);
-            let out = _out.insert(pos::PosOut::new(events, pays, clicks, chunk));
+            let out = _out.insert(pos::PosOut::new(events, pays, chunk));
             types::tl::mark("lists");
-            out.touch(&|| keys.0.get().is_some() && base.0.get().is_some() && table.0.get().is_some() && folders[2].0.get().is_some());
+            let stop = || keys.0.get().is_some() && click_keys.0.get().is_some() && base.0.get().is_some() && table.0.get().is_some() && folders[2].0.get().is_some();
+            out.touch(&stop);
+            click_table.wait().touch(_worker, workers, &stop);
             types::tl::mark("touched");
         }
     });
@@ -387,7 +406,12 @@ pub fn open(data: &Path, workers: usize, positional: Option<bool>, keep_open: bo
     let ingest = Ingest::with_files(files, &ctx, prepared)?;
     #[cfg(feature = "pipe-positional")]
     let pos = match (shape.take(), keys.take()) {
-        (Some((shape, _)), Some(keys)) => Some((ingest.pos_plan(shape, keys), outs.into_iter().map(|out| out.expect("every worker built its lists")).collect())),
+        (Some((shape, _)), Some(keys)) => {
+            // The click key holds only with the user key it was found under.
+            let (user_key, click_key) = click_keys.take();
+            let click_key = if user_key == keys.0 { click_key } else { 0 };
+            Some((ingest.pos_plan(shape, keys, click_key, click_table.take()), outs.into_iter().map(|out| out.expect("every worker built its lists")).collect()))
+        }
         _ => None,
     };
     types::tl::mark("ingest");

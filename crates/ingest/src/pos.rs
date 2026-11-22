@@ -6,18 +6,21 @@
 //! that is already deduplicated, grouped and sorted once every row sits at its number.
 //!
 //! So an event line becomes one 16-byte `PosEvent` in the list of its number's partition
-//! (a range of numbers, not a hash), and a click a `PosClick` in the list of its person's
-//! range. A row the numbering does not cover (an ID spelled another way, a number past the
-//! arrays) goes to the `odd_*` lists as the classic records, and the pipeline runs those
-//! through the classic code. Which list a row takes depends on its `event_id` alone, so every
-//! copy of an event meets its duplicates.
+//! (a range of numbers, not a hash). The clicks are numbered the same way under a key of
+//! their own, a person's one after another: a click is a `PosClick` stored at its number in
+//! one table (`ClickTable`), where each person's clicks are then one stretch. A row the
+//! numbering does not cover (an ID spelled another way, a number past the arrays) goes to the
+//! `odd_*` and `extra_*` lists as the classic records, and the pipeline runs those through
+//! the classic code or adds them to their person's. Which way an event row takes depends on
+//! its `event_id` alone, so every copy of an event meets its duplicates.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use types::chunks::Chunks;
 use types::id::pack_at;
 use types::parts::{Combine, Mode, Parts, Plain};
-use types::pos::{CLICK_CAMPAIGNS, OddIdClick, POS_ODD_USER, POS_VALID, PosClick, PosEvent, PosPay, click_key_at};
+use types::pos::{CLICK_CAMPAIGNS, ExtraClick, POS_ODD_USER, POS_VALID, PosClick, PosEvent, PosPay, click_key_at};
 use types::record::{ClickRec, EventRec, PAY_CATEGORY_SHIFT, VALID};
 use types::scramble::{self, ALIAS_BITS};
 use types::time::DAY;
@@ -68,8 +71,6 @@ pub struct PosShape {
     pub shift: u32,
     pub parts: usize,
     pub persons: u32,
-    pub click_shift: u32,
-    pub click_parts: usize,
 }
 
 impl PosShape {
@@ -82,8 +83,7 @@ impl PosShape {
         // `SS_POS_SHIFT`: the numbers per partition as a power of two, for measurements.
         let shift = (types::env::number("SS_POS_SHIFT", shift as usize) as u32).clamp(10, 16);
         let persons = (rows / 8).clamp(4096, PERSON_LIMIT as usize);
-        let click_shift = (persons / 1024).next_power_of_two().trailing_zeros().max(6);
-        PosShape { shift, parts: room.div_ceil(1 << shift), persons: persons as u32, click_shift, click_parts: persons.div_ceil(1 << click_shift) }
+        PosShape { shift, parts: room.div_ceil(1 << shift), persons: persons as u32 }
     }
 }
 
@@ -100,28 +100,119 @@ pub(crate) fn event_lists(workers: usize, shape: &PosShape, scatter: Option<usiz
     (Chunks::new(shape.parts, bytes), Parts::new(shape.parts, room / 16 + 32, scatter))
 }
 
-/// A worker's lists for the click lines (`PosOut::clicks`), for about `event_rows` event
-/// lines and `click_rows` click lines.
-pub(crate) fn click_lists(workers: usize, shape: &PosShape, click_rows: usize) -> Chunks<PosClick> {
-    // As the events' block (`event_lists`): four times a worker's share of the lines, a chunk
-    // a list and a huge page more.
-    let bytes = (click_rows + click_rows / 8) * size_of::<PosClick>() * 4 / workers.max(4) + shape.click_parts * 4096 + (2 << 20);
-    Chunks::new(shape.click_parts, bytes)
+/// Every click that has a number, at its number. The generator numbers a person's clicks one
+/// after another, person after person, so in this table a person's clicks are one stretch
+/// with no grouping done (`src/positional.rs` checks that they are, and groups them itself
+/// when not). Copies of a click have identical values (rules "Clicks" step 2) and land on one
+/// slot: the table is deduplicated as it fills.
+///
+/// A slot takes the first click stored in it. A later one with the same values is that click
+/// again; one with other values (two lines with one `click_id` that are not copies, which the
+/// rules say do not exist) is refused, and the parse keeps it beside the table
+/// (`PosOut::extra_clicks`), so that every line that is a click on its own stays one, as in
+/// the classic pipeline.
+///
+/// The parse's workers all store into it, and two may store the same click at the same time.
+/// The words are atomics stored and loaded relaxed, which are plain moves: with identical
+/// values, whichever store lands last the slot holds that click. (Two lines of one
+/// `click_id` and different values, stored by two workers within the same few nanoseconds,
+/// could each find the slot empty, and one would be lost: for data the rules exclude, a
+/// chance of about one in a hundred million a pair.)
+pub struct ClickTable {
+    slots: Vec<[AtomicU64; 2]>,
+}
+
+impl ClickTable {
+    /// `slots` empty slots: zeroed by the kernel, a page when it is first written.
+    pub fn new(slots: usize) -> ClickTable {
+        let mut zeros = std::mem::ManuallyDrop::new(vec![[0u64; 2]; slots]);
+        // SAFETY: an atomic has its integer's size, alignment and bit patterns; the vector is
+        // handed over whole.
+        ClickTable { slots: unsafe { Vec::from_raw_parts(zeros.as_mut_ptr().cast(), zeros.len(), zeros.capacity()) } }
+    }
+
+    /// For about `click_rows` click lines: click numbers are below the number of distinct
+    /// clicks, so below the lines; an eighth more for the estimate.
+    pub(crate) fn for_rows(click_rows: usize) -> ClickTable {
+        ClickTable::new(click_rows + click_rows / 8 + 4096)
+    }
+
+    pub fn slots(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Stores the click with words `low`, `rest` (`PosClick::words`) at `number`, when the
+    /// slot is empty. Returns whether the slot now holds this click: `false` when it holds
+    /// another.
+    ///
+    /// # Safety
+    /// `number < self.slots()`.
+    #[inline(always)]
+    pub unsafe fn put(&self, number: usize, low: u64, rest: u64) -> bool {
+        debug_assert!(number < self.slots.len() && rest & 15 != 0);
+        // SAFETY: the caller's contract.
+        let slot = unsafe { self.slots.get_unchecked(number) };
+        let held = slot[1].load(Relaxed);
+        if held == 0 {
+            slot[0].store(low, Relaxed);
+            slot[1].store(rest, Relaxed);
+            return true;
+        }
+        held == rest && slot[0].load(Relaxed) == low
+    }
+
+    /// The slot at `number`: a click, or zeros (`PosClick::is_some`).
+    ///
+    /// # Safety
+    /// `number < self.slots()`.
+    #[inline(always)]
+    pub unsafe fn get(&self, number: usize) -> PosClick {
+        debug_assert!(number < self.slots.len());
+        // SAFETY: the caller's contract.
+        let slot = unsafe { self.slots.get_unchecked(number) };
+        PosClick::from_words(slot[0].load(Relaxed), slot[1].load(Relaxed))
+    }
+
+    /// Where the slot at `number` is, for a prefetch; any number will do.
+    #[inline(always)]
+    pub(crate) fn address(&self, number: usize) -> *const u8 {
+        self.slots.as_ptr().wrapping_add(number).cast()
+    }
+
+    /// Has the kernel back piece `piece` of `pieces` now, until `stop` says so: a store of
+    /// the zero that is there, a page.
+    pub(crate) fn touch(&self, piece: usize, pieces: usize, stop: &impl Fn() -> bool) {
+        let (from, to) = (self.slots.len() * piece / pieces, self.slots.len() * (piece + 1) / pieces);
+        for slot in self.slots[from..to].iter().step_by(4096 / 16) {
+            if stop() {
+                return;
+            }
+            slot[0].fetch_or(0, Relaxed);
+        }
+    }
+
+    /// Slot `free-early`: piece `piece` of `pieces` of the table back to the kernel. The
+    /// table is dead once the sessions are credited; a slot read after this is empty.
+    pub fn release(&self, piece: usize, pieces: usize) {
+        let (from, to) = (self.slots.len() * piece / pieces, self.slots.len() * (piece + 1) / pieces);
+        // SAFETY: whole pages inside the table's own memory, which then read as zeros: empty
+        // slots, through the atomics as before.
+        unsafe { types::mem::release(self.slots.as_ptr().wrapping_add(from).cast(), (to - from) * 16) };
+    }
 }
 
 impl PosOut {
     /// A worker's buffers for the positional parse: its lists, and room to read a chunk of
     /// `chunk` bytes into.
-    pub(crate) fn new(events: Chunks<PosEvent>, pays: Parts<PosPay>, clicks: Chunks<PosClick>, chunk: usize) -> PosOut {
+    pub(crate) fn new(events: Chunks<PosEvent>, pays: Parts<PosPay>, chunk: usize) -> PosOut {
         PosOut {
             events,
             pays,
-            clicks,
             odd_events: Vec::new(),
             odd_users: Vec::new(),
             odd_clicks: Vec::new(),
-            odd_id_clicks: Vec::new(),
-            odd_ids: Vec::new(),
+            extra_clicks: Vec::new(),
+            click_end: 0,
             scratch: Scratch::new(),
             // What `Ingest::read` takes for a chunk: untouched until read into, or `touch`.
             input: vec![0; crate::READ_ROOM + chunk + crate::READ_SLACK + 1 + crate::PAD],
@@ -131,7 +222,7 @@ impl PosOut {
     }
 
     /// Has the kernel back the buffers now, until `stop` says so (`Parts::touch`): the chunk
-    /// buffer and a fair share of the events' and the clicks' blocks.
+    /// buffer and a fair share of the events' block.
     pub(crate) fn touch(&mut self, stop: &impl Fn() -> bool) {
         for page in self.input.chunks_mut(4096) {
             if stop() {
@@ -141,7 +232,6 @@ impl PosOut {
         }
         // A fair share of the rows: a quarter of the block (`event_lists`).
         self.events.touch(self.events.capacity() / 4, stop);
-        self.clicks.touch(self.clicks.capacity() / 4, stop);
         self.pays.touch(usize::MAX, stop);
     }
 }
@@ -177,6 +267,37 @@ pub(crate) fn keys(sample: &[(u64, u64)], event_rows: usize, force: bool) -> Opt
     find_keys(sample, event_rows).or(force.then_some((0, 0)))
 }
 
+/// (click half, user half) of up to `SAMPLE_ROWS` of `lines`, the first lines of the click
+/// files, as `sample`.
+pub(crate) fn click_sample(lines: &[u8]) -> Vec<(u64, u64)> {
+    let mut rows = Vec::new();
+    // SAFETY: whole lines of a padded buffer; the fields are inside it.
+    unsafe {
+        crate::tok::Quick::lines::<4>(lines.as_ptr().add(1), lines.len() - 1 - crate::PAD, &mut Scratch::new(), |fields| {
+            let (id, user) = (fields[0], fields[1]);
+            if rows.len() < SAMPLE_ROWS
+                && let Some(click) = scramble::canonical_at(id.p, id.len, b'k')
+                && let Some(user) = scramble::canonical_at(user.p, user.len, b'u')
+            {
+                rows.push((scramble::half(click), scramble::half(user)));
+            }
+        })
+    };
+    rows
+}
+
+/// The click key `sample` gives (`click_sample`), with the user key it was found under; 0
+/// for none. The clicks are numbered as the events are, a person's one after another and the
+/// persons in order, so the search is `find_keys`'s. Nothing downstream trusts the key: under
+/// a wrong one the clicks have numbers past the click table or in no order, and the stages
+/// after the parse take them as they find them.
+pub(crate) fn click_key(sample: &[(u64, u64)], click_rows: usize) -> (u64, u64) {
+    if sample.len() < MIN_ROWS {
+        return (0, 0);
+    }
+    find_keys(sample, click_rows).unwrap_or((0, 0))
+}
+
 /// The keys and the shape of the dense arrays.
 pub struct PosPlan {
     pub user_key: u64,
@@ -186,9 +307,9 @@ pub struct PosPlan {
     pub parts: usize,
     /// Persons the per-person arrays hold; a user number's person is below it.
     pub persons: u32,
-    /// Persons per click list = `1 << click_shift`.
-    pub click_shift: u32,
-    pub click_parts: usize,
+    /// The clicks' key, 0 when none was found, and the table of the clicks by number.
+    pub click_key: u64,
+    pub clicks: ClickTable,
     /// Event rows decoded eight at a time (`wide`), where the build has AVX-512; `SS_POS_DECODE`.
     pub wide: bool,
     /// Event lines read by their shape straight into the wide decode (`fused`), no tokenizer
@@ -213,20 +334,19 @@ pub struct PosOut {
     pub events: Chunks<PosEvent>,
     /// The same lists: the `pay` of each valid purchase among them.
     pub pays: Parts<PosPay>,
-    /// List `person >> click_shift`: valid clicks whose `user_id` is a number and whose
-    /// `click_id` has a key (`types::pos::click_key_at`).
-    pub clicks: Chunks<PosClick>,
     /// Every other well-formed event line with an `event_id`, as the classic record.
     pub odd_events: Vec<EventRec>,
     /// The `user_id` of each `PosEvent` flagged `POS_ODD_USER`, at its `u`.
     pub odd_users: Vec<Id>,
-    /// Every other valid click whose `user_id` is not such a number, as the classic record
-    /// (`user` as read).
+    /// Every valid click whose `user_id` is not a number inside the arrays, as the classic
+    /// record (`user` as read). The valid clicks of numbered users are in the click table
+    /// (`PosPlan::clicks`) or here:
     pub odd_clicks: Vec<ClickRec>,
-    /// The `click_id` of each click in `clicks` that has no key (`PosClick::odd`).
-    pub odd_ids: Vec<Id>,
-    /// The valid clicks of numbered users whose campaign is past a `PosClick`'s bits.
-    pub odd_id_clicks: Vec<OddIdClick>,
+    /// The valid clicks of numbered users that have no slot in the click table, or whose
+    /// slot holds another click.
+    pub extra_clicks: Vec<ExtraClick>,
+    /// One past the highest slot of the click table this worker stored a click in.
+    pub click_end: usize,
     scratch: Scratch,
     /// The chunk being parsed, when it is read and not mapped (`Ingest::read`), and the file
     /// it was read from, kept open for the next.
@@ -237,11 +357,10 @@ pub struct PosOut {
 }
 
 impl PosOut {
-    /// Slot `free-early`: the lists are dead once placed and grouped.
+    /// Slot `free-early`: the lists are dead once placed.
     pub fn release(&mut self) {
         self.events.release();
         self.pays.release();
-        self.clicks.release();
     }
 }
 
@@ -409,15 +528,15 @@ impl<T: Copy + Default> Pending<T> {
 
 impl Ingest {
     /// The plan for `shape` and the keys `keys` found (`crate::open`).
-    pub(crate) fn pos_plan(&self, shape: PosShape, (user_key, event_key): (u64, u64)) -> PosPlan {
+    pub(crate) fn pos_plan(&self, shape: PosShape, (user_key, event_key): (u64, u64), click_key: u64, clicks: ClickTable) -> PosPlan {
         PosPlan {
             user_key,
             event_key,
             shift: shape.shift,
             parts: shape.parts,
             persons: shape.persons,
-            click_shift: shape.click_shift,
-            click_parts: shape.click_parts,
+            click_key,
+            clicks,
             wide: DECODES[types::env::pick("SS_POS_DECODE", DECODES)] == "wide",
             // The fused decode finds a date among the table's months, one step each.
             fused: ["fused", "kernel"].contains(&DECODES[types::env::pick("SS_POS_DECODE", DECODES)]) && self.few_months(),
@@ -489,7 +608,7 @@ fn find_keys(sample: &[(u64, u64)], event_rows: usize) -> Option<(u64, u64)> {
     let lowest = persons.chunk_by(|a, b| a == b).find(|rows| rows.len() >= 4)?[0];
     let first: Vec<u64> = sample.iter().filter(|&&(_, user)| person_of(user, user_key) == lowest).map(|&(event, _)| event).collect();
     let bound = 2 * event_rows as u64 + (1 << 16);
-    // A whale has at most 2% of the events; a 16th of the lines leaves room.
+    // A whale has at most 2% of the events or the clicks; a 16th of the lines leaves room.
     let tries = (event_rows as u64 / 16).max(1 << 16);
     let inside = |half, key| scramble::number_of_half(half, key) < bound;
     let event_key = (0..tries)
@@ -592,11 +711,8 @@ unsafe fn clicks<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &D
         return unsafe { wide::fused::kern::clicks::<M>(p, len, lead, ctx, dates, campaigns, plan, out) };
     }
     let _ = campaigns;
-    let PosOut { clicks, odd_clicks, odd_id_clicks, odd_ids, scratch, .. } = out;
-    let mut pending = Pending::new();
-    unsafe { T::lines::<4>(p, len, scratch, |fields| click_row::<M>(ctx, dates, plan, fields, &mut pending, clicks, odd_clicks, odd_id_clicks, odd_ids)) };
-    pending.flush::<M>(clicks);
-    clicks.fence();
+    let PosOut { odd_clicks, extra_clicks, click_end, scratch, .. } = out;
+    unsafe { T::lines::<4>(p, len, scratch, |fields| click_row(ctx, dates, plan, fields, odd_clicks, extra_clicks, click_end)) };
 }
 
 /// The checks of `crate::event_row`, the same bits; only where the record goes differs.
@@ -698,43 +814,34 @@ fn odd_user(user: Field, odd_users: &mut Vec<Id>) -> (u32, u16) {
 /// # Safety
 /// The fields are from a segment.
 #[inline(always)]
-unsafe fn click_row<M: Mode>(
-    ctx: &Ctx,
-    dates: &Dates,
-    plan: &PosPlan,
-    fields: &[Field; 4],
-    pending: &mut Pending<PosClick>,
-    clicks: &mut Chunks<PosClick>,
-    odd_clicks: &mut Vec<ClickRec>,
-    odd_id_clicks: &mut Vec<OddIdClick>,
-    odd_ids: &mut Vec<Id>,
-) {
+#[allow(clippy::too_many_arguments)]
+unsafe fn click_row(ctx: &Ctx, dates: &Dates, plan: &PosPlan, fields: &[Field; 4], odd_clicks: &mut Vec<ClickRec>, extra_clicks: &mut Vec<ExtraClick>, click_end: &mut usize) {
     let [click, user, campaign, ts] = *fields;
     let key = unsafe { click_key_at(click.p, click.len) };
+    // The click's slot: its `click_id`'s number, when that is one of the table's.
+    let slot = unsafe { scramble::canonical_at(click.p, click.len, b'k') }
+        .map(|scrambled| scramble::number(scrambled, plan.click_key))
+        .filter(|&number| number < plan.clicks.slots() as u64);
     let click = unsafe { pack_at(click.p, click.len) };
     let (ok, ts) = unsafe { dates.ts(ts.p, ts.len) };
     if (click != 0) & (user.len != 0) & ok & (ts >= 0) & (ts < i64::from(ctx.ts_end))
         && let Some(campaign) = ctx.campaign_index.get(unsafe { pack_at(campaign.p, campaign.len) })
     {
         let number = unsafe { scramble::canonical_at(user.p, user.len, b'u') }.map(|scrambled| scramble::number(scrambled, plan.user_key));
-        match (number, key) {
-            (Some(number), Some(key)) if number >> ALIAS_BITS < u64::from(plan.persons) && (campaign as usize) < CLICK_CAMPAIGNS => {
-                let list = (number >> ALIAS_BITS >> plan.click_shift) as usize;
-                // SAFETY: the person is below `persons`, so the list is below `click_parts`.
-                unsafe { pending.push::<M>(list, PosClick::new(key, number as u32, ts as u32, campaign), clicks) };
+        match (number, key, slot) {
+            (Some(number), Some(key), Some(slot)) if number >> ALIAS_BITS < u64::from(plan.persons) && (campaign as usize) < CLICK_CAMPAIGNS => {
+                let (low, rest) = PosClick::new(key, number as u32, ts as u32, campaign).words();
+                // SAFETY: `slot` is below the table's slots.
+                if !unsafe { plan.clicks.put(slot as usize, low, rest) } {
+                    extra_clicks.push(ExtraClick { u: number as u32, click, ts: ts as u32, campaign });
+                }
+                *click_end = (*click_end).max(slot as usize + 1);
             }
-            // A `click_id` spelled another way (one line in 200,000 has its IDs in upper
-            // case): the click with its person's, and the ID kept beside the lists.
-            (Some(number), None) if number >> ALIAS_BITS < u64::from(plan.persons) && (campaign as usize) < CLICK_CAMPAIGNS => {
-                let list = (number >> ALIAS_BITS >> plan.click_shift) as usize;
-                odd_ids.push(click);
-                // SAFETY: as above.
-                unsafe { pending.push::<M>(list, PosClick::odd(odd_ids.len() - 1, number as u32, ts as u32, campaign), clicks) };
-            }
-            // A campaign past the record's bits: the click as it is, and its person leaves
-            // the fast lane (`src/positional.rs`).
-            (Some(number), _) if number >> ALIAS_BITS < u64::from(plan.persons) => {
-                odd_id_clicks.push(OddIdClick { u: number as u32, click, ts: ts as u32, campaign });
+            // No slot: a `click_id` spelled another way (one line in 200,000 has its IDs in
+            // upper case) or numbered past the table, or a campaign past the record's bits.
+            // The click as it is, with its person's (`src/positional.rs`).
+            (Some(number), ..) if number >> ALIAS_BITS < u64::from(plan.persons) => {
+                extra_clicks.push(ExtraClick { u: number as u32, click, ts: ts as u32, campaign });
             }
             _ => odd_clicks.push(ClickRec { user: unsafe { pack_at(user.p, user.len) }, click, ts: ts as u32, campaign }),
         }
@@ -773,6 +880,14 @@ pub(crate) mod wide {
 
     use super::*;
     use crate::ts::rd;
+
+    /// A click the table refused (`ClickTable::put`): kept as the click it is.
+    #[cold]
+    #[inline(never)]
+    #[cfg_attr(not(all(feature = "tok-shape", target_feature = "avx512vl", target_feature = "avx512cd", target_feature = "bmi2", target_feature = "lzcnt")), allow(dead_code))]
+    fn refused(click: PosClick, extra_clicks: &mut Vec<ExtraClick>) {
+        extra_clicks.push(ExtraClick { u: click.u(), click: types::pos::click_key_id(click.key()), ts: click.ts(), campaign: click.campaign() });
+    }
 
     /// Rows gathered before they are decoded; a multiple of 8.
     const ROWS: usize = 64;
@@ -814,16 +929,32 @@ pub(crate) mod wide {
             self.len = 0;
         }
 
-        /// `flush` for clicks held the same way: list, then the click's two words.
+        /// The clicks held (the click's number where an event's list is, then its two
+        /// words) into the table, all but the last `keep`: a click's slot is asked for when
+        /// the click is held (`kern::finish_clicks`), and stored into once the clicks after
+        /// it have given the cache line time to arrive. A slot is anywhere in the table, so
+        /// stored at once every click waited for its line. `end` is kept one past the highest
+        /// slot stored; a click whose slot holds another goes to `extra_clicks`.
         #[cfg_attr(not(all(feature = "tok-shape", target_feature = "avx512vl", target_feature = "avx512cd", target_feature = "bmi2", target_feature = "lzcnt")), allow(dead_code))]
         #[inline(never)]
-        fn flush_clicks(&mut self, clicks: &mut Chunks<PosClick>) {
-            let (lists, low, high) = (&self.lists, &self.low, &self.high);
-            // SAFETY: `len <= HELD`, and only lists of persons below `PosPlan::persons` are held.
-            unsafe {
-                clicks.extend(self.len, |at| (*lists.get_unchecked(at) as usize, PosClick::from_words(*low.get_unchecked(at), *high.get_unchecked(at))))
-            };
-            self.len = 0;
+        fn store_clicks(&mut self, table: &ClickTable, keep: usize, end: &mut usize, extra_clicks: &mut Vec<ExtraClick>) {
+            let stored = self.len.saturating_sub(keep);
+            let mut top = *end;
+            for at in 0..stored {
+                // SAFETY: `len <= HELD`, and only numbers below the table's slots are held.
+                unsafe {
+                    let (slot, low, rest) = (*self.lists.get_unchecked(at) as usize, *self.low.get_unchecked(at), *self.high.get_unchecked(at));
+                    if !table.put(slot, low, rest) {
+                        refused(PosClick::from_words(low, rest), extra_clicks);
+                    }
+                    top = top.max(slot + 1);
+                }
+            }
+            *end = top;
+            self.lists.copy_within(stored..self.len, 0);
+            self.low.copy_within(stored..self.len, 0);
+            self.high.copy_within(stored..self.len, 0);
+            self.len -= stored;
         }
     }
 
@@ -1714,28 +1845,26 @@ pub(crate) mod wide {
         #[cold]
         #[inline(never)]
         #[allow(clippy::too_many_arguments)]
-        unsafe fn slow_click<M: Mode>(
+        unsafe fn slow_click(
             p: *const u8,
             len: usize,
             at: usize,
             ctx: &Ctx,
             dates: &Dates,
             plan: &PosPlan,
-            pending: &mut Pending<PosClick>,
-            clicks: &mut Chunks<PosClick>,
             odd_clicks: &mut Vec<ClickRec>,
-            odd_id_clicks: &mut Vec<OddIdClick>,
-            odd_ids: &mut Vec<Id>,
+            extra_clicks: &mut Vec<ExtraClick>,
+            click_end: &mut usize,
         ) {
             // SAFETY: one line of the segment, 64 bytes readable at its first; a shape's
             // fields are inside the line.
             unsafe {
                 let line = p.add(at);
                 if let Some(shape) = click_shape(line) {
-                    return click_row::<M>(ctx, dates, plan, &shape.fields(line), pending, clicks, odd_clicks, odd_id_clicks, odd_ids);
+                    return click_row(ctx, dates, plan, &shape.fields(line), odd_clicks, extra_clicks, click_end);
                 }
                 let bytes = line_end(p, len, at) - at;
-                Scalar::lines::<4>(line, bytes, &mut Scratch::new(), |fields| click_row::<M>(ctx, dates, plan, fields, pending, clicks, odd_clicks, odd_id_clicks, odd_ids));
+                Scalar::lines::<4>(line, bytes, &mut Scratch::new(), |fields| click_row(ctx, dates, plan, fields, odd_clicks, extra_clicks, click_end));
             }
         }
 

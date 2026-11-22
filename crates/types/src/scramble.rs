@@ -161,28 +161,33 @@ pub fn canonical_packed(id: Id, letter: u8) -> Option<u64> {
 /// The packed ID of `letter` and the base 36 of `scrambled(number, key)`: the spelling
 /// `canonical_at` maps back to `number`.
 pub fn id_of(number: u64, key: u64, letter: u8) -> Id {
-    let mut rest = scrambled(number, key);
-    // The digits, the last first: at most 8, since the value is below 2^40.
-    let (mut digits, mut count) = ([0u8; 8], 0);
-    loop {
-        digits[count] = b"0123456789abcdefghijklmnopqrstuvwxyz"[(rest % 36) as usize];
-        rest /= 36;
-        count += 1;
-        if rest == 0 {
-            break;
-        }
-    }
-    // Packed as `id::pack` packs the text: 7 bits a byte, the letter in bits 56..63, each
-    // digit 7 bits below the one before it, so the 8th lands in the low bits where a ninth
-    // byte goes. (Through the text and `pack` this was 350 instructions, and every person
-    // without links is named by it.)
-    let (mut packed, mut shift) = (u64::from(letter) << 56, 49);
-    for &digit in digits[..count].iter().rev() {
-        packed |= u64::from(digit) << shift;
-        shift -= 7;
-    }
-    packed
+    let value = scrambled(number, key);
+    // Eight digits with leading zeros, the first in the top byte: the value is below 2^40,
+    // so two halves of four digits, each two pairs from a table. (Digit by digit, with a
+    // remainder and a quotient each, this was 1.3% of a run's cycles at 20M events: every
+    // person without links is named by it.)
+    let (high, low) = (value / 1_679_616, value % 1_679_616);
+    let pair = |pair: u64| u64::from(PAIRS[pair as usize]);
+    let digits = pair(high / 1296) << 48 | pair(high % 1296) << 32 | pair(low / 1296) << 16 | pair(low % 1296);
+    // The leading zeros go, but for the last digit.
+    let lead = (((digits ^ 0x3030_3030_3030_3030).leading_zeros() / 8) as usize).min(7);
+    let mut text = [0u8; 16];
+    text[0] = letter;
+    text[1..9].copy_from_slice(&(digits.swap_bytes() >> (8 * lead)).to_le_bytes());
+    // SAFETY: 16 bytes are readable.
+    unsafe { id::pack_at(text.as_ptr(), 9 - lead) }
 }
+
+/// Two base 36 digits as text, the first in the high byte, for each value below 36 * 36.
+static PAIRS: [u16; 1296] = {
+    let mut pairs = [0u16; 1296];
+    let mut at = 0;
+    while at < 1296 {
+        pairs[at] = (b"0123456789abcdefghijklmnopqrstuvwxyz"[at / 36] as u16) << 8 | b"0123456789abcdefghijklmnopqrstuvwxyz"[at % 36] as u16;
+        at += 1;
+    }
+    pairs
+};
 
 /// Eight IDs at once (AVX-512), for the positional parse's batches (`ingest::pos`).
 #[cfg(all(
@@ -336,6 +341,31 @@ mod tests {
             }
             text.extend(digits.iter().rev());
             assert_eq!(id_of(number, key, b'u'), id::pack(&text), "{:?}", String::from_utf8_lossy(&text));
+        }
+    }
+
+    /// `id_of` at every number of digits and at the edges between them.
+    #[test]
+    fn ids_of_every_length() {
+        let key = 0x5A_0F1E_2D3C;
+        let mut values = vec![0u64, MASK];
+        for digits in 1..8u32 {
+            let edge = 36u64.pow(digits);
+            values.extend([edge - 1, edge, edge + 1, edge * 35, edge * 36 - 1]);
+        }
+        for value in values.into_iter().filter(|&value| value <= MASK) {
+            let mut text = Vec::new();
+            let mut rest = value;
+            loop {
+                text.push(b"0123456789abcdefghijklmnopqrstuvwxyz"[(rest % 36) as usize]);
+                rest /= 36;
+                if rest == 0 {
+                    break;
+                }
+            }
+            text.push(b'k');
+            text.reverse();
+            assert_eq!(id_of(number(value, key), key, b'k'), id::pack(&text), "{:?}", String::from_utf8_lossy(&text));
         }
     }
 
