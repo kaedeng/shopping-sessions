@@ -216,7 +216,9 @@ struct Mixer(u64);
 impl Mixer {
     #[inline(always)]
     fn mix(&mut self, word: u64) {
-        let wide = u128::from(self.0 ^ word) * 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835u128;
+        // Wrapping: the product is wider than 128 bits, and a build that checks arithmetic
+        // (the tests') stopped here.
+        let wide = u128::from(self.0 ^ word).wrapping_mul(0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835u128);
         self.0 = (wide as u64) ^ (wide >> 64) as u64;
     }
 }

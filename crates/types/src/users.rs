@@ -767,7 +767,7 @@ mod tests {
         let users = Users::new(1 << 12, 1 << 10);
         let texts: Vec<Vec<u8>> = (0..1500u64)
             .map(|n| match n % 4 {
-                0 => format!("u{:032x}", u128::from(n) * 0x9E37_79B9_7F4A_7C15_1234_5678_9ABC_DEF1).into_bytes(),
+                0 => format!("u{:032x}", u128::from(n).wrapping_mul(0x9E37_79B9_7F4A_7C15_1234_5678_9ABC_DEF1)).into_bytes(),
                 1 => format!("U{n}").into_bytes(),
                 2 => format!("anonymous-user-{n}").into_bytes(),
                 _ => format!("u{}", n + 1).into_bytes(),
