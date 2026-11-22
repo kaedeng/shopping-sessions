@@ -797,7 +797,7 @@ impl Kern for Wide {
 
 impl Kern for Narrow {
     type Consts = NarrowConsts;
-    type ClickConsts = __m256i;
+    type ClickConsts = i64;
 
     #[inline(always)]
     fn consts(ctx: &Ctx, memo: &Memo) -> NarrowConsts {
@@ -805,12 +805,8 @@ impl Kern for Narrow {
     }
 
     #[inline(always)]
-    fn click_consts(ctx: &Ctx) -> __m256i {
-        // SAFETY: register arithmetic; AVX2 is compiled in.
-        #[allow(unused_unsafe)]
-        unsafe {
-            _mm256_set1_epi64x(i64::from(ctx.ts_end))
-        }
+    fn click_consts(ctx: &Ctx) -> i64 {
+        i64::from(ctx.ts_end)
     }
 
     #[inline(always)]
@@ -820,7 +816,7 @@ impl Kern for Narrow {
     }
 
     #[inline(always)]
-    unsafe fn finish_clicks(batch: *mut Batch, base: *const u8, bytes: usize, ts_end: __m256i, campaigns: &Campaigns, ctx: &Ctx, dates: &Dates, plan: &Plan, clicks: &mut Chunks<Ck>, slow: &mut usize) {
+    unsafe fn finish_clicks(batch: *mut Batch, base: *const u8, bytes: usize, ts_end: i64, campaigns: &Campaigns, ctx: &Ctx, dates: &Dates, plan: &Plan, clicks: &mut Chunks<Ck>, slow: &mut usize) {
         // SAFETY: the caller's contract.
         unsafe { finish_clicks_narrow(batch, base, bytes, ts_end, campaigns, ctx, dates, plan, clicks, slow) }
     }
@@ -2206,8 +2202,9 @@ unsafe fn finish_clicks(
     }
 }
 
-/// `finish_clicks` in 256-bit registers, four rows a step (`types::width::Narrow`), with each
-/// row's campaign looked up on its own where `finish_clicks` gathers eight.
+/// `finish_clicks` with no 512-bit instruction (`types::width::Narrow`): eight rows a step,
+/// which of them are clean by two 256-bit tests, and each clean row's window and campaign
+/// on its own where `finish_clicks` compares and gathers eight in a register.
 ///
 /// # Safety
 /// As `finish_clicks`.
@@ -2217,7 +2214,7 @@ unsafe fn finish_clicks_narrow(
     batch: *mut Batch,
     base: *const u8,
     bytes: usize,
-    ts_end: __m256i,
+    ts_end: i64,
     campaigns: &Campaigns,
     ctx: &Ctx,
     dates: &Dates,
@@ -2225,46 +2222,41 @@ unsafe fn finish_clicks_narrow(
     clicks: &mut Chunks<Ck>,
     slow: &mut usize,
 ) {
-    // SAFETY: as `finish_clicks`, with `first + 4 <= BATCH`.
+    // SAFETY: as `finish_clicks`.
     unsafe {
         let batch = &mut *batch;
         let rows = std::mem::take(&mut batch.count);
         look::<Narrow>(batch, rows, plan);
         let kept = if plan.whole_clicks { usize::MAX } else { 9 };
-        let all = |value: i64| _mm256_set1_epi64x(value);
         let mut first = 0;
         while first < rows {
-            let live: __mmask8 = if rows - first >= 4 { 0xF } else { (1u8 << (rows - first)) - 1 };
-            // A row a register: the click's width, ts, user, campaign. The four `ts`.
-            let at = batch.rows.as_ptr().add(first).cast::<__m256i>();
-            let (r0, r1, r2, r3) = (_mm256_load_si256(at), _mm256_load_si256(at.add(1)), _mm256_load_si256(at.add(2)), _mm256_load_si256(at.add(3)));
-            let ts = _mm256_permute2x128_si256::<0x20>(_mm256_unpackhi_epi64(r0, r1), _mm256_unpackhi_epi64(r2, r3));
-            let inside = _mm256_cmpge_epi64_mask(ts, _mm256_setzero_si256()) & _mm256_cmplt_epi64_mask(ts, ts_end);
-            let class = _mm256_loadu_si256(batch.class.as_ptr().add(first).cast());
-            let clean = live & _mm256_testn_epi64_mask(class, all(!(LONG_USER as i64)));
-            let dropped = clean & !inside;
-
-            // The clicks, and the rows whose campaign the table has not: the row code's.
+            let live = _bzhi_u32(0xFF, (rows - first) as u32) as __mmask8;
+            let clean = live & clean_rows(batch.class.as_ptr().add(first));
+            // The clicks, and the rows whose campaign the table has not: the row code's. A
+            // clean row with its `ts` outside the window is no click (`finish_clicks`).
             let mut slow_rows = live & !clean;
-            let mut left = clean & inside;
+            let mut left = clean;
             while left != 0 {
                 let lane = left.trailing_zeros() as usize;
                 left &= left - 1;
                 let row = first + lane;
-                let number = batch.rows[row][3] & 0xFFFF_FFFF;
+                let [raw, ts, _, number] = batch.rows[row];
+                if !(0..ts_end).contains(&(ts as i64)) {
+                    continue;
+                }
+                let number = number & 0xFFFF_FFFF;
                 let index = if number < Campaigns::NUMBERS as u64 { *campaigns.numbers.get_unchecked(number as usize) } else { Campaigns::NONE };
                 if index == Campaigns::NONE {
                     slow_rows |= 1 << lane;
                     continue;
                 }
                 // As `finish_clicks`.
-                let raw = batch.rows[row][0] as usize;
                 let quoted = usize::from(*batch.line[row] == b'"');
-                let click = pack_at(batch.line[row].add(quoted), (raw - 2 * quoted).min(kept));
-                clicks.push_at(0, Ck { click, user_ts: u64::from(batch.users[row]) | batch.rows[row][1] << 32, campaign: u64::from(index) });
+                let click = pack_at(batch.line[row].add(quoted), (raw as usize - 2 * quoted).min(kept));
+                clicks.push_at(0, Ck { click, user_ts: u64::from(batch.users[row]) | ts << 32, campaign: u64::from(index) });
             }
 
-            let mut left = slow_rows & !dropped;
+            let mut left = slow_rows;
             while left != 0 {
                 let row = first + left.trailing_zeros() as usize;
                 left &= left - 1;
@@ -2277,7 +2269,7 @@ unsafe fn finish_clicks_narrow(
                     at = line_end(base, bytes, at);
                 }
             }
-            first += 4;
+            first += 8;
         }
     }
 }
