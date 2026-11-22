@@ -5,7 +5,7 @@ Reads the inputs under `$DATA_DIR` and writes `user_daily/` and `campaign_daily/
 - `decisions.md` holds the design pick per slot, `alternatives.md` every option and measurement, `implementation.md` how the picks are built: the crates, the feature and env var of every slot, the record layouts, the limits.
 - `x86.md`: how the M4 Mac, the x86 test box and the scorer's Xeon differ, what was measured on x86, and the procedure for timing there. Read it before deciding anything on Mac numbers alone.
 - `src/main.rs` is the pipeline: three parallel stages (parse, dedup and person scatter, sessions and output). Each stage's code is a crate under `crates/`.
-- `Dockerfile` is a two-stage build: `rust:1.98-slim-trixie` compiles, `debian:trixie-slim` runs. `.cargo/config.toml` compiles amd64 for `x86-64-v3` (AVX2, BMI2).
+- `Dockerfile` is a two-stage build: `rust:1.98-slim-trixie` compiles, `debian:trixie-slim` runs. `.cargo/config.toml` compiles Linux amd64 for `cascadelake` (AVX-512 on top of AVX2 and BMI2; the organizers' README says the scorers have AVX-512).
 - `run.sh` is the entry point. The binary needs no temp directory and takes its thread count from `NCPU`.
 - `generator/` writes datasets; `prototypes/` are the throwaway benchmarks behind `alternatives.md`.
 

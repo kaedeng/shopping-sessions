@@ -308,8 +308,8 @@ The union-find takes one of the 8 workers: under `--cpus 8` a ninth busy thread 
 
 | Alternative | Where | Status | Result |
 | --- | --- | --- | --- |
-| `target-cpu=x86-64-v3` for amd64 (AVX2, BMI2) | `.cargo/config.toml` | pick | built; the image passes the fixtures on amd64 under emulation, no timing |
-| `target-cpu=cascadelake` | `.cargo/config.toml` | untested | the README permits it |
+| `target-cpu=x86-64-v3` for amd64 (AVX2, BMI2) | `.cargo/config.toml` | measured | the previous pick; still what Intel Macs build with, and the build for a Linux amd64 machine without AVX-512 (`RUSTFLAGS="-C target-cpu=x86-64-v3"`) |
+| `target-cpu=cascadelake` | `.cargo/config.toml` | pick | x86, 20M, same source both sides: faster in all six comparisons. Paired runs (two copies at once, two threads per core) −1.7 to −9.6%, typically about −6% (743 → 696 ms); single core 2360 → 2322 ms (−1.6%); 8 cores back to back 460 → 447 ms (−2.9%, inside the noise). Parse, `place` and sessions all gain. 36/36 fixtures, `dev/` MATCH, and output identical to the `x86-64-v3` build at 20M. The binary has about 2,400 zmm instructions, the parse loops among them (see `implementation.md`, Build); `-evex512` and `+prefer-256-bit` both leave them in. Unknown: whether the scorer's Xeon lowers its clock for them. Light 512-bit integer code drops a Skylake-SP or Cascade Lake core one frequency step; Ice Lake and newer lose little. Only a submission can tell |
 | Fat LTO against thin LTO, with `codegen-units = 1` and `panic = "abort"` | Cargo profile | measured | no difference on the Mac at full size (min/median total of 10 runs, two rounds: fat 711/744 and 729/764 ms, thin 710/728 and 749/760); fat is what is built. `opt-level` is 3, the release default |
 | Profile-guided optimisation trained on generator output during the image build | Dockerfile | measured | no gain on the Mac at full size: 724/748 and 741/766 ms against fat LTO's 711/744 and 729/764, trained on a 5M-event set from another seed plus `dev/`. Not wired into the Dockerfile; untested on amd64, where it would need the generator in the image |
 
