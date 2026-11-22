@@ -6,6 +6,7 @@
 //! `SS_TIMING=1` prints each stage's wall time to stderr; implementation.md lists every knob.
 //! Built with `--features trace`, `SS_TRACE=FILE` saves every task as a span (`types::par::trace`).
 
+mod fallback;
 #[cfg(feature = "pipe-positional")]
 mod opaque;
 #[cfg(feature = "pipe-positional")]
@@ -153,8 +154,12 @@ fn hand_back(workers: usize) {
 }
 
 fn main() {
+    // A death of this try is the start of a second, by the classic pipeline (`fallback`).
+    fallback::arm();
     if let Err(error) = run() {
         eprintln!("shopping-sessions: {error}");
+        // So is an error. Back from this only where there is no second try to start.
+        fallback::again();
         std::process::exit(1);
     }
 }
@@ -172,6 +177,8 @@ fn run() -> Result<(), String> {
     // (`probe::stretched`).
     let stretched = probe::stretched();
     let mut lap = |stage: &'static str| {
+        // `SS_FAULT`: the run dies here, for tests.
+        fallback::fault(stage);
         if let Some(&(_, taking)) = stage_workers.iter().find(|(after, _)| *after == stage) {
             par::limit(taking);
         }
@@ -191,6 +198,11 @@ fn run() -> Result<(), String> {
     };
 
     let (data, out) = (dir("DATA_DIR", "/data"), dir("OUTPUT_DIR", "/output"));
+    // A second try writes where the first may have left files (`fallback`).
+    if fallback::second() {
+        fallback::clear(&out);
+    }
+    fallback::failing()?;
     // `SS_PROBE`: a report on the machine after the run (`probe`).
     let probe = probe::Probe::start();
     one_arena();
@@ -229,6 +241,7 @@ fn run() -> Result<(), String> {
     {
         if let Some((plan, parsed)) = opened.pos {
             positional::run(&ctx, &ingest, &plan, parsed, &out, parallel_alloc, &mut lap)?;
+            fallback::done();
             if timing {
                 eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
             }
@@ -458,11 +471,14 @@ fn run() -> Result<(), String> {
         if let Err(error) = written {
             drop(failure.set(error));
         }
+        fallback::fault("files");
     });
     drop((states, files));
     if let Some(error) = failure.into_inner() {
         return Err(error);
     }
+    // Every file is written: a death from here on loses nothing.
+    fallback::done();
     lap("output");
     if timing {
         eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
