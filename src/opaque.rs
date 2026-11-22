@@ -73,6 +73,10 @@ impl Persons {
         let numbered = users.count();
         up.touch_first(numbered);
         names.touch_first(numbered);
+        // `SS_TAIL=small`: the entries past those are read for every row of a user that no
+        // link names, and are zeros: kept on 4 KB pages, they read as one zero page.
+        up.small_tail(numbered);
+        names.small_tail(numbered);
         // The root of `x`, every user on the way pointed at its grandparent.
         fn find(up: &mut [u32], mut x: u32) -> u32 {
             loop {
