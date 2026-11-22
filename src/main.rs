@@ -104,18 +104,20 @@ fn descriptors() -> bool {
     false
 }
 
-/// Slot `free-early`, the last of it (`SS_EXIT=release|leave`): every large block the
-/// run still holds goes back to the kernel now, a piece a task on all the workers, and the
-/// process ends with next to nothing mapped. Call it last: what the blocks held reads as
-/// zeros afterwards.
+/// Slot `free-early`, the last of it (`SS_EXIT=leave|release`, the pick first): with
+/// `release`, every large block the run still holds goes back to the kernel now, a piece a
+/// task on all the workers, and the process ends with next to nothing mapped. Call it
+/// last: what the blocks held reads as zeros afterwards.
 ///
 /// Left to the exit, one thread unmaps it all after the output is written and before the
-/// process is gone, which whoever times the run waits for. With 2 MB pages that is 5 ms at
-/// 20M events; on 4 KB pages (the scorer has no huge pages) the 900 MB still held are
-/// 225,000 pages and it was 55 ms, a tenth of the run.
+/// process is gone, which whoever times the run waits for. On the x86 box (WSL2) with 4 KB
+/// pages that was 51 ms at 20M events, and handing the blocks back first made the process
+/// 8% faster. On the scorer the same build was 19 ms slower with it than without (0.6270
+/// against 0.6076 s, one binary): unmapping at exit is cheap there, or eight threads
+/// unmapping at once is dear. So the pick is to leave it to the exit.
 fn hand_back(workers: usize) {
     #[cfg(feature = "alloc-region")]
-    if types::mem::free_early() && types::env::pick("SS_EXIT", &["release", "leave"]) == 0 {
+    if types::mem::free_early() && types::env::pick("SS_EXIT", &["leave", "release"]) == 1 {
         if let Some((from, to)) = region::large_used() {
             let started = Instant::now();
             // A thread's chunk is 64 MB, mostly one worker's; smaller pieces so that the
@@ -166,6 +168,7 @@ fn run() -> Result<(), String> {
             par::limit(taking);
         }
         types::tl::mark(stage);
+        probe::lapped();
         if timing || stretched.is_some() {
             let now = Instant::now();
             if timing {
