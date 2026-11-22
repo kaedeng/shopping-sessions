@@ -22,7 +22,8 @@ use types::hash::{hash, person_hash};
 use types::parts::{Combine, Mode, Parts, Plain};
 use types::record::{ClickN, ClickRec, PersonEvent};
 use types::mem::Zeroed;
-use types::users::{Users, mix_long};
+use types::id::SLOW;
+use types::users::{UserKey, Users, mix_long, short_digits};
 use types::{Ctx, Id, par};
 
 use crate::Scattered;
@@ -589,9 +590,17 @@ impl Names {
     /// bytes, then its bytes. A name is read through three tables (the root's name, that
     /// user's slot, the slot's key), each far larger than the caches, so the keys go a few
     /// at a time: every table's lines are asked for before any is read.
+    ///
+    /// An entry is stored, not pushed: room for every key's entry at its longest is made
+    /// first, a short name is its length, the `u` and a word of digits whatever their
+    /// count, and a long one's 32 digits come a byte's two at a time from a table. (Pushed
+    /// byte by byte through `Users::text`, each with its test for room, a name was 90
+    /// cycles, and the names a fifth of the output stage.)
     pub fn texts(&self, keys: &[Id], out: &mut Vec<u8>) {
         let users = &self.plan.users;
         let mut named = [0u32; NAMES_HELD];
+        out.reserve(keys.len() * ENTRY_MOST + 16);
+        let (mut at, mut left) = (out.len(), keys.len());
         for held in keys.chunks(NAMES_HELD) {
             for &key in held {
                 self.persons.prefetch_name(key as u32 - 1);
@@ -604,18 +613,69 @@ impl Names {
                 users.prefetch_key(name);
             }
             for &name in &named[..held.len()] {
-                let at = out.len();
-                out.extend_from_slice(&[0; 4]);
-                users.text(name, out);
-                let len = (out.len() - at - 4) as u32;
-                out[at..at + 4].copy_from_slice(&len.to_le_bytes());
+                left -= 1;
+                // SAFETY: `out` has room for `ENTRY_MOST` bytes for this key and each of
+                // the `left` after it, and 16 more: an entry here is at most `ENTRY_MOST`,
+                // and a short one's word of digits ends inside them.
+                unsafe {
+                    let to = out.as_mut_ptr().add(at);
+                    match users.key(name) {
+                        UserKey::Short(key) if key & SLOW != 0 => at = interned(key, out, at, left),
+                        UserKey::Short(key) => {
+                            let (digits, count) = short_digits(key);
+                            to.cast::<u32>().write_unaligned((1 + count as u32).to_le());
+                            *to.add(4) = b'u';
+                            to.add(5).cast::<[u8; 8]>().write_unaligned(digits);
+                            at += 5 + count;
+                        }
+                        UserKey::Long(hi, lo) => {
+                            to.cast::<u32>().write_unaligned(33u32.to_le());
+                            *to.add(4) = b'u';
+                            for (place, byte) in hi.to_le_bytes().into_iter().chain(lo.to_le_bytes()).enumerate() {
+                                to.add(5 + 2 * place).cast::<[u8; 2]>().write_unaligned(HEX[usize::from(byte)]);
+                            }
+                            at += ENTRY_MOST;
+                        }
+                    }
+                }
             }
         }
+        // SAFETY: the bytes up to `at` were written, inside the room made.
+        unsafe { out.set_len(at) };
     }
+}
+
+/// The entry of a name the directory holds interned (not a `u` and digits): any length, so
+/// through the vector, and room made again for the `left` entries after it. Returns where
+/// the next entry goes.
+#[cold]
+#[inline(never)]
+fn interned(key: u64, out: &mut Vec<u8>, at: usize, left: usize) -> usize {
+    // SAFETY: the bytes up to `at` were written.
+    unsafe { out.set_len(at) };
+    out.extend_from_slice(&[0; 4]);
+    types::id::unpack(key, out);
+    let len = (out.len() - at - 4) as u32;
+    out[at..at + 4].copy_from_slice(&len.to_le_bytes());
+    out.reserve(left * ENTRY_MOST + 16);
+    out.len()
 }
 
 /// Names `Names::texts` reads together.
 const NAMES_HELD: usize = 32;
+/// The longest entry of a name the directory keeps as a key: its length in four bytes, `u`,
+/// 32 hexadecimal digits.
+const ENTRY_MOST: usize = 37;
+/// A byte's two hexadecimal digits.
+static HEX: [[u8; 2]; 256] = {
+    let mut table = [[0u8; 2]; 256];
+    let mut byte = 0;
+    while byte < 256 {
+        table[byte] = [b"0123456789abcdef"[byte >> 4], b"0123456789abcdef"[byte & 15]];
+        byte += 1;
+    }
+    table
+};
 
 /// Stages 1 and 2. `None` when the directory was too small for the input's users: the
 /// caller starts over with a larger `grow`. `whole_clicks`: `ingest::opaque::click_id_at`.

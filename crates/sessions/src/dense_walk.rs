@@ -20,7 +20,7 @@
 use core::arch::x86_64::*;
 
 use types::record::{PAY_CATEGORY_SHIFT, PAY_PRICE_MASK};
-use types::rows::{NO_CATEGORY, UserDaily};
+use types::rows::{EVENTS_HELD, NO_CATEGORY, SESSIONS_HELD, UserDailyNarrow};
 use types::{Ctx, Id};
 
 use crate::agg_dense::Counters;
@@ -102,6 +102,21 @@ fn grow<T: Clone + Default>(column: &mut Vec<T>, len: usize) {
     }
 }
 
+/// Lists the rows `which` names of the 16 from `row` on, each with its count: the rows a
+/// narrow column does not hold (`UserDailyNarrow::wide_events`), one in a thousand.
+#[cold]
+#[inline(never)]
+fn wide_rows(row: usize, mut which: __mmask16, counts: __m512i, list: &mut Vec<(u32, u32)>) {
+    let mut held = [0u32; 16];
+    // SAFETY: 16 lanes into 16 entries.
+    unsafe { _mm512_storeu_si512(held.as_mut_ptr().cast(), counts) };
+    while which != 0 {
+        let lane = which.trailing_zeros() as usize;
+        list.push(((row + lane) as u32, held[lane]));
+        which &= which - 1;
+    }
+}
+
 /// Whether the walk can run for this window: a `ts` and the origin's time of day must add up
 /// in 32 bits.
 pub(crate) fn fits(ctx: &Ctx) -> bool {
@@ -129,7 +144,7 @@ pub(crate) unsafe fn walk(
     sorter: &mut sort_times::Scratch,
     wide: &mut attr_wide::Attr,
     counters: &mut Counters,
-    out: &mut UserDaily,
+    out: &mut UserDailyNarrow,
 ) {
     let m = ends[span - 1] as usize;
     if m == 0 {
@@ -322,39 +337,45 @@ pub(crate) unsafe fn walk(
         counters.paid(s_camp[session], s_day[session] as usize, s_rev[session]);
     }
 
-    // The rows: five columns copied 16 rows a step, then each person's name over its rows.
-    out.reserve(nrow + 32);
-    let at = out.person.len();
-    debug_assert!([out.day.len(), out.sessions.len(), out.events.len(), out.revenue_cents.len(), out.top_category.len()].iter().all(|&len| len == at));
+    // The rows, 16 a step: the day and the two counts narrowed where they are stored (a
+    // byte, a byte, two bytes: `UserDailyNarrow`), the revenue and the category copied. Then
+    // each person once, with its first row.
+    out.reserve(nrow + 32, people.len());
+    let (at, runs) = (out.day.len(), out.person.len());
+    debug_assert!([out.sessions.len(), out.events.len(), out.revenue_cents.len(), out.top_category.len()].iter().all(|&len| len == at));
+    debug_assert_eq!(out.first.len(), runs);
     // SAFETY: room for `nrow + 32` rows in every column; a step writes at most 15 rows past
-    // the last and reads as far past it in the rows' columns, which have that room; a
-    // person's rows are at most 16 (a row a day), and its name is stored over 16 of them
-    // from its first, the persons in order, so each row keeps its own person's.
+    // the last and reads as far past it in the rows' columns, which have that room; and
+    // room for an entry per person of the bucket in the persons' two.
     unsafe {
-        let (person, day, sessions, events, revenue, category) =
-            (out.person.as_mut_ptr().add(at), out.day.as_mut_ptr().add(at), out.sessions.as_mut_ptr().add(at), out.events.as_mut_ptr().add(at), out.revenue_cents.as_mut_ptr().add(at), out.top_category.as_mut_ptr().add(at));
-        let day0 = _mm512_set1_epi32(ctx.day0);
+        let (day, sessions, events, revenue, category) = (out.day.as_mut_ptr().add(at), out.sessions.as_mut_ptr().add(at), out.events.as_mut_ptr().add(at), out.revenue_cents.as_mut_ptr().add(at), out.top_category.as_mut_ptr().add(at));
+        let (sessions_held, events_held) = (_mm512_set1_epi32(SESSIONS_HELD as i32), _mm512_set1_epi32(EVENTS_HELD as i32));
         let mut row = 0;
         while row < nrow {
-            _mm512_storeu_si512(day.add(row).cast(), _mm512_add_epi32(_mm512_loadu_si512(row_day.as_ptr().add(row).cast()), day0));
-            let counts = _mm512_sub_epi32(_mm512_loadu_si512(row_s0.as_ptr().add(row + 1).cast()), _mm512_loadu_si512(row_s0.as_ptr().add(row).cast()));
-            _mm512_storeu_si512(sessions.add(row).cast(), _mm512_cvtepu32_epi64(_mm512_castsi512_si256(counts)));
-            _mm512_storeu_si512(sessions.add(row + 8).cast(), _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(counts)));
-            let counts = _mm512_sub_epi32(_mm512_loadu_si512(row_e0.as_ptr().add(row + 1).cast()), _mm512_loadu_si512(row_e0.as_ptr().add(row).cast()));
-            _mm512_storeu_si512(events.add(row).cast(), _mm512_cvtepu32_epi64(_mm512_castsi512_si256(counts)));
-            _mm512_storeu_si512(events.add(row + 8).cast(), _mm512_cvtepu32_epi64(_mm512_extracti64x4_epi64::<1>(counts)));
+            let live: __mmask16 = if nrow - row >= 16 { 0xFFFF } else { (1u16 << (nrow - row)) - 1 };
+            _mm_storeu_si128(day.add(row).cast(), _mm512_cvtepi32_epi8(_mm512_loadu_si512(row_day.as_ptr().add(row).cast())));
+            let in_row = _mm512_sub_epi32(_mm512_loadu_si512(row_s0.as_ptr().add(row + 1).cast()), _mm512_loadu_si512(row_s0.as_ptr().add(row).cast()));
+            _mm_storeu_si128(sessions.add(row).cast(), _mm512_cvtusepi32_epi8(in_row));
+            let counted = _mm512_sub_epi32(_mm512_loadu_si512(row_e0.as_ptr().add(row + 1).cast()), _mm512_loadu_si512(row_e0.as_ptr().add(row).cast()));
+            _mm256_storeu_si256(events.add(row).cast(), _mm512_cvtusepi32_epi16(counted));
+            // The rows a narrow column does not hold: listed with their counts.
+            let (many, long) = (_mm512_mask_cmpge_epu32_mask(live, in_row, sessions_held), _mm512_mask_cmpge_epu32_mask(live, counted, events_held));
+            if many | long != 0 {
+                wide_rows(at + row, many, in_row, &mut out.wide_sessions);
+                wide_rows(at + row, long, counted, &mut out.wide_events);
+            }
             _mm512_storeu_si512(revenue.add(row).cast(), _mm512_loadu_si512(row_rev.as_ptr().add(row).cast()));
             _mm512_storeu_si512(revenue.add(row + 8).cast(), _mm512_loadu_si512(row_rev.as_ptr().add(row + 8).cast()));
             _mm_storeu_si128(category.add(row).cast(), _mm_loadu_si128(row_cat.as_ptr().add(row).cast()));
             row += 16;
         }
-        for &p in people.iter() {
-            let name = _mm512_set1_epi64((Id::from(base) + Id::from(p)) as i64);
-            let rows = person.add(*s_row.get_unchecked(rank(stretch(p as usize).0)) as usize);
-            _mm512_storeu_si512(rows.cast(), name);
-            _mm512_storeu_si512(rows.add(8).cast(), name);
+        let (person, first) = (out.person.as_mut_ptr().add(runs), out.first.as_mut_ptr().add(runs));
+        for (run, &p) in people.iter().enumerate() {
+            *person.add(run) = Id::from(base) + Id::from(p);
+            *first.add(run) = (at + *s_row.get_unchecked(rank(stretch(p as usize).0)) as usize) as u32;
         }
-        out.person.set_len(at + nrow);
+        out.person.set_len(runs + people.len());
+        out.first.set_len(runs + people.len());
         out.day.set_len(at + nrow);
         out.sessions.set_len(at + nrow);
         out.events.set_len(at + nrow);

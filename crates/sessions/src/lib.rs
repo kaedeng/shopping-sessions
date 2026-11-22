@@ -37,7 +37,7 @@ mod sort_times;
 mod tests;
 
 use types::record::{ClickN, ClickRec, PersonEvent};
-use types::rows::{CampaignDaily, UserDaily};
+use types::rows::{CampaignDaily, UserDaily, UserDailyNarrow};
 use types::{Ctx, Id};
 
 /// One click as the attribution reads it; a person's clicks sit together in the bucket.
@@ -137,6 +137,9 @@ fn key_sort() -> SortFn {
 pub struct Agg {
     /// This worker's `user_daily` rows, one per person and day with a session.
     pub user_daily: UserDaily,
+    /// More of them: the rows of the buckets that went through `dense_walk`, which writes
+    /// them narrow. A row is in one of the two tables.
+    pub user_narrow: UserDailyNarrow,
     bucket: partitioned::Scratch,
     rows: purchase_side::Rows,
     attr: attr_sweep::Attr,
@@ -157,6 +160,7 @@ impl Agg {
     pub fn new(ctx: &Ctx) -> Agg {
         Agg {
             user_daily: UserDaily::default(),
+            user_narrow: UserDailyNarrow::default(),
             bucket: Default::default(),
             rows: Default::default(),
             attr: attr_sweep::Attr::new(ctx),
