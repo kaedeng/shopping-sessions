@@ -61,7 +61,7 @@ mod other {
 mod linux {
     use std::alloc::{GlobalAlloc, Layout, System};
     use std::cell::UnsafeCell;
-    use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering::Relaxed, Ordering::SeqCst};
 
     use super::Region;
 
@@ -126,6 +126,13 @@ mod linux {
     const MAP_PRIVATE_ANONYMOUS_NORESERVE: i32 = 0x02 | 0x20 | 0x4000;
     const MADV_HUGEPAGE: i32 = 14;
     const MADV_NOHUGEPAGE: i32 = 15;
+    const MADV_POPULATE_WRITE: i32 = 23;
+    /// `SS_POPULATE` is set and not 0 (`types::mem::populate_window`): a block that moves to
+    /// a larger one has the pages its bytes go to backed in one call first. Cleared when the
+    /// kernel does not know the call.
+    static POPULATE: AtomicBool = AtomicBool::new(false);
+    /// The smallest block that is worth the call.
+    const POPULATE_FROM: usize = 64 << 10;
 
     /// Makes the reservation, once. Returns whether there is one.
     #[cold]
@@ -161,6 +168,12 @@ mod linux {
                 let value = getenv(c"SS_HUGE".as_ptr().cast());
                 if value.is_null() { b'a' } else { *value }
             };
+            // SAFETY: as above.
+            let populate = unsafe {
+                let value = getenv(c"SS_POPULATE".as_ptr().cast());
+                !value.is_null() && *value != 0 && !(*value == b'0' && *value.add(1) == 0)
+            };
+            POPULATE.store(populate, SeqCst);
             // SAFETY: inside the mapping. A kernel without huge pages says no to both: 4 KB
             // pages everywhere then.
             unsafe {
@@ -418,6 +431,15 @@ mod linux {
             // SAFETY: the caller's contract: `new_size` with this alignment is a valid layout.
             let to = unsafe { self.alloc(Layout::from_size_align_unchecked(new_size, layout.align())) };
             if !to.is_null() {
+                // `SS_POPULATE`: the copy below writes the new block's first pages one after
+                // another, each a fault of its own where it is fresh memory without huge
+                // pages. A large block starts on a page (`kind`).
+                if layout.size() >= POPULATE_FROM && ours(to) && to as usize & (PAGE - 1) == 0 && POPULATE.load(Relaxed) {
+                    // SAFETY: whole pages inside the new block, which holds `new_size` bytes.
+                    if unsafe { madvise(to, layout.size() & !(PAGE - 1), MADV_POPULATE_WRITE) } != 0 {
+                        POPULATE.store(false, Relaxed);
+                    }
+                }
                 // SAFETY: two distinct blocks, each at least `layout.size()` bytes.
                 unsafe {
                     std::ptr::copy_nonoverlapping(ptr, to, layout.size());

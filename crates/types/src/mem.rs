@@ -58,6 +58,15 @@ impl<T> Zeroed<T> {
     /// `touch` for memory no other thread has yet: the first `len` values onto whole 2 MB
     /// pages.
     pub fn touch_first(&mut self, len: usize) {
+        // `SS_POPULATE`: every page of them backed in one call (`populate`), for a machine
+        // without huge pages.
+        if populate_window() != 0 {
+            let bytes = (len.min(self.len) * size_of::<T>()).next_multiple_of(4096).min(self.layout.size() & !4095);
+            // SAFETY: whole pages of the memory, which starts on a page.
+            if bytes != 0 && unsafe { populate(self.at.as_ptr().cast(), bytes) } {
+                return;
+            }
+        }
         let step = (HUGE / size_of::<T>().max(1)).max(1);
         for at in (0..len.min(self.len)).step_by(step) {
             // SAFETY: inside the memory, which is zeros there: the write changes nothing.
@@ -82,6 +91,18 @@ impl<T> Zeroed<T> {
 /// of 0 does not: the compiler knows it changes nothing and makes it a fenced load.
 pub fn touch<T>(table: &Zeroed<T>, piece: usize, pieces: usize, word: impl Fn(&T) -> &std::sync::atomic::AtomicU64) {
     use std::sync::atomic::Ordering::Relaxed;
+    // `SS_POPULATE`: every page of the piece backed in one call (`populate`), for a machine
+    // without huge pages: there each page of the table is otherwise a fault of its own, at
+    // the first key that lands on it.
+    if populate_window() != 0 {
+        let bytes = table.len * size_of::<T>();
+        let steps = bytes.div_ceil(HUGE);
+        let (from, to) = (steps * piece / pieces * HUGE, (steps * (piece + 1) / pieces * HUGE).min(bytes & !4095));
+        // SAFETY: whole pages inside the table, which starts on a page.
+        if to > from && unsafe { populate(table.at.as_ptr().cast::<u8>().add(from), to - from) } {
+            return;
+        }
+    }
     for at in table.firsts(piece, pieces) {
         let _ = word(&table[at]).compare_exchange(0, std::hint::black_box(0), Relaxed, Relaxed);
     }
@@ -163,6 +184,58 @@ pub unsafe fn release(addr: *const u8, len: usize) {
     }
     #[cfg(not(target_os = "linux"))]
     let _ = (addr, len);
+}
+
+/// `SS_POPULATE=KB`: the bytes `populate` is asked for at a time by a list that takes its
+/// memory page after page (`chunks::Chunks`), a power of two; 0, the default, for none.
+/// Read once.
+///
+/// For a machine without huge pages (the scorer's transparent huge pages are `never`): there
+/// every 4 KB page of fresh memory is a fault of its own, 416,000 of them in a run at 20M
+/// events against 2,800 with 2 MB pages, each an exception and a turn at the address-space
+/// lock that the eight workers take at once.
+pub fn populate_window() -> usize {
+    static WINDOW: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *WINDOW.get_or_init(|| {
+        let bytes = crate::env::number("SS_POPULATE", 0) << 10;
+        if bytes == 0 { 0 } else { bytes.next_power_of_two().max(4096) }
+    })
+}
+
+/// Has the kernel back `addr..addr + len` with zeroed pages now, in one call
+/// (`MADV_POPULATE_WRITE`, Linux 5.14): the pages a thread is about to write one after
+/// another, without a fault for each. A kernel that does not know the call says so once and
+/// is not asked again. Linux only; a no-op elsewhere.
+///
+/// Returns whether the kernel did it.
+///
+/// # Safety
+/// `addr..addr + len` is whole 4 KB pages of anonymous memory the caller owns. Pages that
+/// hold data keep it.
+pub unsafe fn populate(addr: *mut u8, len: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use core::ffi::{c_int, c_void};
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        unsafe extern "C" {
+            fn madvise(addr: *mut c_void, len: usize, advice: c_int) -> c_int;
+        }
+        const MADV_POPULATE_WRITE: c_int = 23;
+        static REFUSED: AtomicBool = AtomicBool::new(false);
+        if len != 0 && !REFUSED.load(Relaxed) {
+            // SAFETY: the caller's range. A failure leaves the pages to their first writes.
+            if unsafe { madvise(addr.cast(), len, MADV_POPULATE_WRITE) } == 0 {
+                return true;
+            }
+            REFUSED.store(true, Relaxed);
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (addr, len);
+        false
+    }
 }
 
 #[cfg(test)]

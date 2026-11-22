@@ -196,6 +196,13 @@ impl<T: Copy> Chunks<T> {
         }
         let new = self.next;
         self.next += CHUNK;
+        // `SS_POPULATE`: the chunks come one after another, so the block's next stretch is
+        // backed in one call when the first chunk of it is taken (`mem::populate`).
+        let window = crate::mem::populate_window();
+        if window != 0 && new & (window - 1) == 0 {
+            // SAFETY: whole chunks of the block, from the one handed out now.
+            unsafe { crate::mem::populate(new as *mut u8, window.min(self.end - new)) };
+        }
         if link == NONE {
             self.head[list] = new;
         } else {
