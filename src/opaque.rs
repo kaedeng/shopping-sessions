@@ -468,7 +468,13 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     });
     {
         let (parsed, persons) = (&parsed[..], &persons);
-        par::run(&mut scattered, parts + long_parts + parsed.len(), |_, mine, task| {
+        // The clicks' tasks are taken first: each is a worker's whole list, as long as
+        // hundreds of the lists' tasks, and taken last they were what the round ended on,
+        // one thread at the longest while seven had nothing left (up to 7 ms of 120 at 20M
+        // events).
+        let workers = parsed.len();
+        par::run(&mut scattered, workers + parts + long_parts, |_, mine, task| {
+            let task = if task < workers { parts + long_parts + task } else { task - workers };
             let Scattered { events, clicks, opaque: Scratch { table, kept, kept_long }, dense: ranges, .. } = mine;
             if let (Some(ranges), Some((shift, _))) = (ranges, dense) {
                 if task < parts {
