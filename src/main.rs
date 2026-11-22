@@ -124,6 +124,10 @@ fn hand_back(workers: usize) {
             // workers come out even.
             const PIECE: usize = 8 << 20;
             let mut states = vec![(); workers.max(1)];
+            // `SS_EXIT_WORKERS=1` is the exit's own work done here, on one thread: with
+            // `SS_PROBE=stage:handback` it tells what unmapping costs on a machine that
+            // shows nothing but a run's time.
+            par::limit(types::env::number("SS_EXIT_WORKERS", usize::MAX));
             par::run(&mut states, (to - from).div_ceil(PIECE), |_, _, piece| {
                 let start = from + piece * PIECE;
                 // SAFETY: whole pages of the reservation; nothing reads a large block after
