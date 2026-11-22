@@ -10,6 +10,7 @@
 mod opaque;
 #[cfg(feature = "pipe-positional")]
 mod positional;
+mod probe;
 #[cfg(feature = "alloc-region")]
 mod region;
 
@@ -116,7 +117,13 @@ fn run() -> Result<(), String> {
     types::tl::start(std::env::var_os("SS_TIMING").is_some_and(|value| value == "2"));
     types::tl::mark("main");
     let mut last = started;
+    // `SS_W_PARSE`, `SS_W_DEDUP`, `SS_W_SESSIONS`: the workers that take a stage's tasks, all
+    // of them when unset (`par::limit`). Each is set when the stage before it ends.
+    let stage_workers = [("inputs", "SS_W_PARSE"), ("parse", "SS_W_DEDUP"), ("dedup", "SS_W_SESSIONS"), ("sessions", "")].map(|(after, var)| (after, if var.is_empty() { usize::MAX } else { types::env::number(var, usize::MAX) }));
     let mut lap = |stage: &'static str| {
+        if let Some(&(_, taking)) = stage_workers.iter().find(|(after, _)| *after == stage) {
+            par::limit(taking);
+        }
         types::tl::mark(stage);
         if timing {
             let now = Instant::now();
@@ -126,6 +133,8 @@ fn run() -> Result<(), String> {
     };
 
     let (data, out) = (dir("DATA_DIR", "/data"), dir("OUTPUT_DIR", "/output"));
+    // `SS_PROBE`: a report on the machine after the run (`probe`).
+    let probe = probe::Probe::start();
     one_arena();
     // Room in the descriptor table for every input file, made while the process is one
     // thread: the files then stay open for the run (`ingest::open`).
@@ -357,6 +366,9 @@ fn run() -> Result<(), String> {
         eprintln!("spilled: {spilled_partitions} partitions, {spilled_events} event buckets, {spilled_clicks} click buckets");
     }
     types::tl::report();
+    if let Some(probe) = &probe {
+        probe.finish(&data);
+    }
     #[cfg(feature = "trace")]
     if let Some(path) = std::env::var_os("SS_TRACE") {
         // One name per `par` scope, in order: each `par::init` and `par::each` is a stage of its own.

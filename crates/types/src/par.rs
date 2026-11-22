@@ -12,6 +12,115 @@
 use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
 use std::thread;
 
+/// Workers that take the tasks of the `run`s from here on: `limit`.
+static CAP: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// At most `workers` workers take the tasks of every `run` that follows (`usize::MAX`: all of
+/// them again). The others' states stay as `init` built them. For a machine whose CPUs are
+/// two threads of one core: a stage bound by memory may do better with one worker a core
+/// (`SS_W_PARSE`, `SS_W_DEDUP`, `SS_W_SESSIONS` in `main`).
+pub fn limit(workers: usize) {
+    CAP.store(workers.max(1), Relaxed);
+}
+
+/// `SS_PIN=off|on|cores`: each kept worker on one CPU of those the process may use.
+///
+/// - `on`: worker `w` on the `w`-th allowed CPU, in the order of their numbers.
+/// - `cores`: the CPUs ordered so that the first threads of the cores come before their
+///   siblings (`topology/thread_siblings_list`): the first workers each have a core, which is
+///   what `limit` wants.
+///
+/// The scorer gives a run 8 pinned hyperthreads. Unpinned, the kernel moves a worker when it
+/// wakes for a stage, away from the caches it filled and sometimes onto a core whose sibling
+/// is busy while another core idles.
+pub mod pin {
+    use std::sync::OnceLock;
+
+    /// Words of a CPU mask: 4,096 CPUs.
+    const WORDS: usize = 64;
+
+    /// The CPU of worker `w` is `ORDER[w % len]`; empty: workers stay where the kernel puts
+    /// them.
+    static ORDER: OnceLock<Vec<usize>> = OnceLock::new();
+
+    #[cfg(target_os = "linux")]
+    unsafe extern "C" {
+        fn sched_getaffinity(pid: i32, size: usize, mask: *mut u64) -> i32;
+        fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+    }
+
+    /// The CPUs the calling thread may run on, in the order of their numbers.
+    pub fn allowed() -> Vec<usize> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut mask = [0u64; WORDS];
+            // SAFETY: the mask's own size is passed; a failure leaves it as it is.
+            if unsafe { sched_getaffinity(0, std::mem::size_of_val(&mask), mask.as_mut_ptr()) } == 0 {
+                return (0..WORDS * 64).filter(|cpu| mask[cpu / 64] >> (cpu % 64) & 1 == 1).collect();
+            }
+        }
+        Vec::new()
+    }
+
+    /// The CPUs that are threads of the core `cpu` is a thread of, itself among them.
+    pub fn siblings(cpu: usize) -> Vec<usize> {
+        let Ok(text) = std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list")) else {
+            return vec![cpu];
+        };
+        // "0,4", "0-1", "2-3,10".
+        let mut list = Vec::new();
+        for part in text.trim().split(',') {
+            let (from, to) = part.split_once('-').unwrap_or((part, part));
+            if let (Ok(from), Ok(to)) = (from.parse::<usize>(), to.parse::<usize>()) {
+                list.extend(from..=to);
+            }
+        }
+        list
+    }
+
+    /// Reads the knob and the allowed CPUs, on the thread that starts the workers and before
+    /// it pins itself.
+    pub(super) fn plan() {
+        ORDER.get_or_init(|| {
+            let mode = crate::env::pick("SS_PIN", &["off", "on", "cores"]);
+            if mode == 0 {
+                return Vec::new();
+            }
+            let cpus = allowed();
+            if mode == 1 {
+                return cpus;
+            }
+            // By how many allowed siblings have a smaller number, then by number.
+            let mut keyed: Vec<(usize, usize)> = cpus.iter().map(|&cpu| (siblings(cpu).iter().filter(|&&other| other < cpu && cpus.contains(&other)).count(), cpu)).collect();
+            keyed.sort_unstable();
+            keyed.into_iter().map(|(_, cpu)| cpu).collect()
+        });
+    }
+
+    /// The order `plan` made (empty when workers are not pinned), for a report.
+    pub fn order() -> &'static [usize] {
+        ORDER.get().map_or(&[], Vec::as_slice)
+    }
+
+    /// Puts the calling thread, worker `index`, on its CPU.
+    pub(super) fn worker(index: usize) {
+        let Some(order) = ORDER.get().filter(|order| !order.is_empty()) else {
+            return;
+        };
+        let cpu = order[index % order.len()];
+        let mut mask = [0u64; WORDS];
+        mask[cpu / 64] |= 1 << (cpu % 64);
+        // SAFETY: a mask of the size passed; pid 0 is the calling thread. A refusal leaves
+        // the thread where it was.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = mask;
+    }
+}
+
 /// The workers kept between stages.
 ///
 /// A round is published through atomics alone and the workers watch for it, spinning, for
@@ -131,6 +240,8 @@ mod pool {
                 spawn(pool, child, tree);
             }
         }
+        // After the children's `clone`: a thread starts with its parent's CPUs.
+        super::pin::worker(index);
         pool.up.fetch_add(1, SeqCst);
         crate::tl::mark("thread up");
         // The last round this worker looked at. A thread starts between rounds or during
@@ -192,7 +303,9 @@ mod pool {
     pub fn start(workers: usize) {
         let pool = pool();
         let workers = workers.min(MOST);
+        super::pin::plan();
         grow(pool, workers);
+        super::pin::worker(0);
         // (Going on at once, with the first stage's tasks taken by the threads as they
         // appear, measured the same within the noise: 40 runs each in alternation at 1M.)
         while pool.up.load(SeqCst) + 1 < workers {
@@ -286,7 +399,8 @@ impl<S> States<S> {
 pub fn run<S: Send>(states: &mut [S], tasks: usize, task: impl Fn(usize, &mut S, usize) + Sync) {
     let next = AtomicUsize::new(0);
     let stage = trace::next_stage();
-    each(states, |worker, state| {
+    let taking = CAP.load(Relaxed).min(states.len());
+    each(&mut states[..taking], |worker, state| {
         crate::tl::mark("worker in");
         loop {
             let index = next.fetch_add(1, Relaxed);

@@ -120,6 +120,7 @@ mod linux {
     unsafe extern "C" {
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
         fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+        fn getenv(name: *const u8) -> *const u8;
     }
     const PROT_READ_WRITE: i32 = 1 | 2;
     const MAP_PRIVATE_ANONYMOUS_NORESERVE: i32 = 0x02 | 0x20 | 0x4000;
@@ -148,11 +149,27 @@ mod linux {
             }
             // Whole huge pages only.
             let (first, last) = ((got as usize).next_multiple_of(HUGE), (got as usize + bytes) & !(HUGE - 1));
+            // `SS_HUGE=advise|default|never`, by its first letter, read from the C library:
+            // nothing may allocate here. `advise` (the pick) asks for huge pages; where the
+            // machine's `defrag` is `madvise` (most distributions' default) a fault in an
+            // advised range that finds no free 2 MB compacts memory itself, on the faulting
+            // thread, before it returns. `default` leaves the range to the machine's setting
+            // (huge pages only where it says `always`, and never that stall); `never` is
+            // 4 KB pages.
+            // SAFETY: a terminated name; the value, when there is one, has a first byte.
+            let mode = unsafe {
+                let value = getenv(c"SS_HUGE".as_ptr().cast());
+                if value.is_null() { b'a' } else { *value }
+            };
             // SAFETY: inside the mapping. A kernel without huge pages says no to both: 4 KB
             // pages everywhere then.
             unsafe {
                 madvise(first as *mut u8, SMALL_ZONE, MADV_NOHUGEPAGE);
-                madvise((first + SMALL_ZONE) as *mut u8, last - first - SMALL_ZONE, MADV_HUGEPAGE);
+                match mode {
+                    b'd' => {}
+                    b'n' => drop(madvise((first + SMALL_ZONE) as *mut u8, last - first - SMALL_ZONE, MADV_NOHUGEPAGE)),
+                    _ => drop(madvise((first + SMALL_ZONE) as *mut u8, last - first - SMALL_ZONE, MADV_HUGEPAGE)),
+                }
             }
             BASE.store(first, SeqCst);
             SMALL_NEXT.store(first, SeqCst);
