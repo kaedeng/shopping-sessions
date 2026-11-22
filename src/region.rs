@@ -36,6 +36,20 @@
 
 pub struct Region;
 
+/// The stretch of the reservation that every block larger than 64 KB came from so far: its
+/// first byte and one past the last byte given out. `None` when there is no reservation.
+/// (Small blocks, the thread pool's among them, are in the gigabyte before it.)
+pub fn large_used() -> Option<(usize, usize)> {
+    #[cfg(target_os = "linux")]
+    {
+        linux::large_used()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 mod other {
     use std::alloc::{GlobalAlloc, Layout, System};
@@ -133,6 +147,11 @@ mod linux {
     static POPULATE: AtomicBool = AtomicBool::new(false);
     /// The smallest block that is worth the call.
     const POPULATE_FROM: usize = 64 << 10;
+
+    pub(super) fn large_used() -> Option<(usize, usize)> {
+        let base = BASE.load(Relaxed);
+        (base != 0).then(|| (base + SMALL_ZONE, NEXT.load(Relaxed)))
+    }
 
     /// Makes the reservation, once. Returns whether there is one.
     #[cold]
