@@ -43,7 +43,7 @@ use types::record::PAY_CATEGORY_SHIFT;
 use types::time::DAY;
 use types::users::NO_USER;
 
-use super::{Ck, Ev, EvL, Out, Plan, click_row, event_row};
+use super::{ClickSink, Ev, EvL, Out, Plan, click_row, event_row};
 use crate::pos::Campaigns;
 use crate::price_cents;
 use crate::tok::{Scalar, Scratch, Tok};
@@ -1280,7 +1280,7 @@ pub(super) unsafe fn slow_line(p: *const u8, len: usize, at: usize, ctx: &Ctx, d
 /// As `slow_line`.
 #[cold]
 #[inline(never)]
-unsafe fn slow_click(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, clicks: &mut Chunks<Ck>) {
+unsafe fn slow_click(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, clicks: &mut ClickSink) {
     // SAFETY: one line of the segment.
     unsafe {
         let bytes = line_end(p, len, at) - at;
@@ -1439,7 +1439,9 @@ unsafe fn click_tail(t: *const u8, gap: usize, end: *const u8, days: *const u8, 
 /// `p, len` is a segment, and `lead` bytes before `p` are readable.
 #[inline(never)]
 pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, dates: &Dates, campaigns: &Campaigns, plan: &Plan, out: &mut Out) {
-    let Out { clicks, slow, .. } = out;
+    let Out { clicks, placed, slow, .. } = out;
+    // To the clicks' persons' buckets when the links are joined, else to the worker's list.
+    let clicks = &mut ClickSink::new(clicks, placed.as_mut(), plan);
     let memo = Memo::of(ctx, dates);
     let lanes = Lanes::new();
     // Two batches in turn, as `events`.
@@ -1598,7 +1600,7 @@ unsafe fn finish_clicks(
     ctx: &Ctx,
     dates: &Dates,
     plan: &Plan,
-    clicks: &mut Chunks<Ck>,
+    clicks: &mut ClickSink,
     slow: &mut usize,
 ) {
     // SAFETY: as `finish`; the campaigns' table is read only at numbers below its count.
@@ -1606,6 +1608,14 @@ unsafe fn finish_clicks(
         let batch = &mut *batch;
         let rows = std::mem::take(&mut batch.count);
         look(batch, rows, plan);
+        // Which person each row's user is: asked for now, read when the row is placed.
+        if clicks.places() {
+            for &user in &batch.users[..rows.min(BATCH)] {
+                if user != NO_USER {
+                    clicks.ask(user);
+                }
+            }
+        }
         // Bytes of a `click_id` that are kept (`click_id_at`).
         let kept = if plan.whole_clicks { usize::MAX } else { 9 };
         let all = |value: i64| _mm512_set1_epi64(value);
@@ -1645,7 +1655,7 @@ unsafe fn finish_clicks(
                 let raw = batch.rows[row][0] as usize;
                 let quoted = usize::from(*batch.line[row] == b'"');
                 let click = pack_at(batch.line[row].add(quoted), (raw - 2 * quoted).min(kept));
-                clicks.push_at(0, Ck { click, user_ts: u64::from(batch.users[row]) | ts_of[lane] << 32, campaign: index_of[lane] });
+                clicks.push(click, batch.users[row], ts_of[lane] as u32, index_of[lane] as u32);
             }
 
             // Every other row, through the row code: the bytes from the row's line to the

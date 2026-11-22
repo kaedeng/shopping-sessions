@@ -22,11 +22,12 @@
 //! spelling.
 
 use std::fs::File;
+use std::sync::OnceLock;
 
 use types::chunks::Chunks;
 use types::hash::hash;
 use types::id::{self, Id, pack_at};
-use types::record::PAY_CATEGORY_SHIFT;
+use types::record::{ClickRec, PAY_CATEGORY_SHIFT};
 use types::time::DAY;
 use types::users::{NO_USER, UserKey, Users, key_at_wide, long_key_at, mix_long, short_key_at};
 use types::Ctx;
@@ -203,6 +204,99 @@ fn words(user: u32, ts: u32, valid: bool, ingest: u32, pay: u32) -> (u64, u64) {
     (u64::from(user) | u64::from(ts * u32::from(valid)) << 32, u64::from(ingest) | u64::from(pay) << 32)
 }
 
+/// Where a click goes once the links are joined: straight to the bucket of its person, as
+/// the record the sessions stage reads (`Out::placed`).
+///
+/// A click was written twice: by the parse to its worker's list with its user's place, 122
+/// MB at 20M events, and by the stage after it, which read that list and wrote each click to
+/// its person's bucket. Which person a user is is known as soon as the links are joined, 44
+/// ms into a parse of 208 at 20M events (241 of 1,100 at 60M), and the clicks' chunks are
+/// the last the parse takes: a click chunk taken after that writes its clicks once. One
+/// taken before it writes them to the list, as before (`ClickSink`).
+pub struct Placing {
+    /// Per user's number: 1 + the root of its component, 0 for a root.
+    up: *const u32,
+    /// The shift from a root's number to its bucket.
+    pub shift: u32,
+    /// Buckets a number of the directory can fall in.
+    pub lists: usize,
+}
+
+// SAFETY: the array is only read once a `Placing` is made of it.
+unsafe impl Send for Placing {}
+unsafe impl Sync for Placing {}
+
+impl Placing {
+    /// # Safety
+    /// `up` holds an entry for every number the directory can give, is not written again,
+    /// and outlives every use of this; `lists` is more than any number shifted by `shift`.
+    pub unsafe fn new(up: *const u32, shift: u32, lists: usize) -> Placing {
+        Placing { up, shift, lists }
+    }
+
+    /// The person of user `user`: its component's root.
+    #[inline(always)]
+    fn root(&self, user: u32) -> u32 {
+        // SAFETY: a user's number is below the directory's bound, which the array has.
+        let up = unsafe { *self.up.add(user as usize) };
+        if up == 0 { user } else { up - 1 }
+    }
+}
+
+/// Where a chunk's clicks are written: to their persons' buckets when the links were joined
+/// before the chunk was taken (`Placing`), to the worker's list otherwise.
+pub(crate) struct ClickSink<'a> {
+    listed: &'a mut Chunks<Ck>,
+    placed: Option<(&'a Placing, &'a mut Chunks<ClickRec>)>,
+}
+
+impl<'a> ClickSink<'a> {
+    fn new(listed: &'a mut Chunks<Ck>, placed: Option<&'a mut Chunks<ClickRec>>, plan: &'a Plan) -> ClickSink<'a> {
+        ClickSink { listed, placed: plan.placing.get().zip(placed) }
+    }
+
+    /// Whether `ask` does anything.
+    #[inline(always)]
+    pub(crate) fn places(&self) -> bool {
+        self.placed.is_some()
+    }
+
+    /// Asks for the cache line that says which person user `user` is.
+    #[inline(always)]
+    pub(crate) fn ask(&self, user: u32) {
+        if let Some((placing, _)) = &self.placed {
+            types::mem::prefetch(placing.up.wrapping_add(user as usize));
+        }
+    }
+
+    /// One valid click of user `user`.
+    ///
+    /// # Safety
+    /// `user` is a number the directory gave.
+    #[inline(always)]
+    pub(crate) unsafe fn push(&mut self, click: Id, user: u32, ts: u32, campaign: u32) {
+        // SAFETY: a root is a number of the directory, so its bucket is below `lists`, which
+        // the placed lists have; the worker's list is list 0 of one.
+        unsafe {
+            match &mut self.placed {
+                Some((placing, placed)) => {
+                    let root = placing.root(user);
+                    placed.push_at((root >> placing.shift) as usize, ClickRec { user: u64::from(root) + 1, click, ts, campaign });
+                }
+                None => self.listed.push_at(0, Ck { click, user_ts: u64::from(user) | u64::from(ts) << 32, campaign: u64::from(campaign) }),
+            }
+        }
+    }
+
+    /// Streamed lines become visible to the threads that read the lists.
+    pub(crate) fn fence(&self) {
+        self.listed.fence();
+        if let Some((_, placed)) = &self.placed {
+            placed.fence();
+        }
+    }
+}
+
 /// The run's directory and the shape of the lists.
 pub struct Plan {
     pub users: Users,
@@ -217,6 +311,12 @@ pub struct Plan {
     lean: bool,
     /// Long `click_id`s kept whole (`click_id_at`).
     pub(crate) whole_clicks: bool,
+    /// Set by the stage's caller once the links are joined, when clicks are to be written
+    /// to their persons' buckets (`Placing`).
+    pub placing: OnceLock<Placing>,
+    /// A click chunk waits for `placing` (`SS_CLICKS=wait`, for tests: every click is then
+    /// placed, however short the parse). Only set when `placing` will be.
+    pub wait_for_placing: bool,
     /// `k & ask_step == 0` after a row is when the kernel asks for the directory's lines of
     /// the last eight rows' users (`SS_ASK=rows|batch`): 63 for `rows`, the pick; for
     /// `batch` every bit, which no count of rows clears, and a batch's users are asked for
@@ -243,8 +343,13 @@ pub struct Out {
     pub events: Chunks<Ev>,
     /// List `Plan::long_part(hi, lo)`: the others.
     pub long_events: Chunks<EvL>,
-    /// One list: the valid clicks.
+    /// One list: the valid clicks of the chunks taken before the links were joined.
     pub clicks: Chunks<Ck>,
+    /// List `Placing`'s bucket of the click's person: the valid clicks of every other
+    /// chunk, as the sessions stage reads them. Made by the first such chunk.
+    pub placed: Option<Chunks<ClickRec>>,
+    /// Bytes a worker's share of the clicks takes as placed records.
+    placed_room: usize,
     /// Lines the kernel left to the row code (`SS_TIMING` reports them).
     pub slow: usize,
     scratch: Scratch,
@@ -281,6 +386,8 @@ impl Ingest {
             kernel: DECODES[types::env::pick("SS_DECODE", DECODES)] != "row",
             lean: DECODES[types::env::pick("SS_DECODE", DECODES)] == "lean",
             whole_clicks,
+            placing: OnceLock::new(),
+            wait_for_placing: false,
             ask_step: if types::env::pick("SS_ASK", &["rows", "batch"]) == 0 { 63 } else { usize::MAX },
         }
     }
@@ -295,6 +402,8 @@ impl Ingest {
             events: Chunks::new(parts, room(self.event_rows, size_of::<Ev>(), parts)),
             long_events: Chunks::new(long_parts, room(self.event_rows / 4, size_of::<EvL>(), long_parts)),
             clicks: Chunks::new(1, room(self.click_rows, size_of::<Ck>(), 1)),
+            placed: None,
+            placed_room: room(self.click_rows, size_of::<ClickRec>(), 0),
             slow: 0,
             scratch: Scratch::new(),
             input: vec![0; crate::READ_ROOM + crate::chunk_bytes() + crate::READ_SLACK + 1 + crate::PAD],
@@ -315,7 +424,19 @@ impl Ingest {
         // SAFETY: `plan` made every task a segment, and `read` gives one as `seg` does: whole
         // lines, the byte before them and `PAD` bytes after them readable.
         unsafe {
-            if *click { clicks(p, len, ctx, &self.dates, &self.campaigns, plan, out) } else { events(p, len, ctx, &self.dates, plan, out) }
+            if *click {
+                // `SS_CLICKS=wait`: the links' task was taken before this one, and sets it.
+                while plan.wait_for_placing && plan.placing.get().is_none() {
+                    std::hint::spin_loop();
+                }
+                // The buckets' lists, when this is the worker's first chunk that places.
+                if out.placed.is_none() && let Some(placing) = plan.placing.get() {
+                    out.placed = Some(Chunks::new(placing.lists, out.placed_room + placing.lists * 4096));
+                }
+                clicks(p, len, ctx, &self.dates, &self.campaigns, plan, out)
+            } else {
+                events(p, len, ctx, &self.dates, plan, out)
+            }
         }
         if read.is_none() {
             self.release(seg);
@@ -417,9 +538,10 @@ unsafe fn clicks(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, campaigns: 
         return unsafe { kern::clicks(p, len, lead, ctx, dates, campaigns, plan, out) };
     }
     let _ = campaigns;
-    let Out { clicks, scratch, .. } = out;
-    unsafe { Scalar::lines::<4>(p, len, scratch, |fields| click_row(ctx, dates, plan, fields, clicks)) };
-    clicks.fence();
+    let Out { clicks, placed, scratch, .. } = out;
+    let mut sink = ClickSink::new(clicks, placed.as_mut(), plan);
+    unsafe { Scalar::lines::<4>(p, len, scratch, |fields| click_row(ctx, dates, plan, fields, &mut sink)) };
+    sink.fence();
 }
 
 /// One event line as its record, for any spelling: the checks of `crate::event_row`.
@@ -476,16 +598,16 @@ unsafe fn event_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 7], 
 /// # Safety
 /// The fields are from a segment.
 #[inline(always)]
-unsafe fn click_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 4], clicks: &mut Chunks<Ck>) {
+unsafe fn click_row(ctx: &Ctx, dates: &Dates, plan: &Plan, fields: &[Field; 4], sink: &mut ClickSink) {
     let [click, user, campaign, ts] = *fields;
     let (ok, ts) = unsafe { dates.ts(ts.p, ts.len) };
     if (click.len != 0) & (user.len != 0) & ok & (ts >= 0) & (ts < i64::from(ctx.ts_end))
         && let Some(campaign) = ctx.campaign_index.get(unsafe { pack_at(campaign.p, campaign.len) })
     {
-        // SAFETY: the fields' bytes are readable; the clicks are one list.
+        // SAFETY: the fields' bytes are readable; the user is not empty, so it has a number.
         unsafe {
             let place = plan.users.at(user.p, user.len);
-            clicks.push_at(0, Ck { click: click_id_at(click.p, click.len, plan.whole_clicks), user_ts: u64::from(place) | (ts as u64) << 32, campaign: u64::from(campaign) });
+            sink.push(click_id_at(click.p, click.len, plan.whole_clicks), place, ts as u32, campaign);
         }
     }
 }
@@ -502,7 +624,7 @@ mod tests {
     fn rows_go_by_their_ids_spelling() {
         let ctx = Ctx::new(parse_f1(b"2026-10-08T00:00:00Z").unwrap(), parse_f1(b"2026-10-22T00:00:00Z").unwrap(), &[], &[]).unwrap();
         let dates = Dates::new(&ctx);
-        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, lean: false, whole_clicks: false, ask_step: 63 };
+        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, lean: false, whole_clicks: false, placing: OnceLock::new(), wait_for_placing: false, ask_step: 63 };
         let (mut events, mut long_events) = (Chunks::<Ev>::new(8, 1 << 16), Chunks::<EvL>::new(2, 1 << 16));
         let text = b"\ne1,u1,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,view,p1,\n\
 e02423c3d84ab053af78764ce49f23b5c,u02423c3d84ab053af78764ce49f23b5c,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,cart,p1,\n\

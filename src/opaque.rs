@@ -16,7 +16,7 @@
 use std::sync::OnceLock;
 
 use ingest::Ingest;
-use ingest::opaque::{Ev, EvL, LinkRec, Out, Plan};
+use ingest::opaque::{Ev, EvL, LinkRec, Out, Placing, Plan};
 use types::chunks::Chunks;
 use types::hash::{hash, person_hash};
 use types::parts::{Combine, Mode, Parts, Plain};
@@ -450,7 +450,19 @@ const NAMES_HELD: usize = 32;
 /// Stages 1 and 2. `None` when the directory was too small for the input's users: the
 /// caller starts over with a larger `grow`. `whole_clicks`: `ingest::opaque::click_id_at`.
 pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, parallel_alloc: bool, scatter_mode: Option<usize>, lap: &mut dyn FnMut(&'static str)) -> Option<Staged> {
-    let plan = ingest.opaque_plan(grow, whole_clicks);
+    let mut plan = ingest.opaque_plan(grow, whole_clicks);
+    // `SS_BUCKETS=dense|hash`: the person buckets as ranges of the persons' numbers, for
+    // `sessions::bucket_dense`, or by the persons' hashes, for `sessions::bucket`.
+    let dense_buckets = types::env::pick("SS_BUCKETS", &["dense", "hash"]) == 0;
+    // `SS_CLICKS=placed|listed|wait`: a click chunk taken once the links are joined writes
+    // its clicks to their persons' buckets (`ingest::opaque::Placing`); `listed` writes
+    // every click to its worker's list for the next stage to place, as before; `wait` has
+    // every click chunk wait for the links, so that all are placed (for tests). Buckets
+    // by hash are filled by the next stage only.
+    let click_mode = types::env::pick("SS_CLICKS", &["placed", "listed", "wait"]);
+    let place_clicks = dense_buckets && click_mode != 1;
+    plan.wait_for_placing = place_clicks && click_mode == 2;
+    let plan = plan;
     // Each worker makes its lists, and before that puts its piece of the directory onto
     // whole 2 MB pages (`types::mem::touch`; `SS_TOUCH=off` leaves that to the first
     // lookups). All of it before the first lookup: a piece touched while another worker
@@ -484,6 +496,16 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
             let read: Vec<&[LinkRec]> = links.iter().map(|read| read.get().map_or(&[][..], Vec::as_slice)).collect();
             drop(persons.set(Persons::new(&plan.users, &read)));
             types::tl::mark("links named");
+            if place_clicks && let Some(persons) = persons.get() {
+                // The buckets by the users numbered so far: the linked ones and those of
+                // the lines read until now. The rest only add buckets of the same width
+                // (there are at most twice as many as `SS_BUCKET_BITS` asks for).
+                let count = plan.users.count().max(1);
+                let shift = (usize::BITS - (count - 1).leading_zeros()).saturating_sub(ctx.bucket_bits);
+                // SAFETY: the array has an entry a number of the directory, the unions are
+                // done, and it lives in `Names` to the end of the run.
+                drop(plan.placing.set(unsafe { Placing::new(persons.up.as_ptr(), shift, ((plan.users.bound() - 1) >> shift) + 1) }));
+            }
         } else {
             ingest.opaque_parse(ctx, &plan, task - link_tasks - 1, out);
         }
@@ -500,19 +522,20 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     // data has a row for every 8 or 9 events, so a quarter of an even share of the events
     // is twice a worker's rows.
     types::rows::expect(events / ctx.workers / 4);
+    // The clicks still to place, and those the parse placed.
     let clicks: usize = parsed.iter().map(|out| out.clicks.len()).sum();
+    let placed: usize = parsed.iter().map(|out| out.placed.as_ref().map_or(0, Chunks::len)).sum();
     let room = |rows: usize| rows / ctx.workers / buckets * 9 / 8 + 64;
     if std::env::var_os("SS_TIMING").is_some() {
         let long: usize = parsed.iter().map(|out| out.long_events.len()).sum();
         let links: usize = links.iter().filter_map(OnceLock::get).map(Vec::len).sum();
         let slow: usize = parsed.iter().map(|out| out.slow).sum();
-        eprintln!("opaque: {events} event rows ({long} with a long event_id), {clicks} clicks, {links} links, {} lists, {} users, {slow} lines through the row code", parts + long_parts, plan.users.count());
+        eprintln!("opaque: {events} event rows ({long} with a long event_id), {} clicks ({placed} placed by the parse), {links} links, {} lists, {} users, {slow} lines through the row code", clicks + placed, parts + long_parts, plan.users.count());
     }
-    // `SS_BUCKETS=dense|hash`: the person buckets as ranges of the persons' numbers, for
-    // `sessions::bucket_dense`, or by the persons' hashes, for `sessions::bucket`.
-    let dense = (types::env::pick("SS_BUCKETS", &["dense", "hash"]) == 0).then(|| {
+    // The buckets as the parse placed its clicks, if it did.
+    let dense = dense_buckets.then(|| {
         let count = plan.users.count().max(1);
-        let shift = (usize::BITS - (count - 1).leading_zeros()).saturating_sub(ctx.bucket_bits);
+        let shift = plan.placing.get().map_or((usize::BITS - (count - 1).leading_zeros()).saturating_sub(ctx.bucket_bits), |placing| placing.shift);
         (shift, ((count - 1) >> shift) + 1)
     });
     let mut scattered: Vec<Scattered> = par::init(ctx.workers, parallel_alloc, |_| match dense {
@@ -522,6 +545,7 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
             scratch: Default::default(),
             opaque: Default::default(),
             dense: Some(DenseBuckets::new(lists, events, clicks, ctx.workers)),
+            placed: None,
         },
         None => Scattered {
             events: Parts::new(buckets, room(events), scatter_mode),
@@ -529,8 +553,13 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
             scratch: Default::default(),
             opaque: Default::default(),
             dense: None,
+            placed: None,
         },
     });
+    // The clicks the parse placed stay with the buckets: the sessions stage reads them.
+    for (mine, out) in scattered.iter_mut().zip(parsed.iter_mut()) {
+        mine.placed = out.placed.take();
+    }
     // `SS_RECYCLE=off|on`. `on`: the buckets' lists written into the chunks of the parse's
     // lists as the dedup has read them (`Chunks::give`), for buckets that are ranges of
     // numbers. `off`, the pick: into fresh memory, and the parse's lists handed back to the

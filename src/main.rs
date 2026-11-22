@@ -55,6 +55,10 @@ struct Scattered {
     /// them that way (`opaque::Staged::dense`).
     #[cfg(feature = "pipe-positional")]
     dense: Option<opaque::DenseBuckets>,
+    /// The clicks the opaque parse wrote to their persons' buckets itself
+    /// (`ingest::opaque::Placing`): the same buckets as `dense`.
+    #[cfg(feature = "pipe-positional")]
+    placed: Option<types::chunks::Chunks<ClickRec>>,
 }
 
 fn dir(var: &str, default: &str) -> PathBuf {
@@ -306,6 +310,8 @@ fn run() -> Result<(), String> {
                 opaque: Default::default(),
                 #[cfg(feature = "pipe-positional")]
                 dense: None,
+                #[cfg(feature = "pipe-positional")]
+                placed: None,
             });
             par::run(&mut scattered, parts + click_tasks.len(), |_, mine, task| {
                 if task < parts {
@@ -351,7 +357,14 @@ fn run() -> Result<(), String> {
                     1usize << shift,
                     &|each| scattered.iter().for_each(|mine| dense(mine).keys.for_each(bucket, |piece| each(piece))),
                     &|each| scattered.iter().for_each(|mine| dense(mine).pays.for_each(bucket, |piece| each(piece))),
-                    &|each| scattered.iter().for_each(|mine| dense(mine).clicks.for_each(bucket, |piece| each(piece))),
+                    &|each| {
+                        scattered.iter().for_each(|mine| {
+                            dense(mine).clicks.for_each(bucket, |piece| each(piece));
+                            if let Some(placed) = &mine.placed {
+                                placed.for_each(bucket, |piece| each(piece));
+                            }
+                        })
+                    },
                     agg,
                 );
             });
