@@ -240,31 +240,89 @@ pub struct Scratch {
 }
 
 /// Slots per row, rounded up to a power of two: the table ends a quarter full or less.
+/// `SS_DEDUP_ROOM` sets it.
 const ROOM: usize = 4;
-/// Rows `dedup` asks for the slot of ahead of the row it is at: `SS_DEDUP_AHEAD`, 8 unless
-/// set, 0 for none. A row asked for is 11 instructions more (2% of a run's), for 6% of the
-/// stage's time at 21,000 rows a list (a table of half a megabyte) on a machine with a core
-/// a worker; see `SS_ASK` in `ingest::opaque::kern`.
-fn ahead_slots() -> usize {
-    static AHEAD: OnceLock<usize> = OnceLock::new();
-    *AHEAD.get_or_init(|| types::env::number("SS_DEDUP_AHEAD", 8).min(64))
+
+/// How `dedup` reads a list and probes its table: the switches, read once.
+#[derive(Clone, Copy)]
+struct Way {
+    /// Rows `dedup` asks for the slot of ahead of the row it is at: `SS_DEDUP_AHEAD`, 8 unless
+    /// set, 0 for none. A row asked for is 11 instructions more (2% of a run's), for 6% of the
+    /// stage's time at 21,000 rows a list (a table of half a megabyte) on a machine with a core
+    /// a worker; see `SS_ASK` in `ingest::opaque::kern`.
+    ahead: usize,
+    /// `SS_DEDUP_ROOM`: slots per row before the rounding, `ROOM` unless set. 2 makes the
+    /// table at 20M events a quarter of a megabyte, between a quarter and half full.
+    room: usize,
+    /// `SS_DEDUP_READ`: rows `dedup` asks for the input row ahead of the row it is at, on over
+    /// the end of a chunk into the next (`fill_piece`); 0, unless set, for none, which with
+    /// `SS_DEDUP_PROBE=one` is the loop as it was.
+    read: usize,
+    /// `SS_DEDUP_PROBE=one|tag`: a slot holds 1 + a kept row's index (`one`, the pick), or
+    /// that and above it hash bits of the row's key, so that a slot of another key is passed
+    /// over without its kept row read (`tag_row`).
+    tag: bool,
+}
+
+fn way() -> Way {
+    static WAY: OnceLock<Way> = OnceLock::new();
+    *WAY.get_or_init(|| Way {
+        ahead: types::env::number("SS_DEDUP_AHEAD", 8).min(64),
+        room: types::env::number("SS_DEDUP_ROOM", ROOM).clamp(1, 64),
+        read: types::env::number("SS_DEDUP_READ", 0).min(4096),
+        tag: types::env::pick("SS_DEDUP_PROBE", &["one", "tag"]) == 1,
+    })
 }
 
 /// List `list` of every worker deduplicated into `kept`: one record per `event_id`, the copy
 /// with the smallest `ingest`. `bits` are the hash bits that chose the list.
 fn dedup<'p, R: Row + 'p>(lists: impl Iterator<Item = &'p Chunks<R>> + Clone, list: usize, bits: u32, table: &mut Vec<u32>, kept: &mut Vec<R>) {
+    dedup_as(way(), lists, list, bits, table, kept);
+}
+
+/// `dedup` with the switches `way`.
+#[inline(always)]
+fn dedup_as<'p, R: Row + 'p>(way: Way, lists: impl Iterator<Item = &'p Chunks<R>> + Clone, list: usize, bits: u32, table: &mut Vec<u32>, kept: &mut Vec<R>) {
     kept.clear();
     let rows: usize = lists.clone().map(|chunks| chunks.len_of(list)).sum();
     if rows == 0 {
         return;
     }
-    let slot_bits = (ROOM * rows).next_power_of_two().max(1024).trailing_zeros();
+    let slot_bits = (way.room * rows).next_power_of_two().max(1024).trailing_zeros();
     assert!(bits + slot_bits <= 64 && rows < u32::MAX as usize);
     let (shift, mask) = (64 - bits - slot_bits, (1usize << slot_bits) - 1);
     table.clear();
     table.resize(mask + 1, 0);
     kept.reserve(rows);
-    let ahead = ahead_slots();
+    // `tag`: a slot's low bits hold 1 + the index of a kept row, at least 8 bits above them
+    // hash bits of its key.
+    let low_bits = usize::BITS - rows.leading_zeros();
+    let tag = way.tag && low_bits <= 24;
+    if tag || way.read != 0 {
+        let fill = Fill {
+            table: table.as_mut_ptr(),
+            shift,
+            mask,
+            low: u32::MAX >> (32 - low_bits),
+            low_bits,
+            tag_shift: shift.saturating_sub(32 - low_bits),
+            kept: kept.as_mut_ptr(),
+            ahead: way.ahead,
+            read: way.read,
+        };
+        let mut count = 0;
+        // SAFETY: the table has `mask + 1` slots; `kept` has room for every row of the list,
+        // and is empty.
+        if tag {
+            paired(lists, list, |piece, next| count = unsafe { fill_piece::<R, true>(fill, count, piece, next) });
+        } else {
+            paired(lists, list, |piece, next| count = unsafe { fill_piece::<R, false>(fill, count, piece, next) });
+        }
+        // SAFETY: rows `..count` were written, each a copy of a row of the list.
+        unsafe { kept.set_len(count) };
+        return;
+    }
+    let ahead = way.ahead;
     for chunks in lists {
         chunks.for_each(list, |piece| {
             for (number, row) in piece.iter().enumerate() {
@@ -328,7 +386,29 @@ fn dedup_short(parsed: &[Out], list: usize, plan: &Plan, table: &mut Vec<u32>, k
     if rows == 0 {
         return;
     }
-    let slot_bits = (ROOM * rows).next_power_of_two().max(1024).trailing_zeros();
+    let way = way();
+    // `SS_DEDUP_PROBE=tag`: a slot's low bits hold 1 + the index of a kept row, the bits
+    // between them and `WIDE` (8 at the least) hash bits of its key.
+    let low_bits = usize::BITS - rows.leading_zeros();
+    if way.tag && low_bits <= 23 {
+        dedup_short_as::<true>(way, parsed, list, plan, rows, low_bits, table, kept, wide);
+    } else {
+        dedup_short_as::<false>(way, parsed, list, plan, rows, low_bits, table, kept, wide);
+    }
+}
+
+/// `dedup_short` with the switches `way` (`SS_DEDUP_ROOM`, `SS_DEDUP_READ`, `SS_DEDUP_AHEAD`),
+/// and with tagged slots where `TAG`. `rows` is the list's count of records, below
+/// `1 << low_bits`.
+///
+/// `SS_DEDUP_READ`: the parse wrote the lists with streaming stores, a 4 KB chunk at a time
+/// from anywhere in its block, so a list is read from memory, and the hardware's prefetch
+/// starts over at every chunk; the record `read` on is asked for, on over a chunk's end into
+/// the next (`paired`). `SS_DEDUP_AHEAD`'s slot likewise.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn dedup_short_as<const TAG: bool>(way: Way, parsed: &[Out], list: usize, plan: &Plan, rows: usize, low_bits: u32, table: &mut Vec<u32>, kept: &mut Vec<EvN>, wide: &mut Vec<Ev>) {
+    let slot_bits = (way.room * rows).next_power_of_two().max(1024).trailing_zeros();
     assert!(plan.part_bits + slot_bits <= 64 && rows < WIDE as usize);
     let (shift, mask) = (64 - plan.part_bits - slot_bits, (1usize << slot_bits) - 1);
     table.clear();
@@ -336,45 +416,71 @@ fn dedup_short(parsed: &[Out], list: usize, plan: &Plan, table: &mut Vec<u32>, k
     // A narrow record is kept once at the most, and so is a wider row, which is two records.
     kept.reserve(rows);
     wide.reserve(rows / 2 + 1);
-    let ahead = ahead_slots();
+    let (ahead, read) = (way.ahead, way.read);
+    // A slot is `WIDE` or not, its tag (`TAG` only) and 1 + the index of a kept row: the
+    // index in the bits of `low`, the tag in those of `field`, hash bits of the key from
+    // `tag_shift` up. Without `TAG` the index is all but `WIDE` and there is no tag.
+    let low: u32 = if TAG { u32::MAX >> (32 - low_bits) } else { !WIDE };
+    let field: u32 = !low & !WIDE;
+    let tag_shift = shift.saturating_sub(31 - low_bits);
     const KEY: u64 = (1 << 48) - 1;
     let (slots, kept_at, wide_at) = (table.as_mut_ptr(), kept.as_mut_ptr(), wide.as_mut_ptr());
     let (mut kept_len, mut wide_len) = (0usize, 0usize);
-    for out in parsed {
-        out.narrow.for_each(list, |piece| {
-            let (slots, kept_at, wide_at, shift, mask, ahead) = (slots, kept_at, wide_at, shift, mask, ahead);
-            let (mut kept_n, mut wide_n) = (kept_len, wide_len);
-            let (records, count) = (piece.as_ptr(), piece.len());
-            let mut number = 0;
-            // SAFETY: `number < count` where a record is read, and a wider row's second
-            // record is in the piece its first is in (`Chunks::push_pair_at`). A slot's
-            // index is masked to the table. `kept_n` and `wide_n` grow by one a record or a
-            // pair of them at the most, so they stay inside the room reserved above; a slot
-            // holds one more than the index of a row written before it was set.
-            unsafe {
-                while number < count {
-                    let row = *records.add(number);
-                    // `SS_DEDUP_AHEAD`: the slot of the record a few on (some slot, for a
-                    // record that is no narrow one).
-                    if ahead != 0 {
-                        let coming = (*records.add((number + ahead).min(count - 1))).a & KEY;
-                        types::mem::prefetch(slots.add((hash(coming) >> shift) as usize & mask));
+    paired(parsed.iter().map(|out| &out.narrow), list, |piece, next| {
+        let (slots, kept_at, wide_at, shift, mask, ahead, read, low, field, tag_shift) = (slots, kept_at, wide_at, shift, mask, ahead, read, low, field, tag_shift);
+        let tag_of = |hashed: u64| if TAG { ((hashed >> tag_shift) as u32) << low_bits & field } else { 0 };
+        let (mut kept_n, mut wide_n) = (kept_len, wide_len);
+        let (records, count) = (piece.as_ptr(), piece.len());
+        let (later, later_count) = (next.as_ptr(), next.len());
+        let mut number = 0;
+        // SAFETY: `number < count` where a record is read, and a wider row's second
+        // record is in the piece its first is in (`Chunks::push_pair_at`); a record of
+        // `next` is read only below `later_count`. A slot's index is masked to the table.
+        // `kept_n` and `wide_n` grow by one a record or a pair of them at the most, so they
+        // stay inside the room reserved above (below `1 << low_bits` either way); a slot
+        // holds one more than the index of a row written before it was set.
+        unsafe {
+            while number < count {
+                let row = *records.add(number);
+                if read != 0 {
+                    let on = number + read;
+                    if on < count {
+                        types::mem::prefetch(records.add(on));
+                    } else if on - count < later_count {
+                        types::mem::prefetch(later.add(on - count));
                     }
-                    if row.a & EvN::HEAD != EvN::HEAD {
-                        number += 1;
-                        let key = row.a & KEY;
-                        let mut at = (hash(key) >> shift) as usize & mask;
-                        loop {
-                            let slot = slots.add(at);
-                            let held = *slot;
-                            if held == 0 {
-                                kept_at.add(kept_n).write(row);
-                                kept_n += 1;
-                                *slot = kept_n as u32;
-                                break;
-                            }
+                }
+                // `SS_DEDUP_AHEAD`: the slot of the record a few on (some slot, for a
+                // record that is no narrow one).
+                if ahead != 0 {
+                    let on = number + ahead;
+                    let coming = if on < count {
+                        *records.add(on)
+                    } else if on - count < later_count {
+                        *later.add(on - count)
+                    } else {
+                        *records.add(count - 1)
+                    };
+                    types::mem::prefetch(slots.add((hash(coming.a & KEY) >> shift) as usize & mask));
+                }
+                if row.a & EvN::HEAD != EvN::HEAD {
+                    number += 1;
+                    let key = row.a & KEY;
+                    let hashed = hash(key);
+                    let tag = tag_of(hashed);
+                    let mut at = (hashed >> shift) as usize & mask;
+                    loop {
+                        let slot = slots.add(at);
+                        let held = *slot;
+                        if held == 0 {
+                            kept_at.add(kept_n).write(row);
+                            kept_n += 1;
+                            *slot = tag | kept_n as u32;
+                            break;
+                        }
+                        if !TAG || held & field == tag {
                             if held & WIDE == 0 {
-                                let first = &mut *kept_at.add(held as usize - 1);
+                                let first = &mut *kept_at.add((held & low) as usize - 1);
                                 if first.a & KEY == key {
                                     if row.ingest() < first.ingest() {
                                         *first = row;
@@ -382,43 +488,47 @@ fn dedup_short(parsed: &[Out], list: usize, plan: &Plan, table: &mut Vec<u32>, k
                                     break;
                                 }
                             } else {
-                                let first = &mut *wide_at.add((held & !WIDE) as usize - 1);
+                                let first = &mut *wide_at.add((held & low) as usize - 1);
                                 if first.key == key {
                                     if row.ingest() < first.ingest_pay as u32 {
                                         first.user_ts &= 0xFFFF_FFFF;
                                         kept_at.add(kept_n).write(row);
                                         kept_n += 1;
-                                        *slot = kept_n as u32;
+                                        *slot = tag | kept_n as u32;
                                     }
                                     break;
                                 }
                             }
-                            at = (at + 1) & mask;
                         }
-                        continue;
+                        at = (at + 1) & mask;
                     }
-                    if row.a == EvN::PAD.a {
-                        number += 1;
-                        continue;
+                    continue;
+                }
+                if row.a == EvN::PAD.a {
+                    number += 1;
+                    continue;
+                }
+                // A wider row: its key here, its other two words in the record after.
+                assert!(number + 1 < count, "a wider row's second record is in its piece");
+                let rest = *records.add(number + 1);
+                number += 2;
+                let row = Ev { key: row.b, user_ts: rest.a, ingest_pay: rest.b };
+                let key = row.key;
+                let hashed = hash(key);
+                let tag = tag_of(hashed);
+                let mut at = (hashed >> shift) as usize & mask;
+                loop {
+                    let slot = slots.add(at);
+                    let held = *slot;
+                    if held == 0 {
+                        wide_at.add(wide_n).write(row);
+                        wide_n += 1;
+                        *slot = WIDE | tag | wide_n as u32;
+                        break;
                     }
-                    // A wider row: its key here, its other two words in the record after.
-                    assert!(number + 1 < count, "a wider row's second record is in its piece");
-                    let rest = *records.add(number + 1);
-                    number += 2;
-                    let row = Ev { key: row.b, user_ts: rest.a, ingest_pay: rest.b };
-                    let key = row.key;
-                    let mut at = (hash(key) >> shift) as usize & mask;
-                    loop {
-                        let slot = slots.add(at);
-                        let held = *slot;
-                        if held == 0 {
-                            wide_at.add(wide_n).write(row);
-                            wide_n += 1;
-                            *slot = WIDE | wide_n as u32;
-                            break;
-                        }
+                    if !TAG || held & field == tag {
                         if held & WIDE != 0 {
-                            let first = &mut *wide_at.add((held & !WIDE) as usize - 1);
+                            let first = &mut *wide_at.add((held & low) as usize - 1);
                             if first.key == key {
                                 if (row.ingest_pay as u32) < (first.ingest_pay as u32) {
                                     *first = row;
@@ -426,28 +536,181 @@ fn dedup_short(parsed: &[Out], list: usize, plan: &Plan, table: &mut Vec<u32>, k
                                 break;
                             }
                         } else {
-                            let first = &mut *kept_at.add(held as usize - 1);
+                            let first = &mut *kept_at.add((held & low) as usize - 1);
                             if first.a & KEY == key {
                                 if (row.ingest_pay as u32) < first.ingest() {
                                     first.b &= !EvN::TS;
                                     wide_at.add(wide_n).write(row);
                                     wide_n += 1;
-                                    *slot = WIDE | wide_n as u32;
+                                    *slot = WIDE | tag | wide_n as u32;
                                 }
                                 break;
                             }
                         }
-                        at = (at + 1) & mask;
                     }
+                    at = (at + 1) & mask;
                 }
             }
-            (kept_len, wide_len) = (kept_n, wide_n);
-        });
-    }
+        }
+        (kept_len, wide_len) = (kept_n, wide_n);
+    });
     // SAFETY: that many rows were written into the room reserved, each once.
     unsafe {
         kept.set_len(kept_len);
         wide.set_len(wide_len);
+    }
+}
+
+/// A list's table and kept rows as `fill_piece` fills them (the count of kept rows apart).
+#[derive(Clone, Copy)]
+struct Fill<R> {
+    /// `mask + 1` slots; a row's place is `(slot() >> shift) & mask`.
+    table: *mut u32,
+    shift: u32,
+    mask: usize,
+    /// `tag`: a slot is `tag | 1 + index`, the index in the bits of `low` (the low
+    /// `low_bits`), the tag the key's hash bits from `tag_shift` up, placed above them.
+    low: u32,
+    low_bits: u32,
+    tag_shift: u32,
+    /// Room for every row of the list.
+    kept: *mut R,
+    /// `Way::ahead`, `Way::read`.
+    ahead: usize,
+    read: usize,
+}
+
+/// Each piece of list `list` of every worker with the piece after it: the next worker's first
+/// where a worker's list ends, none after the last.
+#[inline(always)]
+fn paired<'p, R: Copy + 'p>(lists: impl Iterator<Item = &'p Chunks<R>>, list: usize, mut each: impl FnMut(&'p [R], &'p [R])) {
+    let mut held: &'p [R] = &[];
+    for chunks in lists {
+        chunks.for_each(list, |piece| {
+            if !held.is_empty() {
+                each(held, piece);
+            }
+            held = piece;
+        });
+    }
+    if !held.is_empty() {
+        each(held, &[]);
+    }
+}
+
+/// Row `at` counted on from the start of `piece` into `next`.
+#[inline(always)]
+fn ahead_of<'a, R>(piece: &'a [R], next: &'a [R], at: usize) -> Option<&'a R> {
+    match piece.get(at) {
+        Some(row) => Some(row),
+        None => next.get(at - piece.len()),
+    }
+}
+
+/// The rows of `piece` into the table, `tag_row` or `one_row`, `count` rows kept before them;
+/// asked for ahead, as far as into `next`, are the slots of the rows `ahead` on and the rows
+/// `read` on. Returns the rows kept after them.
+///
+/// The parse wrote its lists with streaming stores, so a list is read from memory, a chunk at
+/// a time from anywhere in the block: the first read of each line of it was 18% of the cycles
+/// of the dedup tasks. On the two threads of a core the dedup is short of instructions as much
+/// as of memory, so the rows whose rows ahead are in the same piece (all but the last
+/// `ahead.max(read)`) ask for them with no check on where they are.
+///
+/// # Safety
+/// As `Fill` says: the table and `kept` are as large as it says, and `kept` holds `count`.
+#[inline(never)]
+unsafe fn fill_piece<R: Row, const TAG: bool>(fill: Fill<R>, mut count: usize, piece: &[R], next: &[R]) -> usize {
+    let slot_of = |row: &R| fill.table.wrapping_add((row.slot() >> fill.shift) as usize & fill.mask);
+    let inside = piece.len().saturating_sub(fill.ahead.max(fill.read));
+    for (number, row) in piece[..inside].iter().enumerate() {
+        // SAFETY: `number + ahead` and `number + read` are below `inside + ahead.max(read)`,
+        // at most the piece's length (a distance of 0 asks for the row itself); the rest is
+        // the caller's.
+        unsafe {
+            types::mem::prefetch(slot_of(piece.get_unchecked(number + fill.ahead)));
+            types::mem::prefetch(piece.as_ptr().add(number + fill.read));
+            count = if TAG { tag_row(&fill, count, row) } else { one_row(&fill, count, row) };
+        }
+    }
+    for (number, row) in piece.iter().enumerate().skip(inside) {
+        if fill.ahead != 0
+            && let Some(coming) = ahead_of(piece, next, number + fill.ahead)
+        {
+            types::mem::prefetch(slot_of(coming));
+        }
+        if fill.read != 0
+            && let Some(coming) = ahead_of(piece, next, number + fill.read)
+        {
+            types::mem::prefetch(coming as *const R);
+        }
+        // SAFETY: the caller's.
+        count = unsafe { if TAG { tag_row(&fill, count, row) } else { one_row(&fill, count, row) } };
+    }
+    count
+}
+
+/// `row` into a table a slot at a time, as `dedup` does: a slot is 1 + a kept row's index.
+/// Returns the rows kept.
+///
+/// # Safety
+/// As `fill_piece`.
+#[inline(always)]
+unsafe fn one_row<R: Row>(f: &Fill<R>, count: usize, row: &R) -> usize {
+    let mut at = (row.slot() >> f.shift) as usize & f.mask;
+    // SAFETY: `at` is at most `mask`; a slot is set to the count of kept rows right after the
+    // row is written.
+    unsafe {
+        loop {
+            let slot = &mut *f.table.add(at);
+            if *slot == 0 {
+                f.kept.add(count).write(*row);
+                *slot = count as u32 + 1;
+                return count + 1;
+            }
+            let first = &mut *f.kept.add(*slot as usize - 1);
+            if first.same(row) {
+                if (row.words().1 as u32) < (first.words().1 as u32) {
+                    *first = *row;
+                }
+                return count;
+            }
+            at = (at + 1) & f.mask;
+        }
+    }
+}
+
+/// `one_row` with the slots tagged: a slot holding another tag is another key's, passed over
+/// without its kept row read (a read from anywhere in the kept rows, and at 2 slots a row a
+/// row's place is another key's a quarter of the time). Returns the rows kept.
+///
+/// # Safety
+/// As `fill_piece`.
+#[inline(always)]
+unsafe fn tag_row<R: Row>(f: &Fill<R>, count: usize, row: &R) -> usize {
+    let hash = row.slot();
+    let mut at = (hash >> f.shift) as usize & f.mask;
+    let tag = ((hash >> f.tag_shift) as u32) << f.low_bits;
+    // SAFETY: as `one_row`; a slot holds `tag | 1 + index` of a kept row.
+    unsafe {
+        loop {
+            let slot = &mut *f.table.add(at);
+            if *slot == 0 {
+                f.kept.add(count).write(*row);
+                *slot = tag | (count as u32 + 1);
+                return count + 1;
+            }
+            if *slot & !f.low == tag {
+                let first = &mut *f.kept.add((*slot & f.low) as usize - 1);
+                if first.same(row) {
+                    if (row.words().1 as u32) < (first.words().1 as u32) {
+                        *first = *row;
+                    }
+                    return count;
+                }
+            }
+            at = (at + 1) & f.mask;
+        }
     }
 }
 
@@ -859,4 +1122,113 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     // The exit path skips destructors (`fast-exit`), and these are large.
     std::mem::forget(parsed);
     Some(Staged { scattered, names: Names { plan, persons }, dense })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// Every combination of the switches.
+    fn ways() -> Vec<Way> {
+        let mut all = Vec::new();
+        for tag in [false, true] {
+            for room in [1, 2, 4] {
+                for read in [0, 3, 200] {
+                    for ahead in [0, 8] {
+                        all.push(Way { ahead, room, read, tag });
+                    }
+                }
+            }
+        }
+        all
+    }
+
+    /// `rows` dealt to `workers` lists in turn, deduplicated every way: each the same as the
+    /// rows' first copy of each key, with the smallest `ingest`, in order of first copy.
+    fn check<R: Row + PartialEq + std::fmt::Debug>(rows: &[R], key: impl Fn(&R) -> (u64, u64)) {
+        for workers in [1, 3] {
+            let mut lists: Vec<Chunks<R>> = (0..workers).map(|_| Chunks::new(1, 1 << 16)).collect();
+            for (n, row) in rows.iter().enumerate() {
+                lists[n % workers].push(0, *row);
+            }
+            let (mut want, mut at) = (Vec::new(), HashMap::new());
+            for chunks in &lists {
+                chunks.for_each(0, |piece| {
+                    for row in piece {
+                        match at.get(&key(row)) {
+                            None => {
+                                at.insert(key(row), want.len());
+                                want.push(*row);
+                            }
+                            Some(&k) => {
+                                let first: &mut R = &mut want[k];
+                                if (row.words().1 as u32) < (first.words().1 as u32) {
+                                    *first = *row;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            let (mut table, mut kept) = (Vec::new(), Vec::new());
+            for way in ways() {
+                // The table and the rows kept as they were left by the list before.
+                dedup_as(way, lists.iter(), 0, 0, &mut table, &mut kept);
+                assert_eq!(kept, want, "{} rows over {workers} workers, room {}, read {}, ahead {}, tag {}", rows.len(), way.room, way.read, way.ahead, way.tag);
+            }
+        }
+    }
+
+    /// A row of `key` whose `ingest` is `ingest`, told apart from the key's other copies by `n`.
+    fn ev(key: u64, ingest: u32, n: u64) -> Ev {
+        Ev { key, user_ts: n << 32 | 7, ingest_pay: u64::from(ingest) | n << 40 }
+    }
+
+    /// A key whose `hash` is `hash`.
+    fn key_of(hash: u64) -> u64 {
+        // The inverse of the odd constant modulo 2^64, by Newton's iteration.
+        let mut inverse = types::hash::C2;
+        for _ in 0..6 {
+            inverse = inverse.wrapping_mul(2u64.wrapping_sub(types::hash::C2.wrapping_mul(inverse)));
+        }
+        assert_eq!(inverse.wrapping_mul(types::hash::C2), 1);
+        hash.wrapping_mul(inverse)
+    }
+
+    #[test]
+    fn every_way_keeps_the_first_copy_with_the_smallest_ingest() {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state >> 16
+        };
+        for (rows, keys) in [(1usize, 1u64), (2, 1), (300, 40), (5_000, 3_000), (50_000, 45_000), (50_000, 900)] {
+            let picks: Vec<u64> = (0..keys).map(|_| next()).collect();
+            let short: Vec<Ev> = (0..rows as u64).map(|n| ev(picks[(next() % keys) as usize], (next() % 50) as u32, n)).collect();
+            check(&short, |row| (row.key, 0));
+            let long: Vec<EvL> = short.iter().map(|row| EvL { hi: row.key ^ 0x5555, lo: !row.key, user_ts: row.user_ts, ingest_pay: row.ingest_pay }).collect();
+            check(&long, |row| (row.hi, row.lo));
+        }
+    }
+
+    /// Keys made to share a place, and a place and a tag: runs of taken slots from a place
+    /// (past the table's last slot to its first), and the tagged slot of another key.
+    #[test]
+    fn crowded_places_and_shared_tags() {
+        // At most 256 rows a list: 1,024 slots at every room, a place the top 10 bits of the
+        // hash, the tag the 24 bits below them.
+        let mut rows = Vec::new();
+        for copy in 0..3u64 {
+            for j in 0..40u64 {
+                // Place 1023, the last; tags apart.
+                rows.push(ev(key_of(0x3FF << 54 | j << 31), (40 - j as u32 + copy as u32 * 7) % 11, copy * 100 + j));
+                // Place 5, one tag: keys apart only below it.
+                rows.push(ev(key_of(5 << 54 | 9 << 31 | j), (j as u32 * 3 + copy as u32) % 5, copy * 100 + j));
+            }
+            // Place 0, which the probes from place 1023 run on into; a tag of 0.
+            rows.push(ev(key_of(77), 9 - copy as u32, copy));
+        }
+        check(&rows, |row| (row.key, 0));
+    }
 }
