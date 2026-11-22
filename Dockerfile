@@ -17,7 +17,7 @@ COPY src/ src/
 #   Cascade Lake Xeons the microcode fix for the jump erratum (SKX102) keeps such a jump out
 #   of the decoded-instruction cache. No use on Ice Lake or later, nor on AMD.
 ARG CPU=cascadelake
-ARG EXTRA_RUSTFLAGS=""
+ARG EXTRA_RUSTFLAGS="-C llvm-args=-x86-branches-within-32B-boundaries"
 # One static, non-relocatable binary: the C library is linked in, so the image below is the
 # binary alone, and a start is an exec with no loader, no libraries to map and no relocations
 # to apply (about 1 ms of a 17 ms run at 1M events, and what `docker run` adds on top).
