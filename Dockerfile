@@ -58,5 +58,5 @@ WORKDIR /app
 # `scripts/variant.sh NAME SWITCH...` makes the branch `runner/NAME` with the line below
 # rewritten and pushes it. SS_RUN is read by nothing: it keeps the line whole when every
 # switch is at its default.
-ENV SS_RUN=1
+ENV SS_RUN=1 SS_POPULATE=1024 SS_PART_BITS_OPAQUE=10 SS_REAP=on SS_RECYCLE=off
 CMD ["/app/shopping-sessions"]
