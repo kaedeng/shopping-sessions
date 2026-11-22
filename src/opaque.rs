@@ -21,10 +21,29 @@ use types::chunks::Chunks;
 use types::hash::{hash, person_hash};
 use types::parts::{Combine, Mode, Parts, Plain};
 use types::record::{ClickRec, PersonEvent};
+use types::mem::Zeroed;
 use types::users::{Users, mix_long};
 use types::{Ctx, Id, par};
 
 use crate::Scattered;
+
+/// The person buckets as ranges of the persons' numbers (`sessions::bucket_dense`): a
+/// worker's lists of the events' keys (`person << 32 | ts`), of the purchases among them and
+/// of the clicks, a list per bucket.
+pub struct DenseBuckets {
+    pub keys: Chunks<u64>,
+    pub pays: Chunks<sessions::DensePay>,
+    pub clicks: Chunks<ClickRec>,
+}
+
+impl DenseBuckets {
+    /// Room for a worker's share of `events` and `clicks`, and a chunk a list to begin with.
+    fn new(buckets: usize, events: usize, clicks: usize, workers: usize) -> DenseBuckets {
+        let share = |rows: usize, size: usize| rows / workers * size * 9 / 8 + buckets * 4096 + (2 << 20);
+        DenseBuckets { keys: Chunks::new(buckets, share(events, 8)), pays: Chunks::new(buckets, share(events / 16, 16)), clicks: Chunks::new(buckets, share(clicks, 24)) }
+    }
+}
+
 
 /// Links `Persons::new` asks for the entries of ahead of.
 const AHEAD: usize = 16;
@@ -34,10 +53,10 @@ pub struct Persons {
     /// Per user's number: 1 + the user this one hangs under, which once the links are joined
     /// is its component's root. 0 for a root, and for a user no link names: its own person,
     /// called by its own ID.
-    up: Vec<u32>,
+    up: Zeroed<u32>,
     /// Per root: 1 + the user with the component's byte-wise smallest ID (0 before any link
     /// named the root), and `LinkRec::order` of that ID.
-    names: Vec<(u32, u64)>,
+    names: Zeroed<(u32, u64)>,
 }
 
 impl Persons {
@@ -45,11 +64,9 @@ impl Persons {
     /// its component's smallest ID as the links come.
     pub fn new(users: &Users, links: &[Vec<LinkRec>]) -> Persons {
         // Zeroed lazily by the kernel, and touched only where a user's number is: the
-        // numbers are dense, so that is the arrays' first few megabytes. Room for 4 and 2
-        // million entries at least: a block that large is fresh memory, where a smaller one
-        // may be a freed block the allocator clears first.
-        let mut up = vec![0u32; users.bound().max(4 << 20)];
-        let mut names = vec![(0u32, 0u64); users.bound().max(2 << 20)];
+        // numbers are dense, so that is the arrays' first few megabytes.
+        // SAFETY: all zeros is a valid integer, and a valid pair of them.
+        let (mut up, mut names) = unsafe { (Zeroed::<u32>::new(users.bound()), Zeroed::<(u32, u64)>::new(users.bound())) };
         // The root of `x`, every user on the way pointed at its grandparent.
         fn find(up: &mut [u32], mut x: u32) -> u32 {
             loop {
@@ -127,6 +144,12 @@ impl Persons {
     #[inline(always)]
     pub fn prefetch(&self, user: u32) {
         types::mem::prefetch(self.up.as_ptr().wrapping_add(user as usize));
+    }
+
+    /// Asks for the cache line `name(person)` reads.
+    #[inline(always)]
+    pub fn prefetch_name(&self, person: u32) {
+        types::mem::prefetch(self.names.as_ptr().wrapping_add(person as usize));
     }
 
     /// The user whose ID names person `person` (a root): its component's smallest.
@@ -253,6 +276,45 @@ fn scatter<R: Row, M: Mode>(kept: &[R], persons: &Persons, bucket_bits: u32, out
     out.fence();
 }
 
+/// `scatter` into buckets that are ranges of the persons' numbers: bucket
+/// `(person - 1) >> shift`, an event the key `person << 32 | ts`.
+#[inline(always)]
+fn scatter_dense<R: Row>(kept: &[R], persons: &Persons, shift: u32, out: &mut DenseBuckets) {
+    for row in kept {
+        persons.prefetch(row.words().0 as u32);
+    }
+    for row in kept {
+        let (user_ts, ingest_pay) = row.words();
+        let ts = (user_ts >> 32) as u32;
+        if ts != 0 {
+            let root = persons.of(user_ts as u32);
+            let (list, key) = ((root >> shift) as usize, u64::from(root + 1) << 32 | u64::from(ts));
+            out.keys.push(list, key);
+            let pay = (ingest_pay >> 32) as u32;
+            if pay != 0 {
+                out.pays.push(list, sessions::DensePay { key, pay, pad: 0 });
+            }
+        }
+    }
+    out.keys.fence();
+}
+
+/// `scatter_clicks` into the same buckets.
+#[inline(always)]
+fn scatter_clicks_dense(from: &Out, persons: &Persons, shift: u32, out: &mut DenseBuckets) {
+    from.clicks.for_each(0, |piece| {
+        for click in piece {
+            persons.prefetch(click.user_ts as u32);
+        }
+        for click in piece {
+            let root = persons.of(click.user_ts as u32);
+            let rec = ClickRec { user: u64::from(root) + 1, click: click.click, ts: (click.user_ts >> 32) as u32, campaign: click.campaign as u32 };
+            out.clicks.push((root >> shift) as usize, rec);
+        }
+    });
+    out.clicks.fence();
+}
+
 /// A worker's clicks to their persons' buckets.
 #[inline(always)]
 fn scatter_clicks<M: Mode>(from: &Out, persons: &Persons, bucket_bits: u32, out: &mut Parts<ClickRec>) {
@@ -275,6 +337,9 @@ fn scatter_clicks<M: Mode>(from: &Out, persons: &Persons, bucket_bits: u32, out:
 pub struct Staged {
     pub scattered: Vec<Scattered>,
     pub names: Names,
+    /// The buckets as ranges of the persons' numbers (`Scattered::dense`): the shift from a
+    /// number less one to its bucket, and the buckets.
+    pub dense: Option<(u32, usize)>,
 }
 
 /// What a person's place is called.
@@ -284,11 +349,38 @@ pub struct Names {
 }
 
 impl Names {
-    /// Appends the name of the person whose key is `key`: its root's number and one.
-    pub fn text(&self, key: Id, out: &mut Vec<u8>) {
-        self.plan.users.text(self.persons.name(key as u32 - 1), out);
+    /// Appends the names of the persons whose keys are `keys` (a root's number and one), as
+    /// `output::user_daily_named` wants them: each name's length in four little-endian
+    /// bytes, then its bytes. A name is read through three tables (the root's name, that
+    /// user's slot, the slot's key), each far larger than the caches, so the keys go a few
+    /// at a time: every table's lines are asked for before any is read.
+    pub fn texts(&self, keys: &[Id], out: &mut Vec<u8>) {
+        let users = &self.plan.users;
+        let mut named = [0u32; NAMES_HELD];
+        for held in keys.chunks(NAMES_HELD) {
+            for &key in held {
+                self.persons.prefetch_name(key as u32 - 1);
+            }
+            for (name, &key) in named.iter_mut().zip(held) {
+                *name = self.persons.name(key as u32 - 1);
+                users.prefetch_slot(*name);
+            }
+            for &name in &named[..held.len()] {
+                users.prefetch_key(name);
+            }
+            for &name in &named[..held.len()] {
+                let at = out.len();
+                out.extend_from_slice(&[0; 4]);
+                users.text(name, out);
+                let len = (out.len() - at - 4) as u32;
+                out[at..at + 4].copy_from_slice(&len.to_le_bytes());
+            }
+        }
     }
 }
+
+/// Names `Names::texts` reads together.
+const NAMES_HELD: usize = 32;
 
 /// Stages 1 and 2. `None` when the directory was too small for the input's users: the
 /// caller starts over with a larger `grow`. `whole_clicks`: `ingest::opaque::click_id_at`.
@@ -335,17 +427,44 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
         let slow: usize = parsed.iter().map(|out| out.slow).sum();
         eprintln!("opaque: {events} event rows ({long} with a long event_id), {clicks} clicks, {links} links, {} lists, {} users, {slow} lines through the row code", parts + long_parts, plan.users.count());
     }
-    let mut scattered: Vec<Scattered> = par::init(ctx.workers, parallel_alloc, |_| Scattered {
-        events: Parts::new(buckets, room(events), scatter_mode),
-        clicks: Parts::new(buckets, room(clicks), scatter_mode),
-        scratch: Default::default(),
-        opaque: Default::default(),
+    // `SS_BUCKETS=dense|hash`: the person buckets as ranges of the persons' numbers, for
+    // `sessions::bucket_dense`, or by the persons' hashes, for `sessions::bucket`.
+    let dense = (types::env::pick("SS_BUCKETS", &["dense", "hash"]) == 0).then(|| {
+        let count = plan.users.count().max(1);
+        let shift = (usize::BITS - (count - 1).leading_zeros()).saturating_sub(ctx.bucket_bits);
+        (shift, ((count - 1) >> shift) + 1)
+    });
+    let mut scattered: Vec<Scattered> = par::init(ctx.workers, parallel_alloc, |_| match dense {
+        Some((_, lists)) => Scattered {
+            events: Parts::new(1, 64, scatter_mode),
+            clicks: Parts::new(1, 64, scatter_mode),
+            scratch: Default::default(),
+            opaque: Default::default(),
+            dense: Some(DenseBuckets::new(lists, events, clicks, ctx.workers)),
+        },
+        None => Scattered {
+            events: Parts::new(buckets, room(events), scatter_mode),
+            clicks: Parts::new(buckets, room(clicks), scatter_mode),
+            scratch: Default::default(),
+            opaque: Default::default(),
+            dense: None,
+        },
     });
     {
         let (parsed, persons) = (&parsed[..], &persons);
         par::run(&mut scattered, parts + long_parts + parsed.len(), |_, mine, task| {
-            let Scattered { events, clicks, opaque: Scratch { table, kept, kept_long }, .. } = mine;
-            if task < parts {
+            let Scattered { events, clicks, opaque: Scratch { table, kept, kept_long }, dense: ranges, .. } = mine;
+            if let (Some(ranges), Some((shift, _))) = (ranges, dense) {
+                if task < parts {
+                    dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, table, kept);
+                    scatter_dense(kept, persons, shift, ranges);
+                } else if task < parts + long_parts {
+                    dedup(parsed.iter().map(|out| &out.long_events), task - parts, plan.long_bits, table, kept_long);
+                    scatter_dense(kept_long, persons, shift, ranges);
+                } else {
+                    scatter_clicks_dense(&parsed[task - parts - long_parts], persons, shift, ranges);
+                }
+            } else if task < parts {
                 dedup(parsed.iter().map(|out| &out.events), task, plan.part_bits, table, kept);
                 if events.combining() { scatter::<_, Combine>(kept, persons, ctx.bucket_bits, events) } else { scatter::<_, Plain>(kept, persons, ctx.bucket_bits, events) }
             } else if task < parts + long_parts {
@@ -363,5 +482,5 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     }
     // The exit path skips destructors (`fast-exit`), and these are large.
     std::mem::forget(parsed);
-    Some(Staged { scattered, names: Names { plan, persons } })
+    Some(Staged { scattered, names: Names { plan, persons }, dense })
 }

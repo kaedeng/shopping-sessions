@@ -50,6 +50,10 @@ struct Scattered {
     /// The opaque pipeline's dedup buffers (`opaque::stages`).
     #[cfg(feature = "pipe-positional")]
     opaque: opaque::Scratch,
+    /// The person buckets as ranges of the persons' numbers, when the opaque stages write
+    /// them that way (`opaque::Staged::dense`).
+    #[cfg(feature = "pipe-positional")]
+    dense: Option<opaque::DenseBuckets>,
 }
 
 fn dir(var: &str, default: &str) -> PathBuf {
@@ -182,6 +186,8 @@ fn run() -> Result<(), String> {
         // Stages 1 and 2: the person buckets, by the pipeline picked.
         #[cfg(feature = "pipe-positional")]
         let mut names = None;
+        #[allow(unused_mut)]
+        let mut dense_plan: Option<(u32, usize)> = None;
         #[cfg(feature = "pipe-positional")]
         let staged = opaque.then(|| {
             // A directory too small for the input's users (far more of them a line than
@@ -202,6 +208,7 @@ fn run() -> Result<(), String> {
         let (scattered, spilled_partitions) = if let Some(staged) = staged {
             #[cfg(feature = "pipe-positional")]
             {
+                dense_plan = staged.dense;
                 names = Some(staged.names);
                 (staged.scattered, spilled(0, 0))
             }
@@ -233,6 +240,8 @@ fn run() -> Result<(), String> {
                 scratch: Default::default(),
                 #[cfg(feature = "pipe-positional")]
                 opaque: Default::default(),
+                #[cfg(feature = "pipe-positional")]
+                dense: None,
             });
             par::run(&mut scattered, parts + click_tasks.len(), |_, mine, task| {
                 if task < parts {
@@ -261,17 +270,40 @@ fn run() -> Result<(), String> {
         let spilled_clicks = spilled(scattered.iter().map(|mine| mine.clicks.spilled()).sum(), buckets * ctx.workers);
 
         // Stage 3. Person buckets, largest first so a whale's bucket is not the last to start.
-        let mut order: Vec<usize> = (0..buckets).collect();
-        order.sort_by_cached_key(|&bucket| {
-            std::cmp::Reverse(scattered.iter().map(|mine| mine.events.len_of(bucket)).sum::<usize>())
-        });
         let mut aggs: Vec<Agg> = par::init(ctx.workers, parallel_alloc, |_| Agg::new(&ctx));
-        par::run(&mut aggs, buckets, |_, agg, task| {
-            let bucket = order[task];
-            let events = scattered.iter().flat_map(|mine| mine.events.pieces(bucket));
-            let clicks = scattered.iter().flat_map(|mine| mine.clicks.pieces(bucket));
-            sessions::bucket(&ctx, events, clicks, agg);
-        });
+        #[cfg(feature = "pipe-positional")]
+        if let Some((shift, lists)) = dense_plan {
+            // Buckets that are ranges of the persons' numbers: no hash, no lookup.
+            fn dense(mine: &Scattered) -> &opaque::DenseBuckets {
+                mine.dense.as_ref().expect("the opaque stages wrote ranges")
+            }
+            let mut order: Vec<usize> = (0..lists).collect();
+            order.sort_by_cached_key(|&bucket| std::cmp::Reverse(scattered.iter().map(|mine| dense(mine).keys.len_of(bucket)).sum::<usize>()));
+            par::run(&mut aggs, lists, |_, agg, task| {
+                let bucket = order[task];
+                sessions::bucket_dense(
+                    &ctx,
+                    ((bucket as u32) << shift) + 1,
+                    1usize << shift,
+                    &|each| scattered.iter().for_each(|mine| dense(mine).keys.for_each(bucket, |piece| each(piece))),
+                    &|each| scattered.iter().for_each(|mine| dense(mine).pays.for_each(bucket, |piece| each(piece))),
+                    &|each| scattered.iter().for_each(|mine| dense(mine).clicks.for_each(bucket, |piece| each(piece))),
+                    agg,
+                );
+            });
+        }
+        if dense_plan.is_none() {
+            let mut order: Vec<usize> = (0..buckets).collect();
+            order.sort_by_cached_key(|&bucket| {
+                std::cmp::Reverse(scattered.iter().map(|mine| mine.events.len_of(bucket)).sum::<usize>())
+            });
+            par::run(&mut aggs, buckets, |_, agg, task| {
+                let bucket = order[task];
+                let events = scattered.iter().flat_map(|mine| mine.events.pieces(bucket));
+                let clicks = scattered.iter().flat_map(|mine| mine.clicks.pieces(bucket));
+                sessions::bucket(&ctx, events, clicks, agg);
+            });
+        }
         lap("sessions");
         #[cfg(feature = "pipe-positional")]
         if opaque && !whole_clicks && sessions::ambiguous_tie() {
@@ -300,7 +332,7 @@ fn run() -> Result<(), String> {
         // their names.
         #[cfg(feature = "pipe-positional")]
         let written = match &names {
-            Some(names) => output::user_daily_named(&user_folder, worker, &ctx, rows, &|key, out| names.text(key, out)),
+            Some(names) => output::user_daily_named(&user_folder, worker, &ctx, rows, &|keys, out| names.texts(keys, out)),
             None => output::user_daily(&user_folder, worker, &ctx, rows),
         };
         #[cfg(not(feature = "pipe-positional"))]

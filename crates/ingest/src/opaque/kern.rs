@@ -577,8 +577,17 @@ struct Batch {
     line: [*const u8; BATCH + 8],
     /// The second words of a row's long IDs: the event's, the user's.
     lows: [[u64; 2]; BATCH],
-    /// The users' places, once `finish` has looked them up.
+    /// The users' numbers, once `finish` has looked them up.
     users: [u32; BATCH + 16],
+    /// Rows stored and not yet finished: 0 for a batch that is being filled.
+    count: usize,
+}
+
+/// Of the two batches a chunk's rows go through in turn, the one that is not `batch`.
+#[inline(always)]
+unsafe fn other(pair: *mut Batch, batch: *mut Batch) -> *mut Batch {
+    // SAFETY: `pair` is two batches, and `batch` one of them.
+    if batch == pair { unsafe { pair.add(1) } } else { pair }
 }
 
 /// Records held before they are scattered; a group adds at most 8.
@@ -821,8 +830,13 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
     let consts = Consts::new(ctx, plan, memo);
     let lanes = Lanes::new();
     let mut held = Held::new();
+    // Two batches in turn: when one is full its users' lines of the directory are asked
+    // for, and the one before it, asked for a batch ago, is finished. (Asked for and looked
+    // up in one go, the first rows of a batch still waited for their lines: the directory
+    // is far larger than the caches, and a line takes longer to come than 64 rows to ask
+    // for.)
     // SAFETY: plain integers, bytes and pointers that are not read before they are written.
-    let mut batch: Batch = unsafe { std::mem::zeroed() };
+    let mut pair: [Batch; 2] = unsafe { std::mem::zeroed() };
     // SAFETY: a line the kernel runs on begins at `line < stop`, at least `WINDOW - PAD`
     // bytes before the segment's end, which is a newline: the newline it looks for from at
     // most 141 bytes in is inside the segment, and everything it reads lies between 16 bytes
@@ -836,10 +850,11 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
         let days = memo.days.as_ptr().cast::<u8>();
         // The batch through one pointer: a row's class and its line are stored 8 bytes apart,
         // in step with its 32 bytes.
-        let batch: *mut Batch = &raw mut batch;
-        let rows = batch.cast::<u8>();
-        let class = rows.add(std::mem::offset_of!(Batch, class));
-        let lows = rows.add(std::mem::offset_of!(Batch, lows));
+        let pair: *mut Batch = pair.as_mut_ptr();
+        let mut batch = pair;
+        let mut rows = batch.cast::<u8>();
+        let mut class = rows.add(std::mem::offset_of!(Batch, class));
+        let mut lows = rows.add(std::mem::offset_of!(Batch, lows));
         const _: () = assert!(std::mem::offset_of!(Batch, line) == std::mem::offset_of!(Batch, class) + 8 * BATCH && std::mem::offset_of!(Batch, rows) == 0);
         let mut line = p;
         while line < last {
@@ -905,7 +920,12 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                     k += 8;
                     line = end.add(1);
                     if k == 8 * BATCH {
-                        finish(batch, BATCH, line, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
+                        (*batch).count = BATCH;
+                        (*batch).line[BATCH] = line;
+                        ask(&*batch, plan);
+                        batch = other(pair, batch);
+                        finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
+                        (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
                         k = 0;
                     }
                     if line >= stop {
@@ -914,7 +934,12 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 }
                 // The rows so far end where this line begins.
                 if k != 0 {
-                    finish(batch, k / 8, line, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
+                    (*batch).count = k / 8;
+                    (*batch).line[k / 8] = line;
+                    ask(&*batch, plan);
+                    batch = other(pair, batch);
+                    finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
+                    (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
                 }
             }
             if line < last {
@@ -927,6 +952,8 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 line = p.add(line_end(p, len, at));
             }
         }
+        // The batch that was asked for last.
+        finish(other(pair, batch), p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
     }
     held.flush(events);
     // Streamed lines become visible to the threads that read the lists.
@@ -934,17 +961,16 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
     long_events.fence();
 }
 
-/// The rows of a batch as records, and what is not one through the row code.
+/// The rows of a batch (`Batch::count` of them, 0 after this) as records, and what is not
+/// one through the row code.
 ///
 /// # Safety
-/// `base, bytes` is the segment the rows' lines are in, `rows <= BATCH` rows are stored and
-/// `next` is where the last one's line ends.
+/// `base, bytes` is the segment the rows' lines are in, and the batch's `line` holds where
+/// each row's line begins and where the last one ends.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn finish(
     batch: *mut Batch,
-    rows: usize,
-    next: *const u8,
     base: *const u8,
     bytes: usize,
     consts: &Consts,
@@ -960,8 +986,8 @@ unsafe fn finish(
     // an older row or zeros, and `live` keeps it out of the records and the row code.
     unsafe {
         let batch = &mut *batch;
-        batch.line[rows] = next;
-        places(batch, rows, plan);
+        let rows = std::mem::take(&mut batch.count);
+        look(batch, rows, plan);
         let all = |value: i64| _mm512_set1_epi64(value);
         // Two rows a register: event, ts, user, ingest, twice. From two registers, the four
         // events then the four `ts`; the four users then the four `ingest_ts`.
@@ -1014,21 +1040,22 @@ unsafe fn finish(
     }
 }
 
-/// The users' places of a batch's rows, into `Batch::users`: every row's line of the
-/// directory asked for, then read. (Looked up one after another as the records were made,
-/// each row waited for its line: the directory is far larger than the caches.)
-///
-/// # Safety
-/// `rows <= BATCH` rows are stored in `batch`.
+/// Asks for the directory's lines of a batch's users (`Batch::count` rows).
 #[inline(always)]
-unsafe fn places(batch: &mut Batch, rows: usize, plan: &Plan) {
+fn ask(batch: &Batch, plan: &Plan) {
     let users = &plan.users;
-    for row in 0..rows {
+    for row in 0..batch.count {
         let class = batch.class[row];
         if class as u32 == 0 {
             if class & LONG_USER != 0 { users.prefetch_long(batch.rows[row][2], batch.lows[row][1]) } else { users.prefetch_short(batch.rows[row][2] + 1) }
         }
     }
+}
+
+/// The users' numbers of a batch's first `rows` rows, into `Batch::users`.
+#[inline(always)]
+fn look(batch: &mut Batch, rows: usize, plan: &Plan) {
+    let users = &plan.users;
     for row in 0..rows {
         let class = batch.class[row];
         // A row for the row code has no user here: its bytes are read again.
@@ -1301,8 +1328,9 @@ pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
     let Out { clicks, slow, .. } = out;
     let memo = Memo::of(ctx, dates);
     let lanes = Lanes::new();
+    // Two batches in turn, as `events`.
     // SAFETY: plain integers, bytes and pointers that are not read before they are written.
-    let mut batch: Batch = unsafe { std::mem::zeroed() };
+    let mut pair: [Batch; 2] = unsafe { std::mem::zeroed() };
     // SAFETY: as `events`: a line the kernel runs on begins at least `WINDOW - PAD` bytes
     // before the segment's end, and its newline is the first from its first byte (or from
     // its `user_id`'s comma, with every byte before that matched), so the line is the
@@ -1314,10 +1342,11 @@ pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
         let ts_end = _mm512_set1_epi64(i64::from(ctx.ts_end));
         let hundreds = _mm_setr_epi16(100, 1, 0, 0, 0, 0, 0, 0);
         let days = memo.days.as_ptr().cast::<u8>();
-        let batch: *mut Batch = &raw mut batch;
-        let rows = batch.cast::<u8>();
-        let class = rows.add(std::mem::offset_of!(Batch, class));
-        let lows = rows.add(std::mem::offset_of!(Batch, lows));
+        let pair: *mut Batch = pair.as_mut_ptr();
+        let mut batch = pair;
+        let mut rows = batch.cast::<u8>();
+        let mut class = rows.add(std::mem::offset_of!(Batch, class));
+        let mut lows = rows.add(std::mem::offset_of!(Batch, lows));
         let mut line = p;
         while line < last {
             if line >= start && line < stop {
@@ -1394,7 +1423,12 @@ pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                     k += 8;
                     line = end.add(1);
                     if k == 8 * BATCH {
-                        finish_clicks(batch, BATCH, line, p, len, ts_end, campaigns, ctx, dates, plan, clicks, slow);
+                        (*batch).count = BATCH;
+                        (*batch).line[BATCH] = line;
+                        ask(&*batch, plan);
+                        batch = other(pair, batch);
+                        finish_clicks(batch, p, len, ts_end, campaigns, ctx, dates, plan, clicks, slow);
+                        (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
                         k = 0;
                     }
                     if line >= stop {
@@ -1402,7 +1436,12 @@ pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                     }
                 }
                 if k != 0 {
-                    finish_clicks(batch, k / 8, line, p, len, ts_end, campaigns, ctx, dates, plan, clicks, slow);
+                    (*batch).count = k / 8;
+                    (*batch).line[k / 8] = line;
+                    ask(&*batch, plan);
+                    batch = other(pair, batch);
+                    finish_clicks(batch, p, len, ts_end, campaigns, ctx, dates, plan, clicks, slow);
+                    (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
                 }
             }
             if line < last {
@@ -1415,6 +1454,8 @@ pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 line = p.add(line_end(p, len, at));
             }
         }
+        // The batch that was asked for last.
+        finish_clicks(other(pair, batch), p, len, ts_end, campaigns, ctx, dates, plan, clicks, slow);
     }
     clicks.fence();
 }
@@ -1436,8 +1477,6 @@ fn pack_words_128(parts: __m128i) -> __m128i {
 #[allow(clippy::too_many_arguments)]
 unsafe fn finish_clicks(
     batch: *mut Batch,
-    rows: usize,
-    next: *const u8,
     base: *const u8,
     bytes: usize,
     ts_end: __m512i,
@@ -1451,8 +1490,8 @@ unsafe fn finish_clicks(
     // SAFETY: as `finish`; the campaigns' table is read only at numbers below its count.
     unsafe {
         let batch = &mut *batch;
-        batch.line[rows] = next;
-        places(batch, rows, plan);
+        let rows = std::mem::take(&mut batch.count);
+        look(batch, rows, plan);
         // Bytes of a `click_id` that are kept (`click_id_at`).
         let kept = if plan.whole_clicks { usize::MAX } else { 9 };
         let all = |value: i64| _mm512_set1_epi64(value);

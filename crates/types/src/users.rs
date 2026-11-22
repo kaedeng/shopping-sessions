@@ -32,6 +32,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Acquire, Ordering::Relaxed, Ordering::Release};
 
 use crate::id::{self, Id, SLOW};
+use crate::mem::Zeroed;
 
 /// No user: an empty `user_id`.
 pub const NO_USER: u32 = u32::MAX;
@@ -46,13 +47,13 @@ const BLOCK: u32 = 1 << 10;
 
 pub struct Users {
     /// `[key, number + 1]`.
-    short: Vec<[AtomicU64; 2]>,
+    short: Zeroed<[AtomicU64; 2]>,
     /// `[tag, hi, lo, number + 1]`.
-    long: Vec<[AtomicU64; 4]>,
+    long: Zeroed<[AtomicU64; 4]>,
     short_shift: u32,
     long_shift: u32,
     /// Per number: its slot, the long table's after the short one's.
-    slot_of: Vec<AtomicU32>,
+    slot_of: Zeroed<AtomicU32>,
     /// The next block of numbers.
     next: AtomicU32,
     /// Which directory this is, among all the process makes: a thread's block is of one.
@@ -147,6 +148,28 @@ pub fn long_digits(hi: u64, lo: u64, out: &mut Vec<u8>) {
     }
 }
 
+/// The directory's key of the `user_id` that is the `len` bytes at `p`, for any spelling:
+/// `Short(0)` for an empty field. Apart from the lookup (`Users::get`), so that a batch of
+/// keys can be asked for before the first is looked up.
+///
+/// # Safety
+/// `len` bytes readable at `p`.
+pub unsafe fn key_at(p: *const u8, len: usize) -> UserKey {
+    if len == 0 {
+        return UserKey::Short(0);
+    }
+    // SAFETY: the caller's contract.
+    unsafe {
+        if let Some(key) = short_key_at(p, len, b'u') {
+            return UserKey::Short(key);
+        }
+        if let Some((hi, lo)) = long_key_at(p, len, b'u') {
+            return UserKey::Long(hi, lo);
+        }
+        UserKey::Short(id::intern_any(std::slice::from_raw_parts(p, len)))
+    }
+}
+
 #[inline(always)]
 fn mix(key: u64) -> u64 {
     key.wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -167,20 +190,8 @@ impl Users {
         // Every slot's number, and a block a thread may hold unused (64 threads' worth).
         let numbers = short + long + 64 * BLOCK as usize;
         assert!(numbers < NO_USER as usize, "{short} + {long} user slots: a number is 32 bits");
-        // SAFETY: an atomic has its integer's size, alignment and bit patterns, and a vector
-        // of zeros is handed over whole (zeroed lazily by the kernel, where a vector of
-        // atomics would be written slot by slot).
-        unsafe fn zeros<T, A>(count: usize, zero: T) -> Vec<A>
-        where
-            T: Clone,
-        {
-            const { assert!(size_of::<T>() == size_of::<A>() && align_of::<T>() == align_of::<A>()) };
-            let mut plain = std::mem::ManuallyDrop::new(vec![zero; count]);
-            // SAFETY: the caller's part: `A` is `T` made of atomics.
-            unsafe { Vec::from_raw_parts(plain.as_mut_ptr().cast::<A>(), plain.len(), plain.capacity()) }
-        }
-        // SAFETY: arrays of `u64` and `u32` as the same arrays of atomics.
-        let (short_slots, long_slots, slot_of) = unsafe { (zeros::<[u64; 2], [AtomicU64; 2]>(short, [0; 2]), zeros::<[u64; 4], [AtomicU64; 4]>(long, [0; 4]), zeros::<u32, AtomicU32>(numbers, 0)) };
+        // SAFETY: all zeros is a valid atomic integer.
+        let (short_slots, long_slots, slot_of) = unsafe { (Zeroed::new(short), Zeroed::new(long), Zeroed::new(numbers)) };
         Users {
             short: short_slots,
             long: long_slots,
@@ -354,18 +365,44 @@ impl Users {
     /// # Safety
     /// `len` bytes readable at `p`.
     pub unsafe fn at(&self, p: *const u8, len: usize) -> u32 {
-        if len == 0 {
-            return NO_USER;
-        }
         // SAFETY: the caller's contract.
-        unsafe {
-            if let Some(key) = short_key_at(p, len, b'u') {
-                return self.short(key);
-            }
-            if let Some((hi, lo)) = long_key_at(p, len, b'u') {
-                return self.long(hi, lo);
-            }
-            self.short(id::intern_any(std::slice::from_raw_parts(p, len)))
+        self.get(unsafe { key_at(p, len) })
+    }
+
+    /// Asks for the cache line the lookup of `key` begins at.
+    #[inline(always)]
+    pub fn prefetch(&self, key: UserKey) {
+        match key {
+            UserKey::Short(0) => {}
+            UserKey::Short(key) => self.prefetch_short(key),
+            UserKey::Long(hi, lo) => self.prefetch_long(hi, lo),
+        }
+    }
+
+    /// The number of the user with key `key` (`key_at`), `NO_USER` for the key of no ID.
+    #[inline(always)]
+    pub fn get(&self, key: UserKey) -> u32 {
+        match key {
+            UserKey::Short(0) => NO_USER,
+            UserKey::Short(key) => self.short(key),
+            UserKey::Long(hi, lo) => self.long(hi, lo),
+        }
+    }
+
+    /// Asks for the cache line that says which slot user `user` has.
+    #[inline(always)]
+    pub fn prefetch_slot(&self, user: u32) {
+        crate::mem::prefetch(self.slot_of.as_ptr().wrapping_add(user as usize));
+    }
+
+    /// Asks for the slot of user `user`: its key's cache line.
+    #[inline(always)]
+    pub fn prefetch_key(&self, user: u32) {
+        let slot = self.slot_of[user as usize].load(Relaxed) as usize;
+        if slot < self.short.len() {
+            crate::mem::prefetch(self.short.as_ptr().wrapping_add(slot));
+        } else {
+            crate::mem::prefetch(self.long.as_ptr().wrapping_add(slot - self.short.len()));
         }
     }
 

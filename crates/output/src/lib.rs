@@ -25,10 +25,11 @@ pub fn user_daily(folder: &Path, worker: usize, ctx: &Ctx, rows: UserDaily) -> R
 }
 
 /// `user_daily` for rows whose `person` is not a name but the caller's key for one:
-/// `text_of(key, out)` appends the name's bytes. Called once per run of equal keys, on the
-/// writing thread. (A name of 33 bytes as an `Id` is an entry of the intern tables; one in
-/// eight names is that long, and the pipeline for opaque IDs has their bytes elsewhere.)
-pub fn user_daily_named(folder: &Path, worker: usize, ctx: &Ctx, mut rows: UserDaily, text_of: &(dyn Fn(types::Id, &mut Vec<u8>) + Sync)) -> Result<(), String> {
+/// `text_of(keys, out)` appends, for each key, the name's length in four little-endian
+/// bytes and then its bytes. Called once a file with the keys of its runs of equal rows, on
+/// the writing thread. (A name of 33 bytes as an `Id` is an entry of the intern tables; one
+/// in eight names is that long, and the pipeline for opaque IDs has their bytes elsewhere.)
+pub fn user_daily_named(folder: &Path, worker: usize, ctx: &Ctx, mut rows: UserDaily, text_of: &(dyn Fn(&[types::Id], &mut Vec<u8>) + Sync)) -> Result<(), String> {
     #[cfg(feature = "out-direct")]
     if types::env::pick("SS_OUT", &["direct", "arrow"]) == 0 {
         return direct::user_daily(folder, worker, ctx, rows, Some(text_of));
@@ -38,8 +39,8 @@ pub fn user_daily_named(folder: &Path, worker: usize, ctx: &Ctx, mut rows: UserD
     for id in rows.person.iter_mut() {
         if *id != key {
             text.clear();
-            text_of(*id, &mut text);
-            (key, name) = (*id, types::id::pack(&text));
+            text_of(&[*id], &mut text);
+            (key, name) = (*id, types::id::pack(&text[4..]));
         }
         *id = name;
     }

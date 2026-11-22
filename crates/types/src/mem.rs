@@ -13,6 +13,62 @@ pub fn prefetch<T>(p: *const T) {
     let _ = p;
 }
 
+/// `len` zeroed `T`s on memory nothing has touched: the kernel's zero pages, each made
+/// real when it is first written.
+///
+/// A `vec![0; len]` asks the allocator for zeroed memory too, but the process's allocator
+/// (`src/region.rs`) may answer with a block that was freed earlier, and must then clear
+/// all of it at once, on the calling thread: 6 ms for a 67 MB table at 20M events, before
+/// the first worker could start. A request aligned above a huge page is never given such a
+/// block.
+pub struct Zeroed<T> {
+    at: std::ptr::NonNull<T>,
+    len: usize,
+    layout: std::alloc::Layout,
+}
+
+// SAFETY: plain owned memory, as a `Vec<T>` is.
+unsafe impl<T: Send> Send for Zeroed<T> {}
+unsafe impl<T: Sync> Sync for Zeroed<T> {}
+
+impl<T> Zeroed<T> {
+    /// # Safety
+    /// All zeros is a valid `T`.
+    pub unsafe fn new(len: usize) -> Zeroed<T> {
+        let layout = std::alloc::Layout::from_size_align((len * size_of::<T>()).max(1), 4 << 20).expect("Zeroed: layout");
+        // SAFETY: the layout has a size.
+        let at = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<T>();
+        let Some(at) = std::ptr::NonNull::new(at) else { std::alloc::handle_alloc_error(layout) };
+        Zeroed { at, len, layout }
+    }
+}
+
+impl<T> std::ops::Deref for Zeroed<T> {
+    type Target = [T];
+
+    #[inline(always)]
+    fn deref(&self) -> &[T] {
+        // SAFETY: `len` values, valid from the first (zeros) on.
+        unsafe { std::slice::from_raw_parts(self.at.as_ptr(), self.len) }
+    }
+}
+
+impl<T> std::ops::DerefMut for Zeroed<T> {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [T] {
+        // SAFETY: as `deref`, and owned.
+        unsafe { std::slice::from_raw_parts_mut(self.at.as_ptr(), self.len) }
+    }
+}
+
+impl<T> Drop for Zeroed<T> {
+    fn drop(&mut self) {
+        // SAFETY: allocated in `new` with this layout; the values need no drop of their own
+        // that matters here (integers and atomics).
+        unsafe { std::alloc::dealloc(self.at.as_ptr().cast(), self.layout) }
+    }
+}
+
 /// Slot `free-early` (`SS_FREE=early|exit`): whether a buffer goes back to the kernel as soon as
 /// it is dead (`release`) or with everything else at exit. Read once.
 pub fn free_early() -> bool {

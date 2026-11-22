@@ -286,11 +286,13 @@ fn footer(columns: &[Column], rows: usize, chunks: &[Chunk]) -> Vec<u8> {
 /// The `user_id` column: (dictionary page body, data page body, dictionary entries). A name
 /// enters the dictionary whenever it differs from the row before, and the values are one RLE
 /// run of that entry's index for the rows that share it. With `text_of`, a row's `Id` is not
-/// a name but the caller's key for one, and `text_of` appends the name's bytes.
+/// a name but the caller's key for one, and `text_of` appends the dictionary's entries for
+/// a list of keys: each name's length in four bytes, then its bytes.
 fn names(person: &[Id], text_of: Option<Names>) -> (Vec<u8>, Vec<u8>, usize) {
     // 13 bytes a name at most while packed; slow-path IDs grow the buffer.
     let mut dictionary: Vec<u8> = Vec::with_capacity(person.len() / 2 * 13 + 64);
     let mut runs: Vec<u32> = Vec::with_capacity(person.len() / 2 + 16);
+    let mut keys: Vec<Id> = Vec::new();
     let mut text = Vec::new();
     let mut at = 0;
     while at < person.len() {
@@ -299,11 +301,10 @@ fn names(person: &[Id], text_of: Option<Names>) -> (Vec<u8>, Vec<u8>, usize) {
         while end < person.len() && person[end] == id {
             end += 1;
         }
-        if let Some(text_of) = text_of {
-            text.clear();
-            text_of(id, &mut text);
-            dictionary.extend_from_slice(&(text.len() as u32).to_le_bytes());
-            dictionary.extend_from_slice(&text);
+        if text_of.is_some() {
+            // All at once after the loop: the caller reads each name from tables far larger
+            // than the caches, and with every key in hand it can ask for them ahead.
+            keys.push(id);
         } else if id & SLOW != 0 {
             text.clear();
             id::unpack(id, &mut text);
@@ -319,6 +320,9 @@ fn names(person: &[Id], text_of: Option<Names>) -> (Vec<u8>, Vec<u8>, usize) {
         }
         runs.push((end - at) as u32);
         at = end;
+    }
+    if let Some(text_of) = text_of {
+        text_of(&keys, &mut dictionary);
     }
     // The values: the indices' bit width, then for each entry a run header (rows << 1) and
     // the index in whole bytes.
@@ -369,8 +373,9 @@ pub fn user_daily(folder: &Path, worker: usize, ctx: &Ctx, rows: UserDaily, text
     write(&path, ctx, &rows, text_of).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// Appends the name a row's key stands for (`crate::user_daily_named`).
-pub type Names<'a> = &'a (dyn Fn(Id, &mut Vec<u8>) + Sync);
+/// Appends, for each key of a list, the name it stands for as a dictionary entry: its
+/// length in four little-endian bytes, then its bytes (`crate::user_daily_named`).
+pub type Names<'a> = &'a (dyn Fn(&[Id], &mut Vec<u8>) + Sync);
 
 fn write(path: &Path, ctx: &Ctx, table: &UserDaily, text_of: Option<Names>) -> Result<(), String> {
     let io = |error: std::io::Error| error.to_string();

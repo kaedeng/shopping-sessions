@@ -122,6 +122,8 @@ pub struct Agg {
     wide: Option<attr_wide::Attr>,
     day: agg_dense::Day,
     counters: agg_dense::Counters,
+    /// `bucket_dense`'s buffers.
+    dense: partitioned::Dense,
 }
 
 impl Agg {
@@ -137,6 +139,7 @@ impl Agg {
             wide: (ctx.n_days <= attr_wide::DAYS && types::env::pick("SS_ATTR", &["wide", "interval"]) == 0).then(|| attr_wide::Attr::new(ctx.campaigns.len())),
             day: Default::default(),
             counters: agg_dense::Counters::new(ctx),
+            dense: Default::default(),
         }
     }
 }
@@ -207,6 +210,39 @@ pub fn bucket<'a>(
         }
     }
     partitioned::bucket::<false>(ctx, events, clicks, agg)
+}
+
+/// A purchase as `bucket_dense` reads it: its event's key (`person << 32 | ts`) and its `pay`
+/// (`PersonEvent::pay`). 16 bytes.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct DensePay {
+    pub key: u64,
+    pub pay: u32,
+    pub pad: u32,
+}
+
+/// One bucket of persons that are numbers: every person of the bucket is in
+/// `base..base + span`, so what `bucket` keeps per person in a hash table is an array here,
+/// read at `person - base`.
+///
+/// - `events` calls its argument with the bucket's surviving events, a piece at a time, each
+///   the key `person << 32 | ts`; it is called twice, with the same pieces.
+/// - `pays` does the same with the purchases among those events, once.
+/// - `clicks` does the same with the bucket's clicks, twice; a click's `user` is its person.
+///
+/// The rows are `bucket`'s, with the person's number as the row's `person`.
+#[cfg(feature = "pipe-positional")]
+pub fn bucket_dense(
+    ctx: &Ctx,
+    base: u32,
+    span: usize,
+    events: &dyn Fn(&mut dyn FnMut(&[u64])),
+    pays: &dyn Fn(&mut dyn FnMut(&[DensePay])),
+    clicks: &dyn Fn(&mut dyn FnMut(&[ClickRec])),
+    agg: &mut Agg,
+) {
+    partitioned::bucket_dense(ctx, base, span, events, pays, clicks, agg)
 }
 
 /// `bucket` with the assists counted per stretch of a person's sessions (`attr-interval`): for

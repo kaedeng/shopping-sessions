@@ -300,6 +300,217 @@ pub fn bucket_wide<'a>(
     true
 }
 
+/// `bucket_dense`'s buffers, one set per worker.
+#[derive(Default)]
+pub struct Dense {
+    /// Per person of the bucket, and one more: before the scatter the first position of its
+    /// events in `ts`, after it one past the last. The same for the clicks.
+    ends: Vec<u32>,
+    click_ends: Vec<u32>,
+    /// The events' times, a person's together; sorted person by person as they are walked.
+    ts: Vec<u32>,
+    clicks: Vec<Click>,
+    /// The purchases as `(key - base << 32, pay)`, ascending, then a sentinel.
+    side: Vec<(u64, u32)>,
+}
+
+/// `crate::bucket_dense`: the bucket's persons are the numbers `base..base + span`.
+///
+/// Nothing is looked up and no key is sorted as a whole. A counting scatter by `person - base`
+/// puts each person's times together, straight from the lists (four bytes an event: the
+/// person is the position); a person's times are sorted alone when its turn comes; the clicks
+/// are grouped the same way. The sessions, the rows and the credits are then the calls
+/// `bucket_wide` makes.
+#[cfg(feature = "pipe-positional")]
+pub fn bucket_dense(
+    ctx: &Ctx,
+    base: u32,
+    span: usize,
+    events: &dyn Fn(&mut dyn FnMut(&[u64])),
+    pays: &dyn Fn(&mut dyn FnMut(&[crate::DensePay])),
+    clicks: &dyn Fn(&mut dyn FnMut(&[ClickRec])),
+    agg: &mut Agg,
+) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
+    let Agg { user_daily, bucket: scratch, attr, wide, day, counters, dense, .. } = agg;
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd")))]
+    let Agg { user_daily, bucket: scratch, attr, day, counters, dense, .. } = agg;
+    let Dense { ends, click_ends, ts, clicks: grouped, side } = dense;
+    let offset = u64::from(base) << 32;
+    // A key's person as its place among the bucket's; checked where it is first met, in the
+    // counting passes, so that the scatters may trust it.
+    let local = |key: u64| (key.wrapping_sub(offset) >> 32) as usize;
+
+    // The events: counted per person, then each time to its person's stretch.
+    ends.clear();
+    ends.resize(span + 1, 0);
+    events(&mut |piece| {
+        for &key in piece {
+            ends[local(key) + 1] += 1;
+        }
+    });
+    let mut n = 0u32;
+    for end in ends.iter_mut() {
+        n += *end;
+        *end = n;
+    }
+    let n = n as usize;
+    if n == 0 {
+        return;
+    }
+    ts.clear();
+    ts.reserve(n);
+    {
+        let (out, next) = (ts.as_mut_ptr(), ends.as_mut_ptr());
+        events(&mut |piece| {
+            // Eight keys a round, the loads before the stores that depend on them
+            // (`sort_grouped`).
+            let mut chunks = piece.chunks_exact(8);
+            for chunk in &mut chunks {
+                let batch: [u64; 8] = chunk.try_into().expect("chunks of 8");
+                let mut at = [0u32; 8];
+                for (at, key) in at.iter_mut().zip(batch) {
+                    // SAFETY: the count pass indexed the same persons, below `span`.
+                    unsafe {
+                        let slot = next.add(local(key));
+                        *at = *slot;
+                        *slot = *at + 1;
+                    }
+                }
+                for (at, key) in at.into_iter().zip(batch) {
+                    // SAFETY: the running sums make the positions a permutation of `0..n`,
+                    // inside the reserved room.
+                    unsafe { out.add(at as usize).write(key as u32) };
+                }
+            }
+            for &key in chunks.remainder() {
+                // SAFETY: as above.
+                unsafe {
+                    let slot = next.add(local(key));
+                    out.add(*slot as usize).write(key as u32);
+                    *slot += 1;
+                }
+            }
+        });
+        // SAFETY: every position in `0..n` was written once above.
+        unsafe { ts.set_len(n) };
+    }
+
+    // The purchases, in the order the walk meets them.
+    side.clear();
+    pays(&mut |piece| side.extend(piece.iter().map(|pay| (pay.key.wrapping_sub(offset), pay.pay))));
+    side.sort_unstable_by_key(|&(key, _)| key);
+    side.push((u64::MAX, 0));
+
+    // The clicks, grouped the same way; those of a person without events stay unread.
+    click_ends.clear();
+    click_ends.resize(span + 1, 0);
+    clicks(&mut |piece| {
+        for click in piece {
+            click_ends[(click.user as u32).wrapping_sub(base) as usize + 1] += 1;
+        }
+    });
+    let mut kept = 0u32;
+    for end in click_ends.iter_mut() {
+        kept += *end;
+        *end = kept;
+    }
+    grouped.clear();
+    grouped.reserve(kept as usize);
+    {
+        let (out, next) = (grouped.as_mut_ptr(), click_ends.as_mut_ptr());
+        clicks(&mut |piece| {
+            for click in piece {
+                // SAFETY: the count pass indexed the same persons; the positions are a
+                // permutation of `0..kept`, inside the reserved room.
+                unsafe {
+                    let slot = next.add((click.user as u32).wrapping_sub(base) as usize);
+                    out.add(*slot as usize).write(Click { ts: click.ts, campaign: click.campaign, id: click.click });
+                    *slot += 1;
+                }
+            }
+        });
+        // SAFETY: every position in `0..kept` was written once above.
+        unsafe { grouped.set_len(kept as usize) };
+    }
+
+    let Scratch { starts, days, revenue, credits, order, sorted, .. } = scratch;
+    let organic = ctx.organic();
+    let gap = GAP as u32;
+    // After the scatters `ends[p]` is one past person `p`'s last event, so its first is the
+    // end of the person before.
+    let (mut first, mut first_click, mut next_pay) = (0usize, 0usize, 0usize);
+    for at in 0..span {
+        let (end, end_click) = (ends[at] as usize, click_ends[at] as usize);
+        let (from, from_click) = (first, first_click);
+        (first, first_click) = (end, end_click);
+        if end == from {
+            continue;
+        }
+        let person = Id::from(base) + at as Id;
+        let times = &mut ts[from..end];
+        times.sort_unstable();
+        let high = (at as u64) << 32;
+        starts.clear();
+        days.clear();
+        revenue.clear();
+        let mut event = 0;
+        while event < times.len() {
+            let (begin, start) = (event, times[event]);
+            event += 1;
+            while event < times.len() && times[event] - times[event - 1] <= gap {
+                event += 1;
+            }
+            let d = (ctx.day_of(start) - ctx.day0) as usize;
+            day.session(d, event - begin, person, ctx.day0, user_daily);
+            // The session's purchases: those of this person up to its last event.
+            let (last, mut paid) = (high | u64::from(times[event - 1]), 0u64);
+            loop {
+                // SAFETY: the sentinel is above every key, so the walk stops inside `side`.
+                let (key, pay) = *unsafe { side.get_unchecked(next_pay) };
+                if key > last {
+                    break;
+                }
+                let price = pay & types::record::PAY_PRICE_MASK;
+                day.purchase(price, (pay >> types::record::PAY_CATEGORY_SHIFT) as u8);
+                paid += u64::from(price);
+                next_pay += 1;
+            }
+            revenue.push(paid);
+            starts.push(start);
+            days.push(d as u32);
+        }
+        day.flush(person, ctx.day0, user_daily);
+        credits.clear();
+        credits.resize(starts.len(), organic);
+        let clicks = &mut grouped[from_click..end_click];
+        if !clicks.is_empty() {
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
+            let done = match wide.as_mut() {
+                Some(wide) => {
+                    wide.person(clicks, starts, days, credits, counters.wide());
+                    true
+                }
+                None => false,
+            };
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd")))]
+            let done = false;
+            if !done {
+                // A window of more than 16 days: session by session, over the sorted clicks.
+                let clicks = sort_clicks(clicks, order, sorted);
+                for ((&start, &d), credit) in starts.iter().zip(days.iter()).zip(credits.iter_mut()) {
+                    *credit = attr.session(clicks, start, organic, counters.assists(d as usize));
+                }
+                attr.end_person();
+            }
+        }
+        for ((&campaign, &d), &paid) in credits.iter().zip(days.iter()).zip(revenue.iter()) {
+            counters.credit(campaign, d as usize, paid);
+        }
+    }
+    debug_assert_eq!(first, n);
+}
+
 /// `STRETCH` picks the attribution: `attr-interval` (assists counted per stretch of sessions)
 /// where the build has it, else the bucket's own, `attr-sweep` (per session and campaign).
 pub fn bucket<'a, const STRETCH: bool>(

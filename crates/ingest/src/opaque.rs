@@ -28,7 +28,7 @@ use types::hash::hash;
 use types::id::{self, Id, pack_at};
 use types::record::PAY_CATEGORY_SHIFT;
 use types::time::DAY;
-use types::users::{NO_USER, Users, long_key_at, mix_long, short_key_at};
+use types::users::{NO_USER, UserKey, Users, key_at, long_key_at, mix_long, short_key_at};
 use types::Ctx;
 
 use crate::tok::{Field, Scalar, Scratch, Tok};
@@ -181,6 +181,9 @@ pub(crate) unsafe fn click_id_at(p: *const u8, len: usize, whole: bool) -> Id {
     }
 }
 
+/// Link lines whose users are looked up together (`Ingest::opaque_links`).
+const LINKS_HELD: usize = 32;
+
 /// The two words every event record ends with: `user | ts << 32` with 0 for the `ts` of a
 /// row that is not valid, and `ingest | pay << 32`.
 #[inline(always)]
@@ -310,14 +313,33 @@ impl Ingest {
         let mut input = std::mem::take(&mut out.input);
         let read = self.read(seg, &mut input, &mut out.file);
         let (p, len) = read.unwrap_or_else(|| self.seg(seg));
+        // The lines a few at a time: their keys, each key's line of the directory asked for,
+        // then the lookups. (Looked up as it was read, each ID waited for its line: 3% of a
+        // run's cycles for a twentieth of its lines.)
+        let mut held: [([UserKey; 2], [u64; 2]); LINKS_HELD] = [([UserKey::Short(0); 2], [0; 2]); LINKS_HELD];
+        let mut count = 0;
+        let users = &plan.users;
+        let flush = |held: &[([UserKey; 2], [u64; 2])], links: &mut Vec<LinkRec>| {
+            for (keys, _) in held {
+                users.prefetch(keys[0]);
+                users.prefetch(keys[1]);
+            }
+            links.extend(held.iter().map(|&(keys, order)| LinkRec { users: [users.get(keys[0]), users.get(keys[1])], order }));
+        };
         // SAFETY: a segment, and a segment's fields have 16 bytes readable after them.
         unsafe {
             Scalar::lines::<2>(p, len, &mut out.scratch, |&[a, b]| {
                 if a.len != 0 && b.len != 0 {
-                    links.push(LinkRec { users: [plan.users.at(a.p, a.len), plan.users.at(b.p, b.len)], order: [order_at(a.p, a.len), order_at(b.p, b.len)] });
+                    held[count] = ([key_at(a.p, a.len), key_at(b.p, b.len)], [order_at(a.p, a.len), order_at(b.p, b.len)]);
+                    count += 1;
+                    if count == LINKS_HELD {
+                        flush(&held, &mut links);
+                        count = 0;
+                    }
                 }
             })
         };
+        flush(&held[..count], &mut links);
         if read.is_none() {
             self.release(seg);
         }
