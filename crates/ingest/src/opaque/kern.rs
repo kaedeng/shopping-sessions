@@ -33,6 +33,13 @@
 //! fields lie between the last two commas before the newline, the one found from the end
 //! must be the one the type's width gives from the front, and the 32 bytes before the
 //! newline hold no other newline.
+//!
+//! The kernel is made twice (`types::width`, `SS_PARSE_WIDTH`): `Wide` as it was, and
+//! `Narrow` with no instruction that takes a Cascade Lake core off its base clock: the
+//! multiplies of `tail` on 128-bit halves (`tail_narrow`), `finish` and `finish_clicks` in
+//! 256-bit registers (`finish_narrow`, `finish_clicks_narrow`), and the compares the compiler
+//! would join into one 512-bit compare written as `asm!` (`first64`, `clean_rows`,
+//! `classes`).
 
 use core::arch::x86_64::*;
 
@@ -41,7 +48,8 @@ use types::chunks::Chunks;
 use types::id::pack_at;
 use types::record::PAY_CATEGORY_SHIFT;
 use types::time::DAY;
-use types::users::NO_USER;
+use types::users::{NO_USER, pairs_by_shifts};
+use types::width::{Narrow, Wide, Width};
 
 use super::{Ck, Ev, EvL, Out, Plan, click_row, event_row};
 use crate::pos::Campaigns;
@@ -178,6 +186,11 @@ static ONE_K: [OneRow; 16] = one_rows(b'k');
 /// quotes in bytes 1 and 2. Then `w1`, `w2`, a pack and `w3` leave two numbers per lane, and
 /// the value is the first times `kme` plus the second, with byte 3's sign, times `kmf`:
 /// seconds and an offset's minutes, or the first 5 and the last 8 of 13 digits.
+///
+/// `Narrow` (`types::width`) multiplies 128 bits at a time: `w1` on each lane, then the two
+/// lanes' words side by side as bytes (none is over 99), so that the rest is one register's
+/// work: `nw2`, `nw3`, `nkme` and `nkmf` are `w2`, `w3`, `kme` and `kmf` for that register,
+/// the `ts`'s half first, and `nlim` is `limv` for the numbers as words.
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 struct TsRow {
@@ -200,7 +213,13 @@ struct TsRow {
     pmask: u64,
     /// The same for the `ingest_ts`: `PMASK` in every row.
     imask: u64,
-    _pad: [u64; 23],
+    _gap: u64,
+    nw2: [i8; 16],
+    nlim: [i16; 8],
+    nw3: [i16; 8],
+    nkme: [i64; 2],
+    nkmf: [i64; 2],
+    _pad: [u64; 12],
 }
 
 const _: () = assert!(size_of::<TsRow>() == 512 && size_of::<IdRow>() == 64);
@@ -312,6 +331,26 @@ const fn digits_lane(row: &mut TsRow, quoted: bool) {
     row.kmf[0] = 1;
 }
 
+/// `Narrow`'s weights from the row's own (`TsRow`).
+const fn narrow_weights(row: &mut TsRow) {
+    let mut k = 0;
+    while k < 8 {
+        row.nw2[k] = row.w2[k] as i8;
+        row.nw2[8 + k] = row.w2[8 + k] as i8;
+        k += 1;
+    }
+    let mut k = 0;
+    while k < 4 {
+        row.nlim[k] = if row.limv[k] > i16::MAX as i32 { i16::MAX } else { row.limv[k] as i16 };
+        row.nlim[4 + k] = if row.limv[4 + k] > i16::MAX as i32 { i16::MAX } else { row.limv[4 + k] as i16 };
+        row.nw3[k] = row.w3[k];
+        row.nw3[4 + k] = row.w3[8 + k];
+        k += 1;
+    }
+    row.nkme = [row.kme[0], row.kme[2]];
+    row.nkmf = [row.kmf[0], row.kmf[2]];
+}
+
 const fn ts_rows() -> [TsRow; TS_ROWS] {
     let blank = TsRow {
         ctrl: [0x80; 32],
@@ -327,7 +366,13 @@ const fn ts_rows() -> [TsRow; TS_ROWS] {
         tq: 0,
         pmask: 0,
         imask: PMASK,
-        _pad: [0; 23],
+        _gap: 0,
+        nw2: [0; 16],
+        nlim: [0; 8],
+        nw3: [0; 8],
+        nkme: [0; 2],
+        nkmf: [0; 2],
+        _pad: [0; 12],
     };
     let mut table = [blank; TS_ROWS];
     let mut gap = 0;
@@ -354,6 +399,7 @@ const fn ts_rows() -> [TsRow; TS_ROWS] {
                 _ => row.base[1] = 1,
             }
             time_lane(&mut row, 1, false, wrapped == 1);
+            narrow_weights(&mut row);
             table[gap * 2 + wrapped] = row;
             wrapped += 1;
         }
@@ -511,7 +557,7 @@ struct Day {
 /// match it there: a text equal to that date would have been looked up at that date's own
 /// index. Entry 0 is such an entry (no date has day `00`); its midnight is `-origin`, which is
 /// what a `ts` of 13 digits, looked up there with nothing compared, has to have added.
-struct Memo {
+pub(super) struct Memo {
     days: [Day; 128],
     /// The earliest midnight of the table.
     first_ms: i64,
@@ -562,7 +608,7 @@ const BATCH: usize = 64;
 
 /// What the kernel leaves of a row.
 #[repr(C, align(64))]
-struct Batch {
+pub(super) struct Batch {
     /// The `event_id` (its digits, each less `'0'`, or the first word of a long one), the
     /// `ts`, the `user_id` the same way, the `ingest_ts`; the times in milliseconds after
     /// `Ctx::origin`. A click's row: the `click_id`'s raw width, the `ts`, the `user_id`, the
@@ -593,7 +639,7 @@ unsafe fn other(pair: *mut Batch, batch: *mut Batch) -> *mut Batch {
 const HELD: usize = 128;
 
 /// The short-keyed records made and not yet scattered: the record's three words.
-struct Held {
+pub(super) struct Held {
     key: [u64; HELD],
     user_ts: [u64; HELD],
     ingest_pay: [u64; HELD],
@@ -627,7 +673,7 @@ impl Held {
 }
 
 /// What `finish` computes with, the same for every row.
-struct Consts {
+pub(super) struct Consts {
     event_lo: __m512i,
     ts_end: __m512i,
     first_ms: __m512i,
@@ -682,6 +728,203 @@ fn mul_halves(x: __m512i, by: __m256i) -> __m512i {
     }
 }
 
+/// `Consts` in 256-bit registers, for `finish_narrow`.
+pub(super) struct NarrowConsts {
+    event_lo: __m256i,
+    ts_end: __m256i,
+    first_ms: __m256i,
+    ingest_add: __m256i,
+}
+
+impl NarrowConsts {
+    fn new(ctx: &Ctx, memo: &Memo) -> NarrowConsts {
+        // SAFETY: register arithmetic; AVX2 is compiled in.
+        #[allow(unused_unsafe)]
+        unsafe {
+            let all = |value: i64| _mm256_set1_epi64x(value);
+            NarrowConsts {
+                event_lo: all(i64::from(ctx.event_lo)),
+                ts_end: all(i64::from(ctx.ts_end)),
+                first_ms: all(memo.first_ms),
+                ingest_add: all((memo.first_ms + ctx.origin).div_euclid(1000) - ctx.ingest_base()),
+            }
+        }
+    }
+}
+
+/// What the kernel's two widths (`types::width`) do in functions of their own: a batch's rows
+/// into records (`finish`, `finish_clicks`), with the constants they keep in registers.
+/// Everything else is one function for both, with `Width::NARROW` choosing an instruction
+/// here and there.
+pub(super) trait Kern: Width {
+    type Consts;
+    type ClickConsts: Copy;
+    fn consts(ctx: &Ctx, memo: &Memo) -> Self::Consts;
+    fn click_consts(ctx: &Ctx) -> Self::ClickConsts;
+    /// # Safety
+    /// As `finish`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn finish(batch: *mut Batch, base: *const u8, bytes: usize, consts: &Self::Consts, held: &mut Held, ctx: &Ctx, dates: &Dates, plan: &Plan, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>, slow: &mut usize);
+    /// # Safety
+    /// As `finish_clicks`.
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn finish_clicks(batch: *mut Batch, base: *const u8, bytes: usize, ts_end: Self::ClickConsts, campaigns: &Campaigns, ctx: &Ctx, dates: &Dates, plan: &Plan, clicks: &mut Chunks<Ck>, slow: &mut usize);
+}
+
+impl Kern for Wide {
+    type Consts = Consts;
+    type ClickConsts = __m512i;
+
+    #[inline(always)]
+    fn consts(ctx: &Ctx, memo: &Memo) -> Consts {
+        Consts::new(ctx, memo)
+    }
+
+    #[inline(always)]
+    fn click_consts(ctx: &Ctx) -> __m512i {
+        // SAFETY: register arithmetic; AVX-512F is compiled in.
+        #[allow(unused_unsafe)]
+        unsafe {
+            _mm512_set1_epi64(i64::from(ctx.ts_end))
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn finish(batch: *mut Batch, base: *const u8, bytes: usize, consts: &Consts, held: &mut Held, ctx: &Ctx, dates: &Dates, plan: &Plan, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>, slow: &mut usize) {
+        // SAFETY: the caller's contract.
+        unsafe { finish(batch, base, bytes, consts, held, ctx, dates, plan, events, long_events, slow) }
+    }
+
+    #[inline(always)]
+    unsafe fn finish_clicks(batch: *mut Batch, base: *const u8, bytes: usize, ts_end: __m512i, campaigns: &Campaigns, ctx: &Ctx, dates: &Dates, plan: &Plan, clicks: &mut Chunks<Ck>, slow: &mut usize) {
+        // SAFETY: the caller's contract.
+        unsafe { finish_clicks(batch, base, bytes, ts_end, campaigns, ctx, dates, plan, clicks, slow) }
+    }
+}
+
+impl Kern for Narrow {
+    type Consts = NarrowConsts;
+    type ClickConsts = i64;
+
+    #[inline(always)]
+    fn consts(ctx: &Ctx, memo: &Memo) -> NarrowConsts {
+        NarrowConsts::new(ctx, memo)
+    }
+
+    #[inline(always)]
+    fn click_consts(ctx: &Ctx) -> i64 {
+        i64::from(ctx.ts_end)
+    }
+
+    #[inline(always)]
+    unsafe fn finish(batch: *mut Batch, base: *const u8, bytes: usize, consts: &NarrowConsts, held: &mut Held, ctx: &Ctx, dates: &Dates, plan: &Plan, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>, slow: &mut usize) {
+        // SAFETY: the caller's contract.
+        unsafe { finish_narrow(batch, base, bytes, consts, held, ctx, dates, plan, events, long_events, slow) }
+    }
+
+    #[inline(always)]
+    unsafe fn finish_clicks(batch: *mut Batch, base: *const u8, bytes: usize, ts_end: i64, campaigns: &Campaigns, ctx: &Ctx, dates: &Dates, plan: &Plan, clicks: &mut Chunks<Ck>, slow: &mut usize) {
+        // SAFETY: the caller's contract.
+        unsafe { finish_clicks_narrow(batch, base, bytes, ts_end, campaigns, ctx, dates, plan, clicks, slow) }
+    }
+}
+
+/// One 128-bit multiply `op` of `a` by the 16 bytes of a `TsRow`'s field `field`, written as
+/// the instruction it is: of two on a register's halves the compiler makes one 256-bit
+/// multiply, a licence-1 instruction (`types::width`). The field is read at its offset from
+/// the row, not through a pointer of its own (one instruction a multiply less).
+macro_rules! row_mul {
+    ($op:literal, $a:expr, $row:expr, $field:ident) => {
+        row_mul!($op, $a, $row, $field, 0)
+    };
+    ($op:literal, $a:expr, $row:expr, $field:ident, $more:expr) => {{
+        let out: __m128i;
+        // SAFETY: the row's field has 16 bytes at that offset; one AVX instruction.
+        #[allow(unused_unsafe)]
+        unsafe {
+            core::arch::asm!(
+                concat!($op, " {out:x}, {a:x}, xmmword ptr [{row} + {at}]"),
+                a = in(zmm_reg) $a,
+                row = in(reg) core::ptr::from_ref::<TsRow>($row),
+                at = const std::mem::offset_of!(TsRow, $field) + $more,
+                out = lateout(zmm_reg) out,
+                options(pure, readonly, nostack, preserves_flags),
+            )
+        };
+        out
+    }};
+}
+
+/// `_mm_packus_epi16(a, b)` for words that are bytes already, as the one instruction it is:
+/// the intrinsic comes out with a clamp of each operand before it, four more instructions
+/// a line (as `pack_words` says of its own).
+#[inline(always)]
+fn pack_bytes(a: __m128i, b: __m128i) -> __m128i {
+    let packed: __m128i;
+    // SAFETY: one AVX instruction on registers.
+    unsafe { core::arch::asm!("vpackuswb {o:x}, {a:x}, {b:x}", o = lateout(zmm_reg) packed, a = in(zmm_reg) a, b = in(zmm_reg) b, options(pure, nomem, nostack, preserves_flags)) };
+    packed
+}
+
+/// `_mm256_mul_epu32(x, _mm256_broadcastsi128_si256(by))` as two 128-bit multiplies, as
+/// `mul_halves` is two 256-bit ones.
+#[inline(always)]
+fn mul_quarters(x: __m256i, by: __m128i) -> __m256i {
+    let (low, high): (__m128i, __m128i);
+    // SAFETY: two AVX instructions on registers; `low` is written before `b` and `by` are
+    // read, so it is a register of its own.
+    unsafe {
+        let (a, b) = (_mm256_castsi256_si128(x), _mm256_extracti128_si256::<1>(x));
+        core::arch::asm!("vpmuludq {l:x}, {a:x}, {m:x}", "vpmuludq {h:x}, {b:x}, {m:x}", a = in(zmm_reg) a, b = in(zmm_reg) b, m = in(zmm_reg) by, l = out(zmm_reg) low, h = lateout(zmm_reg) high, options(pure, nomem, nostack, preserves_flags));
+        _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(low), high)
+    }
+}
+
+/// The bits of the 64 bytes at `p` that are `splat`'s byte: for `Wide` two 256-bit compares
+/// that the compiler makes one 512-bit compare, for `Narrow` the two compares written as the
+/// instructions they are.
+///
+/// # Safety
+/// 64 bytes readable at `p`.
+#[inline(always)]
+unsafe fn first64<W: Width>(p: *const u8, splat: __m256i) -> u64 {
+    // SAFETY: the caller's contract; AVX-512BW and VL are compiled in.
+    unsafe {
+        if W::NARROW {
+            let bits: u64;
+            core::arch::asm!(
+                "vpcmpeqb {low}, {splat:y}, ymmword ptr [{p}]",
+                "vpcmpeqb {high}, {splat:y}, ymmword ptr [{p} + 32]",
+                "kunpckdq {low}, {high}, {low}",
+                p = in(reg) p,
+                splat = in(zmm_reg) splat,
+                low = out(kreg) bits,
+                high = out(kreg) _,
+                options(pure, readonly, nostack, preserves_flags),
+            );
+            bits
+        } else {
+            _mm512_kunpackd(u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(p.add(32).cast()), splat)), u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(p.cast()), splat)))
+        }
+    }
+}
+
+/// A row's 32 bytes: the digits' halves of the IDs (`ids`' words 1 and 3) beside the times:
+/// event, ts, user, ingest. `Wide`'s times are words 0 and 2 of `times`, `Narrow`'s words 0
+/// and 1 (`tail`).
+#[inline(always)]
+fn beside<W: Width>(ids: __m256i, times: __m256i, lanes: &Lanes) -> __m256i {
+    // SAFETY: register arithmetic; AVX-512VL is compiled in.
+    #[allow(unused_unsafe)]
+    unsafe {
+        if W::NARROW {
+            _mm256_permutex2var_epi64(ids, lanes.beside, times)
+        } else {
+            _mm256_castpd_si256(_mm256_shuffle_pd::<0b0101>(_mm256_castsi256_pd(ids), _mm256_castsi256_pd(times)))
+        }
+    }
+}
+
 /// The registers every line's checks use.
 struct Lanes {
     comma: __m256i,
@@ -694,6 +937,8 @@ struct Lanes {
     letter_max: __m256i,
     /// The bytes of an `ingest_ts`'s date text that are compared: the date, `T`, a colon.
     date_mask: __m128i,
+    /// Where `beside` takes a narrow row's words from.
+    beside: __m256i,
 }
 
 impl Lanes {
@@ -711,6 +956,7 @@ impl Lanes {
                 digit_max: lane(0, 8, 9),
                 letter_max: lane(0, 25, 25),
                 date_mask: _mm_setr_epi8(0, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, -1, 0),
+                beside: _mm256_setr_epi64x(1, 4, 3, 5),
             }
         }
     }
@@ -722,7 +968,7 @@ impl Lanes {
 /// # Safety
 /// 32 bytes readable at `p`.
 #[inline(always)]
-unsafe fn hex32(p: *const u8) -> (u64, u64, u32) {
+unsafe fn hex32<W: Width>(p: *const u8) -> (u64, u64, u32) {
     // SAFETY: the caller's contract; register arithmetic.
     unsafe {
         let text = _mm256_loadu_si256(p.cast());
@@ -733,7 +979,7 @@ unsafe fn hex32(p: *const u8) -> (u64, u64, u32) {
         let value = _mm256_blendv_epi8(_mm256_add_epi8(letter, _mm256_set1_epi8(10)), digit, is_digit);
         let bad = !(_mm256_movemask_epi8(_mm256_or_si256(is_digit, is_letter)) as u32);
         // A pair of digits a byte: the first sixteen times, the second once.
-        let pairs = _mm256_maddubs_epi16(value, _mm256_set1_epi16(0x0110));
+        let pairs = if W::NARROW { pairs_by_shifts(value) } else { _mm256_maddubs_epi16(value, _mm256_set1_epi16(0x0110)) };
         let bytes = _mm256_packus_epi16(pairs, pairs);
         (_mm256_extract_epi64::<0>(bytes) as u64, _mm256_extract_epi64::<2>(bytes) as u64, bad)
     }
@@ -747,7 +993,7 @@ unsafe fn hex32(p: *const u8) -> (u64, u64, u32) {
 /// # Safety
 /// The 16 bytes before `comma` are readable, and for `raw` of 33 or 35 the `raw` before it.
 #[inline(always)]
-unsafe fn one_id(comma: *const u8, raw: usize, table: &[OneRow; 16], letter: u8, lanes: &Lanes) -> (u64, u64, u64, bool) {
+unsafe fn one_id<W: Width>(comma: *const u8, raw: usize, table: &[OneRow; 16], letter: u8, lanes: &Lanes) -> (u64, u64, u64, bool) {
     // SAFETY: the caller's contract; a table row is picked by a width below 16.
     unsafe {
         if raw < 16 {
@@ -759,7 +1005,7 @@ unsafe fn one_id(comma: *const u8, raw: usize, table: &[OneRow; 16], letter: u8,
         } else if raw == 33 || raw == 35 {
             let quoted = (raw - 33) / 2;
             let first = comma.sub(raw);
-            let (hi, lo, bad) = hex32(first.add(quoted + 1));
+            let (hi, lo, bad) = hex32::<W>(first.add(quoted + 1));
             let mut wrong = u64::from(bad) | u64::from(*first.add(quoted) ^ letter);
             if quoted == 1 {
                 wrong |= u64::from(*first ^ b'"') | u64::from(*comma.sub(1) ^ b'"');
@@ -773,7 +1019,8 @@ unsafe fn one_id(comma: *const u8, raw: usize, table: &[OneRow; 16], letter: u8,
 
 /// What an event line's fields after the `user_id` give.
 struct Tail {
-    /// The `ts` and the `ingest_ts`, a half each, in milliseconds after `Ctx::origin`.
+    /// The `ts` and the `ingest_ts` in milliseconds after `Ctx::origin`: words 0 and 2
+    /// (`Wide`), or 0 and 1 (`Narrow`).
     times: __m256i,
     /// Residues: zero for fields as the generator writes them.
     bad: __m256i,
@@ -789,7 +1036,11 @@ struct Tail {
 /// The 16 bytes before `t` and everything from there to 32 bytes past `end` are readable;
 /// `end` is at least 45 bytes past `t`.
 #[inline(always)]
-unsafe fn tail(t: *const u8, gap: usize, end: *const u8, days: *const u8, lanes: &Lanes) -> Tail {
+unsafe fn tail<W: Width>(t: *const u8, gap: usize, end: *const u8, days: *const u8, lanes: &Lanes) -> Tail {
+    if W::NARROW {
+        // SAFETY: the caller's contract.
+        return unsafe { tail_narrow(t, gap, end, days, lanes) };
+    }
     // SAFETY: the caller's contract; table indexes are bounded by the counts they are made
     // of (a width is clamped, a count of zeros is at most 32).
     unsafe {
@@ -842,15 +1093,78 @@ unsafe fn tail(t: *const u8, gap: usize, end: *const u8, days: *const u8, lanes:
     }
 }
 
+/// `tail` with no multiply wider than 128 bits (`types::width`): `w1` on each timestamp's
+/// half, then both halves' words as bytes in one register, which `nw2`, `nw3`, `nkme` and
+/// `nkmf` take to the two values (`TsRow`). Three instructions a line more than `tail`'s
+/// five 256-bit multiplies take, for six 128-bit ones.
+///
+/// # Safety
+/// As `tail`.
+#[inline(always)]
+unsafe fn tail_narrow(t: *const u8, gap: usize, end: *const u8, days: *const u8, lanes: &Lanes) -> Tail {
+    // SAFETY: as `tail`.
+    unsafe {
+        // The last two fields, from the newline back.
+        let tail_bytes = _mm256_loadu_si256(end.sub(32).cast());
+        let tail_commas = _mm256_movemask_epi8(_mm256_cmpeq_epi8(tail_bytes, lanes.comma)) as u32;
+        let tail_quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(tail_bytes, lanes.quote)) as u32;
+        let z5 = tail_commas.leading_zeros();
+        let z4 = (tail_commas.wrapping_shl(z5) << 1).leading_zeros();
+        let tail = &*TAIL.as_ptr().add((z5 << 6 | z4) as usize);
+        let wrapped = _pext_u32(tail_quotes, tail.sel) as usize;
+        let tail_bad = (tail_quotes & tail.qmask) ^ *tail.pat.get_unchecked(wrapped);
+
+        // Both timestamps.
+        let gap = gap.min(64);
+        let ingest_q = usize::from(*t.add(gap + 1) == b'"');
+        let ingest = t.add(gap + 2 * ingest_q);
+        let row = &*TS.as_ptr().add(gap * 2 + ingest_q);
+        let raw = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(t.add(gap).sub(16).cast())), _mm_loadu_si128(ingest.add(5).cast()));
+        let bytes = _mm256_sub_epi8(_mm256_shuffle_epi8(raw, _mm256_load_si256(row.ctrl.as_ptr().cast())), _mm256_load_si256(row.base.as_ptr().cast()));
+        let bytes_bad = _mm256_subs_epu8(bytes, _mm256_load_si256(row.lim.as_ptr().cast()));
+        let (ts_half, ingest_half) = (_mm256_castsi256_si128(bytes), _mm256_extracti128_si256::<1>(bytes));
+        // Words of digits and of literals' residues (none over 99 in a line `bytes_bad`
+        // passes), both halves' as bytes.
+        let words = pack_bytes(row_mul!("vpmaddubsw", ts_half, row, w1), row_mul!("vpmaddubsw", ingest_half, row, w1, 16));
+        let parts = row_mul!("vpmaddubsw", words, row, nw2);
+        let parts_bad = _mm_cmpgt_epi16(parts, _mm_load_si128(row.nlim.as_ptr().cast()));
+        let both = row_mul!("vpmaddwd", parts, row, nw3);
+        let major = row_mul!("vpmuludq", both, row, nkme);
+        // Each half's sign in its first four bytes, as `tail` reads it.
+        let minor = row_mul!("vpmuldq", _mm_sign_epi32(_mm_srli_epi64::<32>(both), _mm_unpacklo_epi64(ts_half, ingest_half)), row, nkmf);
+
+        // Their dates.
+        let ts_date = t.add(row.tq as usize);
+        let ingest_date = t.add(gap + ingest_q);
+        let ts_day = days.add(_pext_u64(u64::from(ts_date.add(7).cast::<u32>().read_unaligned()), row.pmask) as usize * 32);
+        let ingest_day = days.add(_pext_u64(u64::from(ingest_date.add(7).cast::<u32>().read_unaligned()), row.imask) as usize * 32);
+        // (text ^ day) & mask.
+        let ts_date_bad = _mm_ternarylogic_epi64::<0x60>(_mm_load_si128(row.dmask.as_ptr().cast()), _mm_loadu_si128(ts_date.cast()), _mm_load_si128(ts_day.cast()));
+        let ingest_date_bad = _mm_ternarylogic_epi64::<0x60>(lanes.date_mask, _mm_loadu_si128(ingest_date.cast()), _mm_load_si128(ingest_day.cast()));
+        let midnights = _mm_unpacklo_epi64(_mm_load_si128(ts_day.add(16).cast()), _mm_load_si128(ingest_day.add(16).cast()));
+        let times = _mm_add_epi64(_mm_add_epi64(major, minor), midnights);
+
+        // The type, from the comma the `ingest_ts`'s shape puts before it.
+        let kind = &*KIND.as_ptr().add(usize::from(*ingest.add(23)));
+        let kind_bad = _mm_ternarylogic_epi64::<0x60>(_mm_load_si128(kind.mask.as_ptr().cast()), _mm_loadu_si128(ingest.add(21).cast()), _mm_load_si128(kind.cand.as_ptr().cast()));
+        // The comma after the type, from the front and from the end.
+        let apart = end.offset_from(ingest) as i64 - tail.gap - kind.width;
+
+        let narrow = _mm_ternarylogic_epi64::<0xFE>(ts_date_bad, ingest_date_bad, kind_bad);
+        let bad = _mm256_ternarylogic_epi64::<0xFE>(bytes_bad, _mm256_cmpeq_epi8(tail_bytes, lanes.newline), _mm256_zextsi128_si256(_mm_or_si128(narrow, parts_bad)));
+        Tail { times: _mm256_castsi128_si256(times), bad, low: tail_bad | apart as u32, class: kind.class }
+    }
+}
+
 /// One event chunk.
 ///
 /// # Safety
 /// `p, len` is a segment, and `lead` bytes before `p` are readable.
 #[inline(never)]
-pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, out: &mut Out) {
+pub(super) unsafe fn events<W: Kern>(p: *const u8, len: usize, lead: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, out: &mut Out) {
     let Out { events, long_events, slow, .. } = out;
     let memo = Memo::of(ctx, dates);
-    let consts = Consts::new(ctx, memo);
+    let consts = W::consts(ctx, memo);
     let lanes = Lanes::new();
     let mut held = Held::new(plan);
     // Two batches in turn: when one is full its users' lines of the directory are asked
@@ -887,10 +1201,7 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 let mut k = 0usize;
                 loop {
                     // The first commas: the IDs' widths.
-                    let commas = _mm512_kunpackd(
-                        u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(line.add(32).cast()), lanes.comma)),
-                        u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(line.cast()), lanes.comma)),
-                    );
+                    let commas = first64::<W>(line, lanes.comma);
                     let c0 = commas.trailing_zeros() as usize;
                     let rest = commas & commas.wrapping_sub(1);
                     let c1 = rest.trailing_zeros() as usize;
@@ -908,12 +1219,12 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                         let raw = _mm256_loadu_si256(line.add(c0).sub(16).cast());
                         let ids = _mm256_sub_epi8(_mm256_shuffle_epi8(raw, _mm256_load_si256(shape.ctrl.as_ptr().cast())), _mm256_load_si256(shape.base.as_ptr().cast()));
                         let ids_bad = _mm256_min_epu8(_mm256_subs_epu8(_mm256_add_epi8(ids, lanes.to_letter), lanes.letter_max), _mm256_subs_epu8(ids, lanes.digit_max));
-                        let rest_of = tail(line.add(c1), c2 - c1, end, days, &lanes);
+                        let rest_of = tail::<W>(line.add(c1), c2 - c1, end, days, &lanes);
                         let bad = _mm256_or_si256(ids_bad, rest_of.bad);
                         let dirty = u32::from(_mm256_test_epi64_mask(bad, bad));
                         // The digits' halves of the IDs beside the times: event, ts, user,
                         // ingest.
-                        stored = _mm256_castpd_si256(_mm256_shuffle_pd::<0b0101>(_mm256_castsi256_pd(ids), _mm256_castsi256_pd(rest_of.times)));
+                        stored = beside::<W>(ids, rest_of.times, &lanes);
                         word = u64::from(rest_of.low | dirty) | rest_of.class;
                     } else {
                         // A long ID, or two: each ID on its own, and the rest from the
@@ -930,11 +1241,11 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                         }
                         end = t.add(45 + ends.trailing_zeros() as usize);
                         let gap = 1 + (_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(t.add(1).cast()), lanes.comma)) as u32).trailing_zeros() as usize;
-                        let event = one_id(line.add(c0), c0, &ONE_E, b'e', &lanes);
-                        let user = one_id(t, c1.wrapping_sub(c0 + 1), &ONE_U, b'u', &lanes);
-                        let rest_of = tail(t, gap, end, days, &lanes);
+                        let event = one_id::<W>(line.add(c0), c0, &ONE_E, b'e', &lanes);
+                        let user = one_id::<W>(t, c1.wrapping_sub(c0 + 1), &ONE_U, b'u', &lanes);
+                        let rest_of = tail::<W>(t, gap, end, days, &lanes);
                         let dirty = u32::from(_mm256_test_epi64_mask(rest_of.bad, rest_of.bad)) | u32::from(event.2 | user.2 != 0);
-                        stored = _mm256_castpd_si256(_mm256_shuffle_pd::<0b0101>(_mm256_castsi256_pd(_mm256_set_epi64x(user.0 as i64, 0, event.0 as i64, 0)), _mm256_castsi256_pd(rest_of.times)));
+                        stored = beside::<W>(_mm256_set_epi64x(user.0 as i64, 0, event.0 as i64, 0), rest_of.times, &lanes);
                         word = u64::from(rest_of.low | dirty) | rest_of.class | if event.3 { LONG_EVENT } else { 0 } | if user.3 { LONG_USER } else { 0 };
                         lows.add(2 * k).cast::<[u64; 2]>().write([event.1, user.1]);
                     }
@@ -957,10 +1268,10 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                         (*batch).count = BATCH;
                         (*batch).line[BATCH] = line;
                         if !by_rows {
-                            ask(&*batch, plan);
+                            ask::<W>(&*batch, plan);
                         }
                         batch = other(pair, batch);
-                        finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
+                        W::finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
                         (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
                         k = 0;
                     }
@@ -975,10 +1286,10 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                     if by_rows {
                         ask_rows(batch, (k / 8) & !7, k / 8, plan);
                     } else {
-                        ask(&*batch, plan);
+                        ask::<W>(&*batch, plan);
                     }
                     batch = other(pair, batch);
-                    finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
+                    W::finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
                     (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
                 }
             }
@@ -988,12 +1299,12 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 SLOW_LINES.with(|count| count.set(count.get() + 1));
                 *slow += 1;
                 let at = line.offset_from(p) as usize;
-                slow_line(p, len, at, ctx, dates, plan, events, long_events);
+                slow_line::<W>(p, len, at, ctx, dates, plan, events, long_events);
                 line = p.add(line_end(p, len, at));
             }
         }
         // The batch that was asked for last.
-        finish(other(pair, batch), p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
+        W::finish(other(pair, batch), p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
     }
     held.flush(events);
     // Streamed lines become visible to the threads that read the lists.
@@ -1027,7 +1338,7 @@ unsafe fn finish(
     unsafe {
         let batch = &mut *batch;
         let rows = std::mem::take(&mut batch.count);
-        look(batch, rows, plan);
+        look::<Wide>(batch, rows, plan);
         let all = |value: i64| _mm512_set1_epi64(value);
         // Two rows a register: event, ts, user, ingest, twice. From two registers, the four
         // events then the four `ts`; the four users then the four `ingest_ts`.
@@ -1076,6 +1387,110 @@ unsafe fn finish(
             first += 8;
         }
     }
+}
+
+/// `finish` in 256-bit registers (`types::width::Narrow`): eight rows a step, as two groups
+/// of four. The same records as `finish`'s.
+///
+/// # Safety
+/// As `finish`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn finish_narrow(
+    batch: *mut Batch,
+    base: *const u8,
+    bytes: usize,
+    consts: &NarrowConsts,
+    held: &mut Held,
+    ctx: &Ctx,
+    dates: &Dates,
+    plan: &Plan,
+    events: &mut Chunks<Ev>,
+    long_events: &mut Chunks<EvL>,
+    slow: &mut usize,
+) {
+    // SAFETY: as `finish`.
+    unsafe {
+        let batch = &mut *batch;
+        let rows = std::mem::take(&mut batch.count);
+        look::<Narrow>(batch, rows, plan);
+        let all = |value: i64| _mm256_set1_epi64x(value);
+        let mut first = 0;
+        while first < rows {
+            if held.len + 8 > HELD {
+                held.flush(events);
+            }
+            let live = _bzhi_u32(0xFF, (rows - first) as u32) as __mmask8;
+            // Nothing set but, perhaps, a long user: a record as it stands.
+            let fast = live & clean_rows(batch.class.as_ptr().add(first));
+            // A row a register: event, ts, user, ingest. Two rows' pairs of words, then their
+            // halves: four events, four `ts`, four `ingest_ts`.
+            let group = |at: usize| {
+                let rows = batch.rows.as_ptr().add(at).cast::<__m256i>();
+                let (r0, r1, r2, r3) = (_mm256_load_si256(rows), _mm256_load_si256(rows.add(1)), _mm256_load_si256(rows.add(2)), _mm256_load_si256(rows.add(3)));
+                let (low_a, low_b) = (_mm256_unpacklo_epi64(r0, r1), _mm256_unpacklo_epi64(r2, r3));
+                let (high_a, high_b) = (_mm256_unpackhi_epi64(r0, r1), _mm256_unpackhi_epi64(r2, r3));
+                let event = _mm256_permute2x128_si256::<0x20>(low_a, low_b);
+                let ts = _mm256_permute2x128_si256::<0x20>(high_a, high_b);
+                let ingest = _mm256_permute2x128_si256::<0x31>(high_a, high_b);
+                // As `finish`.
+                let valid = _mm256_cmpge_epi64_mask(ts, consts.event_lo) & _mm256_cmplt_epi64_mask(ts, consts.ts_end) & _mm256_cmple_epi64_mask(_mm256_sub_epi64(ingest, ts), all(DAY));
+                let seconds = _mm256_srli_epi64::<38>(mul_quarters(_mm256_sub_epi64(ingest, consts.first_ms), _mm_set1_epi64x(274_877_907)));
+                let ingest_rel = _mm256_add_epi64(seconds, consts.ingest_add);
+                let place = _mm256_cvtepu32_epi64(_mm_loadu_si128(batch.users.as_ptr().add(at).cast()));
+                let user_ts = _mm256_or_si256(place, _mm256_slli_epi64::<32>(_mm256_maskz_mov_epi64(valid, ts)));
+                (_mm256_add_epi64(event, all(1)), user_ts, ingest_rel)
+            };
+            let (key_a, user_ts_a, ingest_a) = group(first);
+            let (key_b, user_ts_b, ingest_b) = group(first + 4);
+            // Compressed in a register and stored whole, as in `finish`.
+            let (fast_a, fast_b) = (fast & 0xF, fast >> 4);
+            let to = held.len;
+            _mm256_storeu_si256(held.key.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_a, key_a));
+            _mm256_storeu_si256(held.user_ts.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_a, user_ts_a));
+            _mm256_storeu_si256(held.ingest_pay.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_a, ingest_a));
+            let to = to + fast_a.count_ones() as usize;
+            _mm256_storeu_si256(held.key.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_b, key_b));
+            _mm256_storeu_si256(held.user_ts.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_b, user_ts_b));
+            _mm256_storeu_si256(held.ingest_pay.as_mut_ptr().add(to).cast(), _mm256_maskz_compress_epi64(fast_b, ingest_b));
+            held.len = to + fast_b.count_ones() as usize;
+
+            if fast != live {
+                let (mut user_ts_of, mut ingest_of) = ([0u64; 8], [0u64; 8]);
+                _mm256_storeu_si256(user_ts_of.as_mut_ptr().cast(), user_ts_a);
+                _mm256_storeu_si256(user_ts_of.as_mut_ptr().add(4).cast(), user_ts_b);
+                _mm256_storeu_si256(ingest_of.as_mut_ptr().cast(), ingest_a);
+                _mm256_storeu_si256(ingest_of.as_mut_ptr().add(4).cast(), ingest_b);
+                others_narrow(batch, first, live & !fast, &user_ts_of, &ingest_of, base, bytes, ctx, dates, plan, events, long_events, slow);
+            }
+            first += 8;
+        }
+    }
+}
+
+/// Of the eight classes at `class`, those with nothing set but perhaps a long user: two
+/// 256-bit tests written as the instructions they are (`types::width`).
+///
+/// # Safety
+/// 64 bytes readable at `class`.
+#[inline(always)]
+unsafe fn clean_rows(class: *const u64) -> __mmask8 {
+    let clean: __mmask8;
+    // SAFETY: the caller's contract; AVX-512F, VL and DQ are compiled in.
+    unsafe {
+        core::arch::asm!(
+            "vptestnmq {c}, {mask:y}, ymmword ptr [{p}]",
+            "vptestnmq {c2}, {mask:y}, ymmword ptr [{p} + 32]",
+            "kshiftlb {c2}, {c2}, 4",
+            "korb {c}, {c}, {c2}",
+            p = in(reg) class,
+            mask = in(zmm_reg) _mm256_set1_epi64x(!(LONG_USER as i64)),
+            c = out(kreg) clean,
+            c2 = out(kreg) _,
+            options(pure, readonly, nostack, preserves_flags),
+        )
+    };
+    clean
 }
 
 /// Asks for the directory's lines of the users of a batch's rows `from..to`.
@@ -1137,22 +1552,106 @@ unsafe fn split(batch: &Batch, rows: usize, short: *mut u64, long: *mut u64) -> 
     }
 }
 
+/// `split` in 256-bit registers (`types::width::Narrow`), the rows' numbers as `u32`s: eight
+/// classes tested as two halves, and eight numbers compressed in one register.
+///
+/// # Safety
+/// As `split`.
+#[inline(always)]
+unsafe fn split_narrow(batch: &Batch, rows: usize, short: *mut u32, long: *mut u32) -> (usize, usize) {
+    let rows = rows.min(BATCH);
+    // SAFETY: as `split`.
+    unsafe {
+        let (mut shorts, mut longs) = (0usize, 0usize);
+        let mut number = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let mut first = 0;
+        while first < rows {
+            let (to_short, to_long) = classes(batch.class.as_ptr().add(first), _bzhi_u32(0xFF, (rows - first) as u32) as u8);
+            _mm256_storeu_si256(short.add(shorts).cast(), _mm256_maskz_compress_epi32(to_short, number));
+            _mm256_storeu_si256(long.add(longs).cast(), _mm256_maskz_compress_epi32(to_long, number));
+            shorts += to_short.count_ones() as usize;
+            longs += to_long.count_ones() as usize;
+            number = _mm256_add_epi32(number, _mm256_set1_epi32(8));
+            first += 8;
+        }
+        (shorts, longs)
+    }
+}
+
+/// Of the eight classes at `class`, `live`'s rows that are records with nothing set but
+/// perhaps a long user (`split`'s `taken`): those with a short user, and those with a long
+/// one. Two tests of each half, written as the instructions they are (`types::width`).
+///
+/// # Safety
+/// 64 bytes readable at `class`.
+#[inline(always)]
+unsafe fn classes(class: *const u64, live: __mmask8) -> (__mmask8, __mmask8) {
+    let (to_short, to_long): (__mmask8, __mmask8);
+    // SAFETY: the caller's contract; AVX-512F, VL and DQ are compiled in.
+    unsafe {
+        core::arch::asm!(
+            "vptestnmq {t}, {low:y}, ymmword ptr [{p}]",
+            "vptestnmq {t2}, {low:y}, ymmword ptr [{p} + 32]",
+            "vptestmq {w}, {long:y}, ymmword ptr [{p}]",
+            "vptestmq {w2}, {long:y}, ymmword ptr [{p} + 32]",
+            "kshiftlb {t2}, {t2}, 4",
+            "kshiftlb {w2}, {w2}, 4",
+            "korb {t2}, {t2}, {t}",
+            "korb {w}, {w}, {w2}",
+            "kandb {t}, {t2}, {live}",
+            "kandnb {s}, {w}, {t}",
+            "kandb {w}, {w}, {t}",
+            p = in(reg) class,
+            low = in(zmm_reg) _mm256_set1_epi64x(0xFFFF_FFFF),
+            long = in(zmm_reg) _mm256_set1_epi64x(LONG_USER as i64),
+            live = in(kreg) live,
+            t = out(kreg) _,
+            t2 = out(kreg) _,
+            w = out(kreg) to_long,
+            w2 = out(kreg) _,
+            s = out(kreg) to_short,
+            options(pure, readonly, nostack, preserves_flags),
+        )
+    };
+    (to_short, to_long)
+}
+
+/// `split` or `split_narrow`, into lists of room for `BATCH + 8` words each.
+///
+/// # Safety
+/// As `split`.
+#[inline(always)]
+unsafe fn split_rows<W: Width>(batch: &Batch, rows: usize, short: *mut u64, long: *mut u64) -> (usize, usize) {
+    // SAFETY: the caller's contract; a list of `u32`s fits in the room for words.
+    unsafe { if W::NARROW { split_narrow(batch, rows, short.cast(), long.cast()) } else { split(batch, rows, short, long) } }
+}
+
+/// Number `at` of a list `split_rows` made.
+///
+/// # Safety
+/// `at` is below the list's length.
+#[inline(always)]
+unsafe fn row_of<W: Width>(list: *const u64, at: usize) -> usize {
+    // SAFETY: the caller's contract.
+    unsafe { if W::NARROW { *list.cast::<u32>().add(at) as usize } else { *list.add(at) as usize } }
+}
+
 /// Asks for the directory's lines of a batch's users (`Batch::count` rows).
 #[inline(always)]
-fn ask(batch: &Batch, plan: &Plan) {
+fn ask<W: Width>(batch: &Batch, plan: &Plan) {
     let users = &plan.users;
     let (mut short, mut long) = (std::mem::MaybeUninit::<[u64; BATCH + 8]>::uninit(), std::mem::MaybeUninit::<[u64; BATCH + 8]>::uninit());
     let (short, long) = (short.as_mut_ptr().cast::<u64>(), long.as_mut_ptr().cast::<u64>());
     // SAFETY: the lists have `BATCH + 8` numbers' room, and `split` wrote the first `shorts`
     // and `longs` of them: rows of the batch.
     unsafe {
-        let (shorts, longs) = split(batch, batch.count, short, long);
+        let (shorts, longs) = split_rows::<W>(batch, batch.count, short, long);
         for at in 0..shorts {
-            let row = *short.add(at) as usize;
+            let row = row_of::<W>(short, at);
             users.prefetch_short(batch.rows.get_unchecked(row)[2] + 1);
         }
         for at in 0..longs {
-            let row = *long.add(at) as usize;
+            let row = row_of::<W>(long, at);
             users.prefetch_long(batch.rows.get_unchecked(row)[2], batch.lows.get_unchecked(row)[1]);
         }
     }
@@ -1161,23 +1660,23 @@ fn ask(batch: &Batch, plan: &Plan) {
 /// The users' numbers of a batch's first `rows` rows, into `Batch::users`: the rows by
 /// their user's table first (`split`), then a loop a table.
 #[inline(always)]
-fn look(batch: &mut Batch, rows: usize, plan: &Plan) {
+fn look<W: Width>(batch: &mut Batch, rows: usize, plan: &Plan) {
     let users = &plan.users;
     let rows = rows.min(BATCH);
     let (mut short, mut long) = (std::mem::MaybeUninit::<[u64; BATCH + 8]>::uninit(), std::mem::MaybeUninit::<[u64; BATCH + 8]>::uninit());
     let (short, long) = (short.as_mut_ptr().cast::<u64>(), long.as_mut_ptr().cast::<u64>());
     // SAFETY: as `ask`; a list's numbers are rows below `rows`.
     unsafe {
-        let (shorts, longs) = split(batch, rows, short, long);
+        let (shorts, longs) = split_rows::<W>(batch, rows, short, long);
         // A row for the row code is in neither list and has no user here: its bytes are
         // read again.
         batch.users[..rows].fill(NO_USER);
         for at in 0..shorts {
-            let row = *short.add(at) as usize;
-            *batch.users.get_unchecked_mut(row) = users.short(batch.rows.get_unchecked(row)[2] + 1);
+            let row = row_of::<W>(short, at);
+            *batch.users.get_unchecked_mut(row) = users.short::<W>(batch.rows.get_unchecked(row)[2] + 1);
         }
         for at in 0..longs {
-            let row = *long.add(at) as usize;
+            let row = row_of::<W>(long, at);
             *batch.users.get_unchecked_mut(row) = users.long(batch.rows.get_unchecked(row)[2], batch.lows.get_unchecked(row)[1]);
         }
     }
@@ -1206,7 +1705,7 @@ unsafe fn others(
     long_events: &mut Chunks<EvL>,
     slow: &mut usize,
 ) {
-    // SAFETY: the caller's contract; a list is the top bits of a hash.
+    // SAFETY: the caller's contract.
     unsafe {
         let (mut user_ts_of, mut ingest_of) = ([0u64; 8], [0u64; 8]);
         _mm512_storeu_si512(user_ts_of.as_mut_ptr().cast(), user_ts);
@@ -1215,37 +1714,93 @@ unsafe fn others(
         while left != 0 {
             let lane = left.trailing_zeros() as usize;
             left &= left - 1;
-            let row = first + lane;
-            let class = batch.class[row];
-            if class as u32 != 0 {
-                // The bytes from the row's line to the next row's, which are whole lines
-                // (more than one when a short line hid in them).
-                let (mut at, to) = (batch.line[row].offset_from(base) as usize, batch.line[row + 1].offset_from(base) as usize);
-                while at < to {
-                    #[cfg(test)]
-                    SLOW_LINES.with(|count| count.set(count.get() + 1));
-                    *slow += 1;
-                    slow_line(base, bytes, at, ctx, dates, plan, events, long_events);
-                    at = line_end(base, bytes, at);
-                }
-                continue;
+            other_row::<Wide>(batch, first + lane, user_ts_of[lane], ingest_of[lane], base, bytes, ctx, dates, plan, events, long_events, slow);
+        }
+    }
+}
+
+/// `others` for eight rows of `finish_narrow`, their records' words in memory.
+///
+/// # Safety
+/// As `others`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn others_narrow(
+    batch: &Batch,
+    first: usize,
+    rest: __mmask8,
+    user_ts_of: &[u64; 8],
+    ingest_of: &[u64; 8],
+    base: *const u8,
+    bytes: usize,
+    ctx: &Ctx,
+    dates: &Dates,
+    plan: &Plan,
+    events: &mut Chunks<Ev>,
+    long_events: &mut Chunks<EvL>,
+    slow: &mut usize,
+) {
+    // SAFETY: the caller's contract.
+    unsafe {
+        let mut left = rest;
+        while left != 0 {
+            let lane = left.trailing_zeros() as usize;
+            left &= left - 1;
+            other_row::<Narrow>(batch, first + lane, user_ts_of[lane], ingest_of[lane], base, bytes, ctx, dates, plan, events, long_events, slow);
+        }
+    }
+}
+
+/// One row of `others`, with the record's words `finish` made for it.
+///
+/// # Safety
+/// As `others`; `row` is one of the batch's rows.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn other_row<W: Width>(
+    batch: &Batch,
+    row: usize,
+    mut user_ts: u64,
+    mut ingest_pay: u64,
+    base: *const u8,
+    bytes: usize,
+    ctx: &Ctx,
+    dates: &Dates,
+    plan: &Plan,
+    events: &mut Chunks<Ev>,
+    long_events: &mut Chunks<EvL>,
+    slow: &mut usize,
+) {
+    // SAFETY: the caller's contract; a list is the top bits of a hash.
+    unsafe {
+        let class = batch.class[row];
+        if class as u32 != 0 {
+            // The bytes from the row's line to the next row's, which are whole lines
+            // (more than one when a short line hid in them).
+            let (mut at, to) = (batch.line[row].offset_from(base) as usize, batch.line[row + 1].offset_from(base) as usize);
+            while at < to {
+                #[cfg(test)]
+                SLOW_LINES.with(|count| count.set(count.get() + 1));
+                *slow += 1;
+                slow_line::<W>(base, bytes, at, ctx, dates, plan, events, long_events);
+                at = line_end(base, bytes, at);
             }
-            let (mut user_ts, mut ingest_pay) = (user_ts_of[lane], ingest_of[lane]);
-            if class & PURCHASE != 0 {
-                // `event_row`: the row is valid when its price is, too.
-                let (pay, price_ok) = purchase(batch.line[row + 1], ctx);
-                if !price_ok {
-                    user_ts &= 0xFFFF_FFFF;
-                }
-                ingest_pay |= u64::from(pay) << 32;
+            return;
+        }
+        if class & PURCHASE != 0 {
+            // `event_row`: the row is valid when its price is, too.
+            let (pay, price_ok) = purchase(batch.line[row + 1], ctx);
+            if !price_ok {
+                user_ts &= 0xFFFF_FFFF;
             }
-            if class & LONG_EVENT != 0 {
-                let (hi, lo) = (batch.rows[row][0], batch.lows[row][0]);
-                long_events.push_at(plan.long_part(hi, lo), EvL { hi, lo, user_ts, ingest_pay });
-            } else {
-                let key = batch.rows[row][0] + 1;
-                events.push_at(plan.part(key), Ev { key, user_ts, ingest_pay });
-            }
+            ingest_pay |= u64::from(pay) << 32;
+        }
+        if class & LONG_EVENT != 0 {
+            let (hi, lo) = (batch.rows[row][0], batch.lows[row][0]);
+            long_events.push_at(plan.long_part(hi, lo), EvL { hi, lo, user_ts, ingest_pay });
+        } else {
+            let key = batch.rows[row][0] + 1;
+            events.push_at(plan.part(key), Ev { key, user_ts, ingest_pay });
         }
     }
 }
@@ -1266,11 +1821,11 @@ unsafe fn line_end(p: *const u8, len: usize, at: usize) -> usize {
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn slow_line(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>) {
+unsafe fn slow_line<W: Width>(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>) {
     // SAFETY: one line of the segment.
     unsafe {
         let bytes = line_end(p, len, at) - at;
-        Scalar::lines::<7>(p.add(at), bytes, &mut Scratch::new(), |fields| event_row(ctx, dates, plan, fields, events, long_events));
+        Scalar::lines::<7>(p.add(at), bytes, &mut Scratch::new(), |fields| event_row::<W>(ctx, dates, plan, fields, events, long_events));
     }
 }
 
@@ -1280,11 +1835,11 @@ unsafe fn slow_line(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Date
 /// As `slow_line`.
 #[cold]
 #[inline(never)]
-unsafe fn slow_click(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, clicks: &mut Chunks<Ck>) {
+unsafe fn slow_click<W: Width>(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, clicks: &mut Chunks<Ck>) {
     // SAFETY: one line of the segment.
     unsafe {
         let bytes = line_end(p, len, at) - at;
-        Scalar::lines::<4>(p.add(at), bytes, &mut Scratch::new(), |fields| click_row(ctx, dates, plan, fields, clicks));
+        Scalar::lines::<4>(p.add(at), bytes, &mut Scratch::new(), |fields| click_row::<W>(ctx, dates, plan, fields, clicks));
     }
 }
 
@@ -1438,7 +1993,7 @@ unsafe fn click_tail(t: *const u8, gap: usize, end: *const u8, days: *const u8, 
 /// # Safety
 /// `p, len` is a segment, and `lead` bytes before `p` are readable.
 #[inline(never)]
-pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, dates: &Dates, campaigns: &Campaigns, plan: &Plan, out: &mut Out) {
+pub(super) unsafe fn clicks<W: Kern>(p: *const u8, len: usize, lead: usize, ctx: &Ctx, dates: &Dates, campaigns: &Campaigns, plan: &Plan, out: &mut Out) {
     let Out { clicks, slow, .. } = out;
     let memo = Memo::of(ctx, dates);
     let lanes = Lanes::new();
@@ -1453,7 +2008,7 @@ pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
         let last = p.add(len);
         let start = p.add(16usize.saturating_sub(lead).min(len));
         let stop = p.add((len + crate::PAD).saturating_sub(WINDOW));
-        let ts_end = _mm512_set1_epi64(i64::from(ctx.ts_end));
+        let ts_end = W::click_consts(ctx);
         let hundreds = _mm_setr_epi16(100, 1, 0, 0, 0, 0, 0, 0);
         let days = memo.days.as_ptr().cast::<u8>();
         let pair: *mut Batch = pair.as_mut_ptr();
@@ -1466,20 +2021,14 @@ pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
             if line >= start && line < stop {
                 let mut k = 0usize;
                 loop {
-                    let commas = _mm512_kunpackd(
-                        u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(line.add(32).cast()), lanes.comma)),
-                        u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(line.cast()), lanes.comma)),
-                    );
+                    let commas = first64::<W>(line, lanes.comma);
                     let c0 = commas.trailing_zeros() as usize;
                     let rest = commas & commas.wrapping_sub(1);
                     let c1 = rest.trailing_zeros() as usize;
                     let (end, stored, word);
                     if c1 <= SHORT_C1 {
                         // Both IDs short: the newline is in the line's first 64 bytes.
-                        let ends = _mm512_kunpackd(
-                            u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(line.add(32).cast()), lanes.newline)),
-                            u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(line.cast()), lanes.newline)),
-                        );
+                        let ends = first64::<W>(line, lanes.newline);
                         if ends == 0 {
                             break;
                         }
@@ -1508,21 +2057,15 @@ pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                         let t = line.add(c1);
                         // The campaign's comma and the newline, in the 64 bytes after the
                         // `user_id`'s.
-                        let after = _mm512_kunpackd(
-                            u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(t.add(33).cast()), lanes.comma)),
-                            u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(t.add(1).cast()), lanes.comma)),
-                        );
-                        let ends = _mm512_kunpackd(
-                            u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(t.add(33).cast()), lanes.newline)),
-                            u64::from(_mm256_cmpeq_epi8_mask(_mm256_loadu_si256(t.add(1).cast()), lanes.newline)),
-                        );
+                        let after = first64::<W>(t.add(1), lanes.comma);
+                        let ends = first64::<W>(t.add(1), lanes.newline);
                         if ends == 0 {
                             break;
                         }
                         end = t.add(1 + ends.trailing_zeros() as usize);
                         let gap = 1 + after.trailing_zeros() as usize;
-                        let click = one_id(line.add(c0), c0, &ONE_K, b'k', &lanes);
-                        let user = one_id(t, c1.wrapping_sub(c0 + 1), &ONE_U, b'u', &lanes);
+                        let click = one_id::<W>(line.add(c0), c0, &ONE_K, b'k', &lanes);
+                        let user = one_id::<W>(t, c1.wrapping_sub(c0 + 1), &ONE_U, b'u', &lanes);
                         let rest_of = click_tail(t, gap, end, days, hundreds);
                         // One comma between the `user_id`'s and the newline: the campaign's.
                         let stray = (after & _blsmsk_u64(ends)).count_ones() ^ 1;
@@ -1539,9 +2082,9 @@ pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                     if k == 8 * BATCH {
                         (*batch).count = BATCH;
                         (*batch).line[BATCH] = line;
-                        ask(&*batch, plan);
+                        ask::<W>(&*batch, plan);
                         batch = other(pair, batch);
-                        finish_clicks(batch, p, len, ts_end, campaigns, ctx, dates, plan, clicks, slow);
+                        W::finish_clicks(batch, p, len, ts_end, campaigns, ctx, dates, plan, clicks, slow);
                         (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
                         k = 0;
                     }
@@ -1552,9 +2095,9 @@ pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 if k != 0 {
                     (*batch).count = k / 8;
                     (*batch).line[k / 8] = line;
-                    ask(&*batch, plan);
+                    ask::<W>(&*batch, plan);
                     batch = other(pair, batch);
-                    finish_clicks(batch, p, len, ts_end, campaigns, ctx, dates, plan, clicks, slow);
+                    W::finish_clicks(batch, p, len, ts_end, campaigns, ctx, dates, plan, clicks, slow);
                     (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
                 }
             }
@@ -1564,12 +2107,12 @@ pub(super) unsafe fn clicks(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 SLOW_LINES.with(|count| count.set(count.get() + 1));
                 *slow += 1;
                 let at = line.offset_from(p) as usize;
-                slow_click(p, len, at, ctx, dates, plan, clicks);
+                slow_click::<W>(p, len, at, ctx, dates, plan, clicks);
                 line = p.add(line_end(p, len, at));
             }
         }
         // The batch that was asked for last.
-        finish_clicks(other(pair, batch), p, len, ts_end, campaigns, ctx, dates, plan, clicks, slow);
+        W::finish_clicks(other(pair, batch), p, len, ts_end, campaigns, ctx, dates, plan, clicks, slow);
     }
     clicks.fence();
 }
@@ -1605,7 +2148,7 @@ unsafe fn finish_clicks(
     unsafe {
         let batch = &mut *batch;
         let rows = std::mem::take(&mut batch.count);
-        look(batch, rows, plan);
+        look::<Wide>(batch, rows, plan);
         // Bytes of a `click_id` that are kept (`click_id_at`).
         let kept = if plan.whole_clicks { usize::MAX } else { 9 };
         let all = |value: i64| _mm512_set1_epi64(value);
@@ -1660,7 +2203,79 @@ unsafe fn finish_clicks(
                     #[cfg(test)]
                     SLOW_LINES.with(|count| count.set(count.get() + 1));
                     *slow += 1;
-                    slow_click(base, bytes, at, ctx, dates, plan, clicks);
+                    slow_click::<Wide>(base, bytes, at, ctx, dates, plan, clicks);
+                    at = line_end(base, bytes, at);
+                }
+            }
+            first += 8;
+        }
+    }
+}
+
+/// `finish_clicks` with no 512-bit instruction (`types::width::Narrow`): eight rows a step,
+/// which of them are clean by two 256-bit tests, and each clean row's window and campaign
+/// on its own where `finish_clicks` compares and gathers eight in a register.
+///
+/// # Safety
+/// As `finish_clicks`.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn finish_clicks_narrow(
+    batch: *mut Batch,
+    base: *const u8,
+    bytes: usize,
+    ts_end: i64,
+    campaigns: &Campaigns,
+    ctx: &Ctx,
+    dates: &Dates,
+    plan: &Plan,
+    clicks: &mut Chunks<Ck>,
+    slow: &mut usize,
+) {
+    // SAFETY: as `finish_clicks`.
+    unsafe {
+        let batch = &mut *batch;
+        let rows = std::mem::take(&mut batch.count);
+        look::<Narrow>(batch, rows, plan);
+        let kept = if plan.whole_clicks { usize::MAX } else { 9 };
+        let mut first = 0;
+        while first < rows {
+            let live = _bzhi_u32(0xFF, (rows - first) as u32) as __mmask8;
+            let clean = live & clean_rows(batch.class.as_ptr().add(first));
+            // The clicks, and the rows whose campaign the table has not: the row code's. A
+            // clean row with its `ts` outside the window is no click (`finish_clicks`).
+            let mut slow_rows = live & !clean;
+            let mut left = clean;
+            while left != 0 {
+                let lane = left.trailing_zeros() as usize;
+                left &= left - 1;
+                let row = first + lane;
+                let [raw, ts, _, number] = batch.rows[row];
+                if !(0..ts_end).contains(&(ts as i64)) {
+                    continue;
+                }
+                let number = number & 0xFFFF_FFFF;
+                let index = if number < Campaigns::NUMBERS as u64 { *campaigns.numbers.get_unchecked(number as usize) } else { Campaigns::NONE };
+                if index == Campaigns::NONE {
+                    slow_rows |= 1 << lane;
+                    continue;
+                }
+                // As `finish_clicks`.
+                let quoted = usize::from(*batch.line[row] == b'"');
+                let click = pack_at(batch.line[row].add(quoted), (raw as usize - 2 * quoted).min(kept));
+                clicks.push_at(0, Ck { click, user_ts: u64::from(batch.users[row]) | ts << 32, campaign: u64::from(index) });
+            }
+
+            let mut left = slow_rows;
+            while left != 0 {
+                let row = first + left.trailing_zeros() as usize;
+                left &= left - 1;
+                let (mut at, to) = (batch.line[row].offset_from(base) as usize, batch.line[row + 1].offset_from(base) as usize);
+                while at < to {
+                    #[cfg(test)]
+                    SLOW_LINES.with(|count| count.set(count.get() + 1));
+                    *slow += 1;
+                    slow_click::<Narrow>(base, bytes, at, ctx, dates, plan, clicks);
                     at = line_end(base, bytes, at);
                 }
             }

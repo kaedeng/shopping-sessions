@@ -34,6 +34,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering::Acquire, Ord
 
 use crate::id::{self, Id, SLOW};
 use crate::mem::Zeroed;
+use crate::width::Width;
 
 /// No user: an empty `user_id`.
 pub const NO_USER: u32 = u32::MAX;
@@ -117,12 +118,12 @@ pub unsafe fn short_key_at(p: *const u8, len: usize, letter: u8) -> Option<u64> 
 /// # Safety
 /// `len` bytes readable at `p`.
 #[inline]
-pub unsafe fn long_key_at(p: *const u8, len: usize, letter: u8) -> Option<(u64, u64)> {
+pub unsafe fn long_key_at<W: Width>(p: *const u8, len: usize, letter: u8) -> Option<(u64, u64)> {
     if len != 33 || unsafe { *p } != letter {
         return None;
     }
     // SAFETY: the 32 bytes after the letter are the ID's.
-    unsafe { hex32(p.add(1)) }
+    unsafe { hex32::<W>(p.add(1)) }
 }
 
 /// 32 hex digits at `p` as `long_key_at` has them, `None` if a byte is not one of `0-9a-f`:
@@ -133,7 +134,7 @@ pub unsafe fn long_key_at(p: *const u8, len: usize, letter: u8) -> Option<(u64, 
 /// 32 bytes readable at `p`.
 #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
 #[inline(always)]
-unsafe fn hex32(p: *const u8) -> Option<(u64, u64)> {
+unsafe fn hex32<W: Width>(p: *const u8) -> Option<(u64, u64)> {
     use core::arch::x86_64::*;
     // SAFETY: the caller's contract; register arithmetic.
     #[allow(unused_unsafe)]
@@ -147,9 +148,23 @@ unsafe fn hex32(p: *const u8) -> Option<(u64, u64)> {
             return None;
         }
         let value = _mm256_blendv_epi8(_mm256_add_epi8(hex, _mm256_set1_epi8(10)), digit, is_digit);
-        let pairs = _mm256_maddubs_epi16(value, _mm256_set1_epi16(0x0110));
+        let pairs = if W::NARROW { pairs_by_shifts(value) } else { _mm256_maddubs_epi16(value, _mm256_set1_epi16(0x0110)) };
         let bytes = _mm256_packus_epi16(pairs, pairs);
         Some((_mm256_extract_epi64::<0>(bytes) as u64, _mm256_extract_epi64::<2>(bytes) as u64))
+    }
+}
+
+/// `_mm256_maddubs_epi16(value, _mm256_set1_epi16(0x0110))` for bytes below 16, by shifts: each
+/// word's first byte sixteen times and its second once. Three licence-0 instructions where the
+/// multiply-add is a licence-1 one (`width`).
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+pub fn pairs_by_shifts(value: core::arch::x86_64::__m256i) -> core::arch::x86_64::__m256i {
+    use core::arch::x86_64::*;
+    // SAFETY: register arithmetic; AVX2 is compiled in.
+    #[allow(unused_unsafe)]
+    unsafe {
+        _mm256_or_si256(_mm256_and_si256(_mm256_slli_epi16::<4>(value), _mm256_set1_epi16(0x00F0)), _mm256_srli_epi16::<8>(value))
     }
 }
 
@@ -159,7 +174,7 @@ unsafe fn hex32(p: *const u8) -> Option<(u64, u64)> {
 /// 32 bytes readable at `p`.
 #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
-unsafe fn hex32(p: *const u8) -> Option<(u64, u64)> {
+unsafe fn hex32<W: Width>(p: *const u8) -> Option<(u64, u64)> {
     let mut bytes = [0u8; 16];
     for at in 0..32 {
         let value = match unsafe { *p.add(at) } {
@@ -208,7 +223,7 @@ pub unsafe fn short_key_wide(p: *const u8, len: usize, letter: u8) -> Option<u64
 /// # Safety
 /// 16 bytes readable at `p`, and `len` of them at least.
 #[inline(always)]
-pub unsafe fn key_at_wide(p: *const u8, len: usize) -> UserKey {
+pub unsafe fn key_at_wide<W: Width>(p: *const u8, len: usize) -> UserKey {
     if len == 0 {
         return UserKey::Short(0);
     }
@@ -217,7 +232,7 @@ pub unsafe fn key_at_wide(p: *const u8, len: usize) -> UserKey {
         if let Some(key) = short_key_wide(p, len, b'u') {
             return UserKey::Short(key);
         }
-        if let Some((hi, lo)) = long_key_at(p, len, b'u') {
+        if let Some((hi, lo)) = long_key_at::<W>(p, len, b'u') {
             return UserKey::Long(hi, lo);
         }
         UserKey::Short(id::intern_any(std::slice::from_raw_parts(p, len)))
@@ -249,7 +264,7 @@ pub fn long_digits(hi: u64, lo: u64, out: &mut Vec<u8>) {
 ///
 /// # Safety
 /// `len` bytes readable at `p`.
-pub unsafe fn key_at(p: *const u8, len: usize) -> UserKey {
+pub unsafe fn key_at<W: Width>(p: *const u8, len: usize) -> UserKey {
     if len == 0 {
         return UserKey::Short(0);
     }
@@ -258,7 +273,7 @@ pub unsafe fn key_at(p: *const u8, len: usize) -> UserKey {
         if let Some(key) = short_key_at(p, len, b'u') {
             return UserKey::Short(key);
         }
-        if let Some((hi, lo)) = long_key_at(p, len, b'u') {
+        if let Some((hi, lo)) = long_key_at::<W>(p, len, b'u') {
             return UserKey::Long(hi, lo);
         }
         UserKey::Short(id::intern_any(std::slice::from_raw_parts(p, len)))
@@ -376,7 +391,7 @@ impl Users {
     /// The number of the user with short-table key `key` (not 0), which is given one if
     /// this is its first lookup.
     #[inline(always)]
-    pub fn short(&self, key: u64) -> u32 {
+    pub fn short<W: Width>(&self, key: u64) -> u32 {
         debug_assert!(key != 0);
         let mask = self.short.len() - 1;
         // A line of four slots at a time, from the key's own: its keys are compared at once,
@@ -392,11 +407,11 @@ impl Users {
             let line = unsafe { std::slice::from_raw_parts(self.short.as_ptr().add(at & mask).cast::<AtomicU64>(), 2 * LINE) };
             loop {
                 // Bit `2 * n` for slot `n`.
-                let hit = Self::keys(line, key);
+                let hit = Self::keys::<W>(line, key);
                 if hit != 0 {
                     return Self::numbered(&line[(hit.trailing_zeros() as usize + 1) & (2 * LINE - 1)]);
                 }
-                let empty = Self::keys(line, 0);
+                let empty = Self::keys::<W>(line, 0);
                 if empty == 0 {
                     break;
                 }
@@ -419,14 +434,39 @@ impl Users {
 
     /// Which of a line's four keys (its even words) are `key`: bit `2 * n` for slot `n`.
     #[inline(always)]
-    fn keys(line: &[AtomicU64], key: u64) -> u32 {
+    fn keys<W: Width>(line: &[AtomicU64], key: u64) -> u32 {
         debug_assert!(line.len() == 2 * LINE);
         // The line's 64 bytes in one register (the table is aligned far above a line, and a
-        // line begins at a multiple of four slots).
-        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        // line begins at a multiple of four slots); for `Narrow` in two, by two compares
+        // written as the instructions they are (`width`: the compiler joins the intrinsics'
+        // two into one 512-bit compare).
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512vl", target_feature = "avx512dq"))]
         // SAFETY: eight words are 64 readable bytes. Other threads store into them
         // meanwhile, a word at a time, and an aligned word is read whole: each key read
-        // here is zero or a key some thread put there, as a relaxed load of it would be.
+        // here is zero or a key some thread put there, as a relaxed load of it would be. The
+        // asm's instructions are AVX-512F, VL and DQ.
+        unsafe {
+            use core::arch::x86_64::*;
+            if W::NARROW {
+                let hits: u8;
+                core::arch::asm!(
+                    "vpcmpeqq {low}, {key}, ymmword ptr [{line}]",
+                    "vpcmpeqq {high}, {key}, ymmword ptr [{line} + 32]",
+                    "kshiftlb {high}, {high}, 4",
+                    "korb {low}, {low}, {high}",
+                    line = in(reg) line.as_ptr(),
+                    key = in(ymm_reg) _mm256_set1_epi64x(key as i64),
+                    low = out(kreg) hits,
+                    high = out(kreg) _,
+                    options(pure, readonly, nostack, preserves_flags),
+                );
+                return u32::from(hits & 0x55);
+            }
+            let slots = _mm512_load_si512(line.as_ptr().cast());
+            u32::from(_mm512_cmpeq_epi64_mask(slots, _mm512_set1_epi64(key as i64)) & 0x55)
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f", not(all(target_feature = "avx512vl", target_feature = "avx512dq"))))]
+        // SAFETY: as above.
         unsafe {
             use core::arch::x86_64::*;
             let slots = _mm512_load_si512(line.as_ptr().cast());
@@ -505,9 +545,9 @@ impl Users {
     ///
     /// # Safety
     /// `len` bytes readable at `p`.
-    pub unsafe fn at(&self, p: *const u8, len: usize) -> u32 {
+    pub unsafe fn at<W: Width>(&self, p: *const u8, len: usize) -> u32 {
         // SAFETY: the caller's contract.
-        self.get(unsafe { key_at(p, len) })
+        self.get::<W>(unsafe { key_at::<W>(p, len) })
     }
 
     /// Asks for the cache line the lookup of `key` begins at.
@@ -522,10 +562,10 @@ impl Users {
 
     /// The number of the user with key `key` (`key_at`), `NO_USER` for the key of no ID.
     #[inline(always)]
-    pub fn get(&self, key: UserKey) -> u32 {
+    pub fn get<W: Width>(&self, key: UserKey) -> u32 {
         match key {
             UserKey::Short(0) => NO_USER,
-            UserKey::Short(key) => self.short(key),
+            UserKey::Short(key) => self.short::<W>(key),
             UserKey::Long(hi, lo) => self.long(hi, lo),
         }
     }
@@ -623,6 +663,7 @@ impl Users {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::width::{Narrow, Wide};
 
     fn short(text: &[u8]) -> Option<u64> {
         let mut bytes = [0u8; 48];
@@ -635,7 +676,7 @@ mod tests {
         let mut bytes = [0u8; 48];
         bytes[..text.len()].copy_from_slice(text);
         // SAFETY: 48 bytes are readable.
-        unsafe { long_key_at(bytes.as_ptr(), text.len(), b'u') }
+        unsafe { long_key_at::<Wide>(bytes.as_ptr(), text.len(), b'u') }
     }
 
     /// The keys read a word at a time are the keys read a byte at a time, for IDs and for
@@ -680,10 +721,12 @@ mod tests {
                         let value: Vec<u8> = text[1..].chunks(2).map(|pair| nibble(pair[0]) << 4 | nibble(pair[1])).collect();
                         (u64::from_le_bytes(value[..8].try_into().unwrap()), u64::from_le_bytes(value[8..].try_into().unwrap()))
                     });
-                    assert_eq!(long_key_at(bytes.as_ptr(), text.len(), b'u'), slow, "{:?}", String::from_utf8_lossy(text));
+                    assert_eq!(long_key_at::<Wide>(bytes.as_ptr(), text.len(), b'u'), slow, "{:?}", String::from_utf8_lossy(text));
+                    assert_eq!(long_key_at::<Narrow>(bytes.as_ptr(), text.len(), b'u'), slow, "{:?}", String::from_utf8_lossy(text));
                     let short = short_key_at(bytes.as_ptr(), text.len(), b'u');
                     if short.is_some() || slow.is_some() || text.is_empty() {
-                        assert_eq!(key_at_wide(bytes.as_ptr(), text.len()), key_at(bytes.as_ptr(), text.len()), "{:?}", String::from_utf8_lossy(text));
+                        assert_eq!(key_at_wide::<Wide>(bytes.as_ptr(), text.len()), key_at::<Wide>(bytes.as_ptr(), text.len()), "{:?}", String::from_utf8_lossy(text));
+                        assert_eq!(key_at_wide::<Narrow>(bytes.as_ptr(), text.len()), key_at::<Wide>(bytes.as_ptr(), text.len()), "{:?}", String::from_utf8_lossy(text));
                     }
                 }
             }
@@ -715,6 +758,11 @@ mod tests {
 
     #[test]
     fn every_id_has_one_place_from_any_thread() {
+        every_id_has_one_place::<Wide>();
+        every_id_has_one_place::<Narrow>();
+    }
+
+    fn every_id_has_one_place<W: Width>() {
         let users = Users::new(1 << 12, 1 << 10);
         let texts: Vec<Vec<u8>> = (0..1500u64)
             .map(|n| match n % 4 {
@@ -728,7 +776,7 @@ mod tests {
             let mut bytes = text.to_vec();
             bytes.resize(text.len() + 16, 0);
             // SAFETY: the text's bytes are readable.
-            unsafe { users.at(bytes.as_ptr(), text.len()) }
+            unsafe { users.at::<W>(bytes.as_ptr(), text.len()) }
         };
         let (all, place_of) = (&texts, &place);
         let places: Vec<Vec<u32>> = std::thread::scope(|scope| {
@@ -763,10 +811,12 @@ mod tests {
 
     #[test]
     fn a_full_table_says_so() {
-        let users = Users::new(64, 64);
-        for n in 0..5000u64 {
-            users.short(n + 1);
+        for narrow in [false, true] {
+            let users = Users::new(64, 64);
+            for n in 0..5000u64 {
+                if narrow { users.short::<Narrow>(n + 1) } else { users.short::<Wide>(n + 1) };
+            }
+            assert!(users.overflowed());
         }
-        assert!(users.overflowed());
     }
 }
