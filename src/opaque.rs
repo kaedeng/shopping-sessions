@@ -218,8 +218,14 @@ pub struct Scratch {
 
 /// Slots per row, rounded up to a power of two: the table ends a quarter full or less.
 const ROOM: usize = 4;
-/// Rows `dedup` asks for the slot of ahead of the row it is at.
-const AHEAD_SLOTS: usize = 8;
+/// Rows `dedup` asks for the slot of ahead of the row it is at: `SS_DEDUP_AHEAD`, 8 unless
+/// set, 0 for none. A row asked for is 11 instructions more (2% of a run's), for 6% of the
+/// stage's time at 21,000 rows a list (a table of half a megabyte) on a machine with a core
+/// a worker; see `SS_ASK` in `ingest::opaque::kern`.
+fn ahead_slots() -> usize {
+    static AHEAD: OnceLock<usize> = OnceLock::new();
+    *AHEAD.get_or_init(|| types::env::number("SS_DEDUP_AHEAD", 8).min(64))
+}
 
 /// List `list` of every worker deduplicated into `kept`: one record per `event_id`, the copy
 /// with the smallest `ingest`. `bits` are the hash bits that chose the list.
@@ -235,12 +241,15 @@ fn dedup<'p, R: Row + 'p>(lists: impl Iterator<Item = &'p Chunks<R>> + Clone, li
     table.clear();
     table.resize(mask + 1, 0);
     kept.reserve(rows);
+    let ahead = ahead_slots();
     for chunks in lists {
         chunks.for_each(list, |piece| {
             for (number, row) in piece.iter().enumerate() {
-                // The slot of the row a few on: at 60M events a list's table is half a
-                // megabyte and its kept rows more, past L2 together.
-                if let Some(coming) = piece.get(number + AHEAD_SLOTS) {
+                // `SS_DEDUP_AHEAD`: the slot of the row a few on (at 60M events a list's
+                // table is half a megabyte and its kept rows more, past L2 together).
+                if ahead != 0
+                    && let Some(coming) = piece.get(number + ahead)
+                {
                     types::mem::prefetch(table.as_ptr().wrapping_add((coming.slot() >> shift) as usize & mask));
                 }
                 let mut at = (row.slot() >> shift) as usize & mask;

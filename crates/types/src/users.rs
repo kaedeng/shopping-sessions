@@ -121,9 +121,48 @@ pub unsafe fn long_key_at(p: *const u8, len: usize, letter: u8) -> Option<(u64, 
     if len != 33 || unsafe { *p } != letter {
         return None;
     }
+    // SAFETY: the 32 bytes after the letter are the ID's.
+    unsafe { hex32(p.add(1)) }
+}
+
+/// 32 hex digits at `p` as `long_key_at` has them, `None` if a byte is not one of `0-9a-f`:
+/// in one register, each digit a value, two values a byte (the first sixteen times, the
+/// second once), the bytes in the digits' order.
+///
+/// # Safety
+/// 32 bytes readable at `p`.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn hex32(p: *const u8) -> Option<(u64, u64)> {
+    use core::arch::x86_64::*;
+    // SAFETY: the caller's contract; register arithmetic.
+    #[allow(unused_unsafe)]
+    unsafe {
+        let text = _mm256_loadu_si256(p.cast());
+        let digit = _mm256_sub_epi8(text, _mm256_set1_epi8(b'0' as i8));
+        let hex = _mm256_sub_epi8(text, _mm256_set1_epi8(b'a' as i8));
+        let is_digit = _mm256_cmpeq_epi8(_mm256_min_epu8(digit, _mm256_set1_epi8(9)), digit);
+        let is_hex = _mm256_cmpeq_epi8(_mm256_min_epu8(hex, _mm256_set1_epi8(5)), hex);
+        if _mm256_movemask_epi8(_mm256_or_si256(is_digit, is_hex)) != -1 {
+            return None;
+        }
+        let value = _mm256_blendv_epi8(_mm256_add_epi8(hex, _mm256_set1_epi8(10)), digit, is_digit);
+        let pairs = _mm256_maddubs_epi16(value, _mm256_set1_epi16(0x0110));
+        let bytes = _mm256_packus_epi16(pairs, pairs);
+        Some((_mm256_extract_epi64::<0>(bytes) as u64, _mm256_extract_epi64::<2>(bytes) as u64))
+    }
+}
+
+/// `hex32` a digit at a time, where the build has no 256-bit registers.
+///
+/// # Safety
+/// 32 bytes readable at `p`.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+unsafe fn hex32(p: *const u8) -> Option<(u64, u64)> {
     let mut bytes = [0u8; 16];
     for at in 0..32 {
-        let value = match unsafe { *p.add(1 + at) } {
+        let value = match unsafe { *p.add(at) } {
             byte @ b'0'..=b'9' => byte - b'0',
             byte @ b'a'..=b'f' => byte - b'a' + 10,
             _ => return None,
@@ -131,6 +170,58 @@ pub unsafe fn long_key_at(p: *const u8, len: usize, letter: u8) -> Option<(u64, 
         bytes[at / 2] |= value << (4 * (1 - at % 2));
     }
     Some((u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")), u64::from_le_bytes(bytes[8..].try_into().expect("8 bytes"))))
+}
+
+/// `short_key_at` for an ID with 9 bytes readable at `p` whatever `len` is, as a field of a
+/// segment has: the digits a word at a time. (Byte by byte, the links' two IDs a line were
+/// 2% of a run's instructions.)
+///
+/// # Safety
+/// 9 bytes readable at `p`.
+#[inline(always)]
+pub unsafe fn short_key_wide(p: *const u8, len: usize, letter: u8) -> Option<u64> {
+    if !(2..=9).contains(&len) || unsafe { *p } != letter {
+        return None;
+    }
+    let digits = len - 1;
+    // The digits in the low bytes, in their order; the bytes past them read as `1`, a digit.
+    let raw = u64::from_le(unsafe { p.add(1).cast::<u64>().read_unaligned() });
+    let mask = u64::MAX >> (8 * (8 - digits));
+    let word = (raw & mask) | (0x3131_3131_3131_3131 & !mask);
+    // A byte is one of `0-9a-z`: below 0x80, and bit 7 of each sum below says which side of
+    // a bound it is (no sum carries into the next byte).
+    const SEVEN: u64 = 0x7F7F_7F7F_7F7F_7F7F;
+    let low = word & SEVEN;
+    let at_least = |bound: u8| low + (0x0101_0101_0101_0101 * u64::from(0x80 - bound));
+    let digit = at_least(b'0') & !at_least(b'9' + 1);
+    let lower = at_least(b'a') & !at_least(b'z' + 1);
+    let fine = (digit | lower) & !word & !SEVEN;
+    // No leading zero, unless it is the only digit.
+    if fine != !SEVEN || (digits > 1 && raw as u8 == b'0') {
+        return None;
+    }
+    Some((((raw & mask) - (ZEROS & mask)) << (8 * (8 - digits))) + 1)
+}
+
+/// `key_at` for a field of a segment: 16 bytes readable at `p` whatever `len` is.
+///
+/// # Safety
+/// 16 bytes readable at `p`, and `len` of them at least.
+#[inline(always)]
+pub unsafe fn key_at_wide(p: *const u8, len: usize) -> UserKey {
+    if len == 0 {
+        return UserKey::Short(0);
+    }
+    // SAFETY: the caller's contract.
+    unsafe {
+        if let Some(key) = short_key_wide(p, len, b'u') {
+            return UserKey::Short(key);
+        }
+        if let Some((hi, lo)) = long_key_at(p, len, b'u') {
+            return UserKey::Long(hi, lo);
+        }
+        UserKey::Short(id::intern_any(std::slice::from_raw_parts(p, len)))
+    }
 }
 
 /// The digits of a short key as text: up to 8 bytes, and how many.
@@ -545,6 +636,58 @@ mod tests {
         bytes[..text.len()].copy_from_slice(text);
         // SAFETY: 48 bytes are readable.
         unsafe { long_key_at(bytes.as_ptr(), text.len(), b'u') }
+    }
+
+    /// The keys read a word at a time are the keys read a byte at a time, for IDs and for
+    /// everything near one.
+    #[test]
+    fn wide_keys_are_the_keys() {
+        let mut texts: Vec<Vec<u8>> = Vec::new();
+        for id in [&b""[..], b"u", b"u0", b"u1", b"uz", b"u10", b"u01", b"u00", b"u1a0", b"uzzzzzzzz", b"u4k2nn2cj", b"u10000000", b"ua0b0c0d0", b"u123456789", b"U1", b"uA", b"u1 ", b" u1", b"e1", b"u1\r", b"u1_", b"u\xff", b"u1\x80", b"u/", b"u:", b"u`", b"u{", b"u9z", b"u0a"] {
+            texts.push(id.to_vec());
+        }
+        // Every byte value at every digit's place of a full-width ID and of a short one.
+        for base in [&b"u12345678"[..], b"uab"] {
+            for at in 0..base.len() {
+                for byte in 0..=255u8 {
+                    let mut text = base.to_vec();
+                    text[at] = byte;
+                    texts.push(text);
+                }
+            }
+        }
+        let hex = b"u02423c3d84ab053af78764ce49f23b5c";
+        for at in 0..hex.len() {
+            for byte in [b'0', b'9', b'a', b'f', b'g', b'A', b'F', b'/', b':', b'`', 0, 0x80, 0xFF] {
+                let mut text = hex.to_vec();
+                text[at] = byte;
+                texts.push(text);
+            }
+        }
+        texts.push(hex[..32].to_vec());
+        texts.push([&hex[..], b"c"].concat());
+        for text in &texts {
+            // What follows the ID must not matter: once zeros, once digits.
+            for fill in [0u8, b'7'] {
+                let mut bytes = text.clone();
+                bytes.resize(text.len() + 48, fill);
+                // SAFETY: 48 bytes are readable after the text.
+                unsafe {
+                    assert_eq!(short_key_wide(bytes.as_ptr(), text.len(), b'u'), short_key_at(bytes.as_ptr(), text.len(), b'u'), "{:?}", String::from_utf8_lossy(text));
+                    // The long key against the digits read one by one.
+                    let slow = (text.len() == 33 && text[0] == b'u' && text[1..].iter().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))).then(|| {
+                        let nibble = |byte: u8| if byte.is_ascii_digit() { byte - b'0' } else { byte - b'a' + 10 };
+                        let value: Vec<u8> = text[1..].chunks(2).map(|pair| nibble(pair[0]) << 4 | nibble(pair[1])).collect();
+                        (u64::from_le_bytes(value[..8].try_into().unwrap()), u64::from_le_bytes(value[8..].try_into().unwrap()))
+                    });
+                    assert_eq!(long_key_at(bytes.as_ptr(), text.len(), b'u'), slow, "{:?}", String::from_utf8_lossy(text));
+                    let short = short_key_at(bytes.as_ptr(), text.len(), b'u');
+                    if short.is_some() || slow.is_some() || text.is_empty() {
+                        assert_eq!(key_at_wide(bytes.as_ptr(), text.len()), key_at(bytes.as_ptr(), text.len()), "{:?}", String::from_utf8_lossy(text));
+                    }
+                }
+            }
+        }
     }
 
     #[test]

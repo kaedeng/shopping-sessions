@@ -880,6 +880,7 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
         let mut lows = rows.add(std::mem::offset_of!(Batch, lows));
         const _: () = assert!(std::mem::offset_of!(Batch, line) == std::mem::offset_of!(Batch, class) + 8 * BATCH && std::mem::offset_of!(Batch, rows) == 0);
         let mut line = p;
+        let (ask_step, by_rows) = (plan.ask_step, plan.ask_step != usize::MAX);
         while line < last {
             if line >= start && line < stop {
                 // Eight times the rows stored: a row is 32 bytes, its class and its line 8.
@@ -944,12 +945,20 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                     line = end.add(1);
                     // The directory's lines of the last eight rows' users: asked for as the
                     // rows are decoded, a few at a time, and not a batch's 64 at once.
-                    if k & 63 == 0 {
+                    // `SS_ASK=batch` asks for a batch's when it is full, as before: by rows
+                    // it is 14 instructions a line more (2.5% of a run's) for 1% of the
+                    // cycles at 60M events and nothing at 20M, on a machine with a core a
+                    // worker; where two workers share a core the wait for a line is already
+                    // the other's time, and which side wins there is the scorer's to say.
+                    if k & ask_step == 0 {
                         ask_rows(batch, k / 8 - 8, k / 8, plan);
                     }
                     if k == 8 * BATCH {
                         (*batch).count = BATCH;
                         (*batch).line[BATCH] = line;
+                        if !by_rows {
+                            ask(&*batch, plan);
+                        }
                         batch = other(pair, batch);
                         finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
                         (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));
@@ -963,7 +972,11 @@ pub(super) unsafe fn events(p: *const u8, len: usize, lead: usize, ctx: &Ctx, da
                 if k != 0 {
                     (*batch).count = k / 8;
                     (*batch).line[k / 8] = line;
-                    ask_rows(batch, (k / 8) & !7, k / 8, plan);
+                    if by_rows {
+                        ask_rows(batch, (k / 8) & !7, k / 8, plan);
+                    } else {
+                        ask(&*batch, plan);
+                    }
                     batch = other(pair, batch);
                     finish(batch, p, len, &consts, &mut held, ctx, dates, plan, events, long_events, slow);
                     (rows, class, lows) = (batch.cast::<u8>(), batch.cast::<u8>().add(std::mem::offset_of!(Batch, class)), batch.cast::<u8>().add(std::mem::offset_of!(Batch, lows)));

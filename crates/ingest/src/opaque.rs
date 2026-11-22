@@ -28,10 +28,10 @@ use types::hash::hash;
 use types::id::{self, Id, pack_at};
 use types::record::PAY_CATEGORY_SHIFT;
 use types::time::DAY;
-use types::users::{NO_USER, UserKey, Users, key_at, long_key_at, mix_long, short_key_at};
+use types::users::{NO_USER, UserKey, Users, key_at_wide, long_key_at, mix_long, short_key_at};
 use types::Ctx;
 
-use crate::tok::{Field, Scalar, Scratch, Tok};
+use crate::tok::{Field, Mask, Scalar, Scratch, Tok};
 use crate::ts::{Dates, rd};
 use crate::{Ingest, ingest_slow, price_cents};
 
@@ -203,6 +203,11 @@ pub struct Plan {
     kernel: bool,
     /// Long `click_id`s kept whole (`click_id_at`).
     pub(crate) whole_clicks: bool,
+    /// `k & ask_step == 0` after a row is when the kernel asks for the directory's lines of
+    /// the last eight rows' users (`SS_ASK=rows|batch`): 63 for `rows`, the pick; for
+    /// `batch` every bit, which no count of rows clears, and a batch's users are asked for
+    /// when it is full.
+    pub(crate) ask_step: usize,
 }
 
 impl Plan {
@@ -261,6 +266,7 @@ impl Ingest {
             long_bits: part_bits.saturating_sub(3).max(1),
             kernel: DECODES[types::env::pick("SS_DECODE", DECODES)] == "kernel",
             whole_clicks,
+            ask_step: if types::env::pick("SS_ASK", &["rows", "batch"]) == 0 { 63 } else { usize::MAX },
         }
     }
 
@@ -329,10 +335,13 @@ impl Ingest {
             links.extend(held.iter().map(|&(keys, order)| LinkRec { users: [users.get(keys[0]), users.get(keys[1])], order }));
         };
         // SAFETY: a segment, and a segment's fields have 16 bytes readable after them.
+        // (The lines by their masks and the keys a word at a time: through the byte-by-byte
+        // tokenizer and `key_at`, 0.9M link lines were 4.7% of a run's instructions at 20M
+        // events, 730 a line.)
         unsafe {
-            Scalar::lines::<2>(p, len, &mut out.scratch, |&[a, b]| {
+            Mask::lines::<2>(p, len, &mut out.scratch, |&[a, b]| {
                 if a.len != 0 && b.len != 0 {
-                    held[count] = ([key_at(a.p, a.len), key_at(b.p, b.len)], [order_at(a.p, a.len), order_at(b.p, b.len)]);
+                    held[count] = ([key_at_wide(a.p, a.len), key_at_wide(b.p, b.len)], [order_at(a.p, a.len), order_at(b.p, b.len)]);
                     count += 1;
                     if count == LINKS_HELD {
                         flush(&held, &mut links);
@@ -478,7 +487,7 @@ mod tests {
     fn rows_go_by_their_ids_spelling() {
         let ctx = Ctx::new(parse_f1(b"2026-10-08T00:00:00Z").unwrap(), parse_f1(b"2026-10-22T00:00:00Z").unwrap(), &[], &[]).unwrap();
         let dates = Dates::new(&ctx);
-        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, whole_clicks: false };
+        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, whole_clicks: false, ask_step: 63 };
         let (mut events, mut long_events) = (Chunks::<Ev>::new(8, 1 << 16), Chunks::<EvL>::new(2, 1 << 16));
         let text = b"\ne1,u1,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,view,p1,\n\
 e02423c3d84ab053af78764ce49f23b5c,u02423c3d84ab053af78764ce49f23b5c,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,cart,p1,\n\
