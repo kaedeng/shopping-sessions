@@ -253,6 +253,12 @@ unsafe fn intern_at(p: *const u8, len: usize) -> Id {
     intern(unsafe { std::slice::from_raw_parts(p, len) })
 }
 
+/// The interned ID of any bytes, those that pack too: for a table that keeps IDs of one
+/// kind apart from keys of its own (`types::users`), and never mixes them with `pack`'s.
+pub fn intern_any(bytes: &[u8]) -> Id {
+    intern(bytes)
+}
+
 /// Only for bytes that cannot pack, or one string would get two IDs.
 fn intern(bytes: &[u8]) -> Id {
     let mut hasher = Mixer::default();

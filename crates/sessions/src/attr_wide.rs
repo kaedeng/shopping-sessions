@@ -130,8 +130,15 @@ impl Attr {
             if at == n || keys[at] >> 32 != keys[first] >> 32 {
                 if at - first > 1 {
                     keys[first..at].sort_unstable_by(|&a, &b| {
-                        let (a, b) = (clicks[a as u32 as usize].id, clicks[b as u32 as usize].id);
-                        if id::less(b, a) { std::cmp::Ordering::Less } else if id::less(a, b) { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Equal }
+                        let (a, b) = (&clicks[a as u32 as usize], &clicks[b as u32 as usize]);
+                        if id::less(b.id, a.id) {
+                            std::cmp::Ordering::Less
+                        } else if id::less(a.id, b.id) {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            crate::note_tie(a, b);
+                            std::cmp::Ordering::Equal
+                        }
                     });
                 }
                 first = at;
@@ -208,6 +215,8 @@ fn smallest(clicks: &[Click], lanes: u16) -> usize {
         rest &= rest - 1;
         if id::less(clicks[lane].id, clicks[best].id) {
             best = lane;
+        } else if !id::less(clicks[best].id, clicks[lane].id) {
+            crate::note_tie(&clicks[lane], &clicks[best]);
         }
     }
     best
@@ -221,6 +230,30 @@ mod tests {
     use super::*;
     use crate::attr_interval;
     use crate::partitioned::sort_clicks_for_test;
+
+    /// Two clicks at one instant under IDs that compare equal, for two campaigns: reported
+    /// wherever the tie is broken (the flag only ever goes up outside this test, so each
+    /// check is of the call before it).
+    #[test]
+    fn reports_a_tie_the_ids_cannot_break() {
+        let twins = |n: usize| -> Vec<Click> {
+            let mut clicks = vec![Click { ts: 100, campaign: 1, id: id::pack(b"k1") }, Click { ts: 100, campaign: 2, id: id::pack(b"k1") }];
+            clicks.extend((2..n).map(|at| Click { ts: at as u32, campaign: 3, id: id::pack(format!("kx{at}").as_bytes()) }));
+            clicks
+        };
+        let (starts, days) = ([200u32], [0u32]);
+        let mut attr = Attr::new(8);
+        let mut assisted = vec![0u32; 8 * DAYS];
+        for n in [2, LIGHT, LIGHT + 4] {
+            crate::reset_tie();
+            let mut credits = [7u32];
+            attr.person(&twins(n), &starts, &days, &mut credits, &mut assisted);
+            assert!(crate::ambiguous_tie(), "{n} clicks");
+            crate::reset_tie();
+            sort_clicks_for_test(&mut twins(n));
+            assert!(crate::ambiguous_tie(), "{n} clicks sorted");
+        }
+    }
 
     /// Random persons through both attributions: the same credits, the same assists.
     #[test]

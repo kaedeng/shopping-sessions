@@ -43,6 +43,11 @@ pub struct Scratch {
     /// A long click run sorted: `ts << 32 | position`, then the clicks in that order.
     order: Vec<u64>,
     sorted: Vec<Click>,
+    /// `bucket_wide`: the person in hand's sessions, one entry each.
+    starts: Vec<u32>,
+    days: Vec<u32>,
+    revenue: Vec<u64>,
+    credits: Vec<u32>,
 }
 
 impl Scratch {
@@ -180,6 +185,7 @@ fn click_order(a: &Click, b: &Click) -> Ordering {
         } else if id::less(b.id, a.id) {
             Ordering::Less
         } else {
+            crate::note_tie(a, b);
             Ordering::Equal
         }
     })
@@ -221,6 +227,77 @@ pub(crate) fn sort_clicks_for_test(clicks: &mut [Click]) -> Vec<Click> {
 #[cfg(feature = "pipe-positional")]
 pub(crate) fn sort_person_clicks<'s>(scratch: &'s mut Scratch, clicks: &'s mut [Click]) -> &'s [Click] {
     sort_clicks(clicks, &mut scratch.order, &mut scratch.sorted)
+}
+
+/// `bucket` with a person's sessions listed first and credited together by `attr-wide`: no
+/// click is sorted, a person with at most 16 clicks is one compare a session, and the assists
+/// of one with more are counted per campaign, not per session and campaign. Returns `false`,
+/// with nothing done, where that attribution is not there (a window of more than 16 days).
+///
+/// The rows, the purchases and the credits are the calls `bucket` makes, a person's credits
+/// after its rows instead of between them.
+#[cfg(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
+pub fn bucket_wide<'a>(
+    ctx: &Ctx,
+    events: impl Iterator<Item = &'a [PersonEvent]> + Clone,
+    clicks: impl Iterator<Item = &'a [ClickRec]> + Clone,
+    agg: &mut Agg,
+) -> bool {
+    let Agg { user_daily, bucket: scratch, rows, wide, day, counters, .. } = agg;
+    let Some(wide) = wide else { return false };
+    let n: usize = events.clone().map(<[_]>::len).sum();
+    let ts_bits = ctx.ts_bits;
+    scratch.reset(n, ctx.bucket_bits);
+    rows.clear(n);
+    for piece in events {
+        rows.extend(piece.iter().map(|event| {
+            debug_assert!(event.ts >= ctx.event_lo && event.ts < ctx.ts_end);
+            (u64::from(scratch.intern(event.person)) << ts_bits | u64::from(event.ts), event.pay)
+        }));
+    }
+    let persons = scratch.persons.len();
+    rows.sort(ts_bits + (usize::BITS - persons.leading_zeros()), ts_bits);
+    scratch.gather_clicks(clicks);
+
+    let Scratch { persons: names, click_end, clicks: grouped, starts, days, revenue, credits, .. } = scratch;
+    let ts_mask = (1u64 << ts_bits) - 1;
+    let organic = ctx.organic();
+    let (mut at, mut first_click) = (0, 0);
+    for local in 0..persons {
+        let person = names[local];
+        let end_click = click_end[local] as usize;
+        let clicks = &grouped[first_click..end_click];
+        first_click = end_click;
+        starts.clear();
+        days.clear();
+        revenue.clear();
+        loop {
+            let first = at;
+            let start = (rows.key(at) & ts_mask) as u32;
+            at += 1;
+            // The sentinel key ends the last session of the bucket.
+            while rows.key(at) - rows.key(at - 1) <= GAP {
+                at += 1;
+            }
+            let d = (ctx.day_of(start) - ctx.day0) as usize;
+            day.session(d, at - first, person, ctx.day0, user_daily);
+            revenue.push(rows.purchases(first..at, |price, category| day.purchase(price, category)));
+            starts.push(start);
+            days.push(d as u32);
+            if rows.key(at) >> ts_bits != local as u64 {
+                break;
+            }
+        }
+        day.flush(person, ctx.day0, user_daily);
+        credits.clear();
+        credits.resize(starts.len(), organic);
+        wide.person(clicks, starts, days, credits, counters.wide());
+        for ((&campaign, &d), &paid) in credits.iter().zip(days.iter()).zip(revenue.iter()) {
+            counters.credit(campaign, d as usize, paid);
+        }
+    }
+    debug_assert_eq!(at, n);
+    true
 }
 
 /// `STRETCH` picks the attribution: `attr-interval` (assists counted per stretch of sessions)

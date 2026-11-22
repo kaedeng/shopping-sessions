@@ -7,6 +7,8 @@
 //! Built with `--features trace`, `SS_TRACE=FILE` saves every task as a span (`types::par::trace`).
 
 #[cfg(feature = "pipe-positional")]
+mod opaque;
+#[cfg(feature = "pipe-positional")]
 mod positional;
 #[cfg(feature = "alloc-region")]
 mod region;
@@ -45,6 +47,9 @@ struct Scattered {
     events: Parts<PersonEvent>,
     clicks: Parts<ClickRec>,
     scratch: dedup::Scratch,
+    /// The opaque pipeline's dedup buffers (`opaque::stages`).
+    #[cfg(feature = "pipe-positional")]
+    opaque: opaque::Scratch,
 }
 
 fn dir(var: &str, default: &str) -> PathBuf {
@@ -131,14 +136,17 @@ fn run() -> Result<(), String> {
     // below. Today's IDs carry none, so the pick is `classic`, which never tries it; `auto`
     // tries it, and `positional` runs it whatever the sample says (exact either way; for
     // tests).
+    //
+    // The pick is `opaque` (`opaque::stages`): the same three stages with the parse and the
+    // dedup made for IDs that are opaque strings of two widths.
     #[cfg(feature = "pipe-positional")]
-    let positional = {
-        const PIPES: &[&str] = &["classic", "auto", "positional"];
+    let (positional, opaque) = {
+        const PIPES: &[&str] = &["opaque", "classic", "auto", "positional"];
         let pipe = PIPES[types::env::pick("SS_PIPE", PIPES)];
-        (pipe != "classic").then_some(pipe == "positional")
+        ((pipe == "auto" || pipe == "positional").then_some(pipe == "positional"), pipe == "opaque")
     };
     #[cfg(not(feature = "pipe-positional"))]
-    let positional = None;
+    let (positional, opaque) = (None, false);
     let opened = ingest::open(&data, workers, positional, keep_open)?;
     let (ctx, ingest) = (opened.ctx, opened.ingest);
     let parallel_alloc = ALLOC[types::env::pick("SS_ALLOC", ALLOC)] == "parallel";
@@ -162,69 +170,123 @@ fn run() -> Result<(), String> {
     }
 
     // Stage 1. Task 0 is the union-find, the only serial job; its worker then joins the parse.
-    let mut parsed: Vec<ParseOut> = par::init(ctx.workers, parallel_alloc, |_| ingest.new_out(&ctx));
-    let link_table = OnceLock::new();
-    par::run(&mut parsed, ingest.tasks() + 1, |_, out, task| match task {
-        0 => drop(link_table.set(links::build(&ingest.links()))),
-        _ => ingest.parse(&ctx, task - 1, out),
-    });
-    let link_table = link_table.get().expect("task 0 ran");
-    lap("parse");
-
-    // Stage 2. Each dedup partition, then its survivors' persons; clicks only need the person.
-    let (parts, buckets) = (1usize << ctx.part_bits, 1usize << ctx.bucket_bits);
-    let click_tasks: Vec<(usize, usize)> = parsed
-        .iter()
-        .enumerate()
-        .flat_map(|(worker, out)| (0..out.clicks.len()).step_by(CLICK_TASK).map(move |start| (worker, start)))
-        .collect();
-    let events: usize = parsed.iter().map(|out| out.parts.len()).sum();
-    let clicks: usize = parsed.iter().map(|out| out.clicks.len()).sum();
-    let room = |rows: usize| rows / ctx.workers / buckets * 9 / 8 + 64;
-    let mut scattered: Vec<Scattered> = par::init(ctx.workers, parallel_alloc, |_| Scattered {
-        events: Parts::new(buckets, room(events), scatter),
-        clicks: Parts::new(buckets, room(clicks), scatter),
-        scratch: Default::default(),
-    });
-    par::run(&mut scattered, parts + click_tasks.len(), |_, mine, task| {
-        if task < parts {
-            let pieces = parsed.iter().flat_map(|out| out.parts.pieces(task));
-            let kept = dedup::partition(pieces, ctx.part_bits, &mut mine.scratch);
-            links::scatter_events(link_table, kept, ctx.bucket_bits, &mut mine.events);
-        } else {
-            let (worker, start) = click_tasks[task - parts];
-            let clicks = &parsed[worker].clicks;
-            let end = clicks.len().min(start + CLICK_TASK);
-            links::scatter_clicks(link_table, &clicks[start..end], ctx.bucket_bits, &mut mine.clicks);
-        }
-    });
-    lap("dedup");
-    // Lists that outgrew their carved room and spilled into a `Vec` (`types::parts`), counted
-    // before `free-early` empties them.
-    let spilled = |count: usize, of: usize| format!("{count} of {of}");
-    let spilled_partitions = spilled(parsed.iter().map(|out| out.parts.spilled()).sum(), parts * ctx.workers);
-    let spilled_events = spilled(scattered.iter().map(|mine| mine.events.spilled()).sum(), buckets * ctx.workers);
-    let spilled_clicks = spilled(scattered.iter().map(|mine| mine.clicks.spilled()).sum(), buckets * ctx.workers);
-    // Slot `free-early`: the dedup partitions and the parsed clicks are dead; each worker hands
-    // its own back to the kernel, so their pages are not left for the one thread that exits.
+    let buckets = 1usize << ctx.bucket_bits;
     let free_early = types::mem::free_early();
-    if free_early {
-        par::each(&mut parsed, |_, out| out.release());
-    }
+    let spilled = |count: usize, of: usize| format!("{count} of {of}");
+    // The stages up to the sessions, once; twice when the sessions stage says that the
+    // long `click_id`s, kept by their first 9 bytes, left a tie between two campaigns'
+    // clicks open (`ingest::opaque::click_id_at`): then with those IDs whole.
+    #[cfg(feature = "pipe-positional")]
+    let mut whole_clicks = types::env::pick("SS_CLICK_IDS", &["first", "whole"]) == 1;
+    let (mut scattered, mut aggs, names, spilled_partitions, spilled_events, spilled_clicks) = loop {
+        // Stages 1 and 2: the person buckets, by the pipeline picked.
+        #[cfg(feature = "pipe-positional")]
+        let mut names = None;
+        #[cfg(feature = "pipe-positional")]
+        let staged = opaque.then(|| {
+            // A directory too small for the input's users (far more of them a line than
+            // generated data has) is found out by the parse: once more with four times the room.
+            let mut grow = 0;
+            loop {
+                if let Some(staged) = opaque::stages(&ctx, &ingest, grow, whole_clicks, parallel_alloc, scatter, &mut lap) {
+                    break staged;
+                }
+                if timing {
+                    eprintln!("opaque: the users' directory was too small, starting over");
+                }
+                grow += 2;
+            }
+        });
+        #[cfg(not(feature = "pipe-positional"))]
+        let staged: Option<(Vec<Scattered>, ())> = None;
+        let (scattered, spilled_partitions) = if let Some(staged) = staged {
+            #[cfg(feature = "pipe-positional")]
+            {
+                names = Some(staged.names);
+                (staged.scattered, spilled(0, 0))
+            }
+            #[cfg(not(feature = "pipe-positional"))]
+            (staged.0, spilled(0, 0))
+        } else {
+            let mut parsed: Vec<ParseOut> = par::init(ctx.workers, parallel_alloc, |_| ingest.new_out(&ctx));
+            let link_table = OnceLock::new();
+            par::run(&mut parsed, ingest.tasks() + 1, |_, out, task| match task {
+                0 => drop(link_table.set(links::build(&ingest.links()))),
+                _ => ingest.parse(&ctx, task - 1, out),
+            });
+            let link_table = link_table.get().expect("task 0 ran");
+            lap("parse");
 
-    // Stage 3. Person buckets, largest first so a whale's bucket is not the last to start.
-    let mut order: Vec<usize> = (0..buckets).collect();
-    order.sort_by_cached_key(|&bucket| {
-        std::cmp::Reverse(scattered.iter().map(|mine| mine.events.len_of(bucket)).sum::<usize>())
-    });
-    let mut aggs: Vec<Agg> = par::init(ctx.workers, parallel_alloc, |_| Agg::new(&ctx));
-    par::run(&mut aggs, buckets, |_, agg, task| {
-        let bucket = order[task];
-        let events = scattered.iter().flat_map(|mine| mine.events.pieces(bucket));
-        let clicks = scattered.iter().flat_map(|mine| mine.clicks.pieces(bucket));
-        sessions::bucket(&ctx, events, clicks, agg);
-    });
-    lap("sessions");
+            // Stage 2. Each dedup partition, then its survivors' persons; clicks only need the person.
+            let parts = 1usize << ctx.part_bits;
+            let click_tasks: Vec<(usize, usize)> = parsed
+                .iter()
+                .enumerate()
+                .flat_map(|(worker, out)| (0..out.clicks.len()).step_by(CLICK_TASK).map(move |start| (worker, start)))
+                .collect();
+            let events: usize = parsed.iter().map(|out| out.parts.len()).sum();
+            let clicks: usize = parsed.iter().map(|out| out.clicks.len()).sum();
+            let room = |rows: usize| rows / ctx.workers / buckets * 9 / 8 + 64;
+            let mut scattered: Vec<Scattered> = par::init(ctx.workers, parallel_alloc, |_| Scattered {
+                events: Parts::new(buckets, room(events), scatter),
+                clicks: Parts::new(buckets, room(clicks), scatter),
+                scratch: Default::default(),
+                #[cfg(feature = "pipe-positional")]
+                opaque: Default::default(),
+            });
+            par::run(&mut scattered, parts + click_tasks.len(), |_, mine, task| {
+                if task < parts {
+                    let pieces = parsed.iter().flat_map(|out| out.parts.pieces(task));
+                    let kept = dedup::partition(pieces, ctx.part_bits, &mut mine.scratch);
+                    links::scatter_events(link_table, kept, ctx.bucket_bits, &mut mine.events);
+                } else {
+                    let (worker, start) = click_tasks[task - parts];
+                    let clicks = &parsed[worker].clicks;
+                    let end = clicks.len().min(start + CLICK_TASK);
+                    links::scatter_clicks(link_table, &clicks[start..end], ctx.bucket_bits, &mut mine.clicks);
+                }
+            });
+            lap("dedup");
+            // Lists that outgrew their carved room and spilled into a `Vec` (`types::parts`), counted
+            // before `free-early` empties them.
+            let spilled_partitions = spilled(parsed.iter().map(|out| out.parts.spilled()).sum(), parts * ctx.workers);
+            // Slot `free-early`: the dedup partitions and the parsed clicks are dead; each worker hands
+            // its own back to the kernel, so their pages are not left for the one thread that exits.
+            if free_early {
+                par::each(&mut parsed, |_, out| out.release());
+            }
+            (scattered, spilled_partitions)
+        };
+        let spilled_events = spilled(scattered.iter().map(|mine| mine.events.spilled()).sum(), buckets * ctx.workers);
+        let spilled_clicks = spilled(scattered.iter().map(|mine| mine.clicks.spilled()).sum(), buckets * ctx.workers);
+
+        // Stage 3. Person buckets, largest first so a whale's bucket is not the last to start.
+        let mut order: Vec<usize> = (0..buckets).collect();
+        order.sort_by_cached_key(|&bucket| {
+            std::cmp::Reverse(scattered.iter().map(|mine| mine.events.len_of(bucket)).sum::<usize>())
+        });
+        let mut aggs: Vec<Agg> = par::init(ctx.workers, parallel_alloc, |_| Agg::new(&ctx));
+        par::run(&mut aggs, buckets, |_, agg, task| {
+            let bucket = order[task];
+            let events = scattered.iter().flat_map(|mine| mine.events.pieces(bucket));
+            let clicks = scattered.iter().flat_map(|mine| mine.clicks.pieces(bucket));
+            sessions::bucket(&ctx, events, clicks, agg);
+        });
+        lap("sessions");
+        #[cfg(feature = "pipe-positional")]
+        if opaque && !whole_clicks && sessions::ambiguous_tie() {
+            if timing {
+                eprintln!("opaque: a tie between two long click_ids of one beginning, starting over with them whole");
+            }
+            whole_clicks = true;
+            // The exit path skips destructors (`fast-exit`); so does this one.
+            std::mem::forget((scattered, aggs, names));
+            continue;
+        }
+        #[cfg(not(feature = "pipe-positional"))]
+        let names: Option<()> = None;
+        break (scattered, aggs, names, spilled_partitions, spilled_events, spilled_clicks);
+    };
 
     let (user_folder, campaign_folder) = (out.join("user_daily"), out.join("campaign_daily"));
     for folder in [&user_folder, &campaign_folder] {
@@ -234,7 +296,16 @@ fn run() -> Result<(), String> {
     let mut outputs: Vec<(&mut Agg, &mut Scattered)> = aggs.iter_mut().zip(&mut scattered).collect();
     par::each(&mut outputs, |worker, (agg, mine)| {
         let rows = std::mem::take(&mut agg.user_daily);
-        if let Err(error) = output::user_daily(&user_folder, worker, &ctx, rows) {
+        // The opaque pipeline's persons are places in its directory: the writer asks for
+        // their names.
+        #[cfg(feature = "pipe-positional")]
+        let written = match &names {
+            Some(names) => output::user_daily_named(&user_folder, worker, &ctx, rows, &|key, out| names.text(key, out)),
+            None => output::user_daily(&user_folder, worker, &ctx, rows),
+        };
+        #[cfg(not(feature = "pipe-positional"))]
+        let written = output::user_daily(&user_folder, worker, &ctx, rows);
+        if let Err(error) = written {
             drop(failure.set(error));
         }
         // Slot `free-early`: the person buckets are dead since the sessions stage.
@@ -253,6 +324,7 @@ fn run() -> Result<(), String> {
         eprintln!("total    {:>8.1} ms", started.elapsed().as_secs_f64() * 1e3);
         eprintln!("spilled: {spilled_partitions} partitions, {spilled_events} event buckets, {spilled_clicks} click buckets");
     }
+    types::tl::report();
     #[cfg(feature = "trace")]
     if let Some(path) = std::env::var_os("SS_TRACE") {
         // One name per `par` scope, in order: each `par::init` and `par::each` is a stage of its own.

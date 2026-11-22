@@ -1,5 +1,6 @@
 #!/bin/sh
-# The positional pipeline against the classic one, exactly, on generated data (positional.md).
+# The default pipeline (opaque IDs) and the positional one against the classic one, exactly, on
+# generated data.
 # Run inside a container that has the release binary, the generator, python3 and Polars:
 #   BIN       the binary (default /target/release/shopping-sessions)
 #   GEN       the generator (default /gen/release/generate)
@@ -48,11 +49,12 @@ for spec in $specs; do
   mkdir -p "$WORK/classic"
   env DATA_DIR="$WORK/data" OUTPUT_DIR="$WORK/classic" SS_PIPE=classic "$BIN" || { echo "classic failed for $spec"; fail=1; continue; }
   if [ "$mode" = spoiled ]; then
+    compare "$spec" SS_PIPE=opaque
+    compare "$spec" SS_PIPE=opaque SS_DECODE=row NCPU=2
+    compare "$spec" SS_PIPE=opaque SS_CLICK_IDS=whole
     compare "$spec" SS_PIPE=auto
-    compare "$spec" SS_PIPE=positional
-    compare "$spec" SS_POS_DECODE=row NCPU=2
   else
-    compare "$spec" SS_PIPE=auto
+    compare "$spec" SS_PIPE=opaque
     for setting in "$@"; do
       # shellcheck disable=SC2086
       compare "$spec" $setting

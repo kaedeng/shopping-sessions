@@ -44,6 +44,34 @@ pub struct Click {
     pub id: Id,
 }
 
+/// Set once a tie between two clicks could not be told apart: see `ambiguous_tie`.
+static AMBIGUOUS_TIE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Two clicks of one person with the same `ts` whose IDs compare equal, met where the smaller
+/// `click_id` decides: copies of one click (the same campaign) are no matter, but two campaigns
+/// under one ID mean the IDs as kept do not tell the clicks apart.
+#[cold]
+#[inline(never)]
+pub(crate) fn note_tie(a: &Click, b: &Click) {
+    if a.campaign != b.campaign {
+        AMBIGUOUS_TIE.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether any tie so far was between two clicks with IDs that compare equal and different
+/// campaigns: the credit of some session then rests on an order the IDs as kept cannot give
+/// (a long `click_id` kept by its first bytes), and the caller should run again with the IDs
+/// whole. Every place a tie is broken reports here: the classic click sort (`attr-sweep` and
+/// `attr-interval` read its order) and `attr-wide`'s two kernels.
+pub fn ambiguous_tie() -> bool {
+    AMBIGUOUS_TIE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_tie() {
+    AMBIGUOUS_TIE.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(not(any(feature = "sort-radix", feature = "sort-grouped", feature = "sort-std")))]
 compile_error!("sessions needs a key sort: enable `sort-radix`, `sort-grouped` or `sort-std`");
 
@@ -168,6 +196,16 @@ pub fn bucket<'a>(
     clicks: impl Iterator<Item = &'a [ClickRec]> + Clone,
     agg: &mut Agg,
 ) {
+    // `SS_CLASSIC_ATTR=wide|sweep`: a person's sessions credited together by `attr-wide` where
+    // the build and the window allow it, or session by session by `attr-sweep`.
+    #[cfg(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f", target_feature = "avx512cd"))]
+    {
+        static WIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *WIDE.get_or_init(|| types::env::pick("SS_CLASSIC_ATTR", &["wide", "sweep"]) == 0) && agg.wide.is_some() {
+            partitioned::bucket_wide(ctx, events, clicks, agg);
+            return;
+        }
+    }
     partitioned::bucket::<false>(ctx, events, clicks, agg)
 }
 

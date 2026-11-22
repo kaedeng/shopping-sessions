@@ -285,8 +285,9 @@ fn footer(columns: &[Column], rows: usize, chunks: &[Chunk]) -> Vec<u8> {
 
 /// The `user_id` column: (dictionary page body, data page body, dictionary entries). A name
 /// enters the dictionary whenever it differs from the row before, and the values are one RLE
-/// run of that entry's index for the rows that share it.
-fn names(person: &[Id]) -> (Vec<u8>, Vec<u8>, usize) {
+/// run of that entry's index for the rows that share it. With `text_of`, a row's `Id` is not
+/// a name but the caller's key for one, and `text_of` appends the name's bytes.
+fn names(person: &[Id], text_of: Option<Names>) -> (Vec<u8>, Vec<u8>, usize) {
     // 13 bytes a name at most while packed; slow-path IDs grow the buffer.
     let mut dictionary: Vec<u8> = Vec::with_capacity(person.len() / 2 * 13 + 64);
     let mut runs: Vec<u32> = Vec::with_capacity(person.len() / 2 + 16);
@@ -298,7 +299,12 @@ fn names(person: &[Id]) -> (Vec<u8>, Vec<u8>, usize) {
         while end < person.len() && person[end] == id {
             end += 1;
         }
-        if id & SLOW != 0 {
+        if let Some(text_of) = text_of {
+            text.clear();
+            text_of(id, &mut text);
+            dictionary.extend_from_slice(&(text.len() as u32).to_le_bytes());
+            dictionary.extend_from_slice(&text);
+        } else if id & SLOW != 0 {
             text.clear();
             id::unpack(id, &mut text);
             dictionary.extend_from_slice(&(text.len() as u32).to_le_bytes());
@@ -358,12 +364,15 @@ fn bytes_of<T: Copy>(values: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), std::mem::size_of_val(values)) }
 }
 
-pub fn user_daily(folder: &Path, worker: usize, ctx: &Ctx, rows: UserDaily) -> Result<(), String> {
+pub fn user_daily(folder: &Path, worker: usize, ctx: &Ctx, rows: UserDaily, text_of: Option<Names>) -> Result<(), String> {
     let path = folder.join(format!("part-{worker}.parquet"));
-    write(&path, ctx, &rows).map_err(|error| format!("{}: {error}", path.display()))
+    write(&path, ctx, &rows, text_of).map_err(|error| format!("{}: {error}", path.display()))
 }
 
-fn write(path: &Path, ctx: &Ctx, table: &UserDaily) -> Result<(), String> {
+/// Appends the name a row's key stands for (`crate::user_daily_named`).
+pub type Names<'a> = &'a (dyn Fn(Id, &mut Vec<u8>) + Sync);
+
+fn write(path: &Path, ctx: &Ctx, table: &UserDaily, text_of: Option<Names>) -> Result<(), String> {
     let io = |error: std::io::Error| error.to_string();
     let UserDaily { person, day, sessions, events, revenue_cents, top_category } = table;
     let rows = person.len();
@@ -374,7 +383,7 @@ fn write(path: &Path, ctx: &Ctx, table: &UserDaily) -> Result<(), String> {
     let mut offset = 4u64;
     if rows > 0 {
         // `user_id`: the dictionary page, then the data page of runs.
-        let (dictionary, values, entries) = names(person);
+        let (dictionary, values, entries) = names(person, text_of);
         let dictionary_at = offset;
         let header = page_header(DICTIONARY_PAGE, dictionary.len(), entries, PLAIN)?;
         offset += (header.len() + dictionary.len()) as u64;
@@ -554,7 +563,7 @@ mod tests {
                 revenue_cents: table.revenue_cents.clone(),
                 top_category: table.top_category.clone(),
             };
-            user_daily(&direct, 3, &ctx, table).unwrap();
+            user_daily(&direct, 3, &ctx, table, None).unwrap();
             crate::arrow::user_daily(&arrow, 3, &ctx, copy).unwrap();
             let got = read(&direct.join("part-3.parquet"));
             assert_eq!(got.len(), want.len(), "case {case}");

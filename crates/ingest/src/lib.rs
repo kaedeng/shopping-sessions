@@ -5,6 +5,8 @@
 //! CONTRACT (the binary depends on exactly this; the bodies are the implementer's).
 
 #[cfg(feature = "pipe-positional")]
+pub mod opaque;
+#[cfg(feature = "pipe-positional")]
 pub mod pos;
 mod tok;
 mod ts;

@@ -26,6 +26,8 @@ pub mod scramble;
 pub mod table;
 pub mod time;
 pub mod tl;
+#[cfg(feature = "pipe-positional")]
+pub mod users;
 
 pub use ctx::Ctx;
 pub use id::Id;
