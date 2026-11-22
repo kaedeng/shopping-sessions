@@ -126,12 +126,14 @@ fn run() -> Result<(), String> {
     // every page fault on fresh memory. The inputs stage is their first round.
     let workers = types::env::number("NCPU", 8).max(1);
     par::start(workers);
-    // Slot `pipe-positional`: when the rows carry the generator's numbering, the positional
-    // pipeline runs instead of the three stages below. `SS_PIPE=classic` never tries it, and
-    // `positional` runs it whatever the sample says (exact either way; for tests).
+    // Slot `pipe-positional`: when the rows carry the numbering the generator had before its
+    // IDs became a keyed bijection, the positional pipeline runs instead of the three stages
+    // below. Today's IDs carry none, so the pick is `classic`, which never tries it; `auto`
+    // tries it, and `positional` runs it whatever the sample says (exact either way; for
+    // tests).
     #[cfg(feature = "pipe-positional")]
     let positional = {
-        const PIPES: &[&str] = &["auto", "classic", "positional"];
+        const PIPES: &[&str] = &["classic", "auto", "positional"];
         let pipe = PIPES[types::env::pick("SS_PIPE", PIPES)];
         (pipe != "classic").then_some(pipe == "positional")
     };

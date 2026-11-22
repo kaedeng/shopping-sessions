@@ -93,6 +93,8 @@ struct Links {
 const NONE: u8 = 0;
 const ONE: u8 = 1;
 const MIXED: u8 = 2;
+/// Links `Links::build` asks for a person's entries ahead of.
+const LINKS_AHEAD: usize = 16;
 
 /// A link between two aliases of one person.
 #[derive(Clone, Copy)]
@@ -119,7 +121,16 @@ impl Links {
         // A person's mask grows from its first link by every link that touches it. A link that
         // touches none of it yet is set apart: a later one may join the two.
         let mut apart: Vec<u32> = Vec::new();
-        for link in pairs {
+        for (at, link) in pairs.iter().enumerate() {
+            // The entries of the person a few links on, asked for now: the links come in no
+            // order, and each waited for three lines of arrays the size of all persons (70 ns
+            // a link, 62 ms of one thread at 20M events).
+            if let Some(next) = pairs.get(at + LINKS_AHEAD) {
+                let person = (scramble::number(next.scrambled[0], plan.user_key) >> ALIAS_BITS) as usize;
+                types::mem::prefetch(mask.as_ptr().wrapping_add(person));
+                types::mem::prefetch(name.as_ptr().wrapping_add(person));
+                types::mem::prefetch(state.as_ptr().wrapping_add(person));
+            }
             let pair = link.ids;
             let [x, y] = link.scrambled.map(number);
             match (x, y) {
@@ -149,6 +160,7 @@ impl Links {
                 }
             }
         }
+        types::tl::mark("links by person");
         // Until none joins: what then stays apart is a second component of its person.
         loop {
             let before = apart.len();
@@ -177,6 +189,7 @@ impl Links {
                 state[person] = ONE;
             }
         }
+        types::tl::mark("links judged");
         Links { state, mask, name, general: links::build(&general), user_key: plan.user_key }
     }
 

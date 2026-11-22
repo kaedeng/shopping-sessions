@@ -1025,7 +1025,8 @@ fn links_with<T: Tok>(ingest: &Ingest) -> Vec<[Id; 2]> {
 #[inline(always)]
 unsafe fn event_row<M: Mode>(ctx: &Ctx, dates: &Dates, shift: u32, fields: &[Field; 7], parts: &mut Parts<EventRec>) {
     let [id, user, ts, ingest, kind, product, price] = *fields;
-    let id = unsafe { pack_at(id.p, id.len) };
+    // Only ever a key: the dedup compares it and nothing else reads it.
+    let id = unsafe { types::id::key_at(id.p, id.len) };
     if id == 0 {
         return;
     }

@@ -3,17 +3,20 @@
 //! - `0`: the empty ID, an empty field. Never a key in any table, so tables use it for "free".
 //! - top bit clear: 1 to 9 ASCII bytes, 7 bits each, the first byte in bits 62..56, zero-padded
 //!   below. Two packed IDs compare as their bytes do.
-//! - top bit set (`SLOW`): the slow path, an index into the global intern list. Taken by an ID
+//! - top bit set (`SLOW`): the slow path, a place in the global intern tables. Taken by an ID
 //!   longer than 9 bytes, or holding a byte >= 0x80 or a 0x00 (which would pack like padding).
 //!   Equal bytes always give the equal `u64`, so hashing and `==` need no special case; only
 //!   order does, and `less` handles it.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Mutex, OnceLock};
 
 pub type Id = u64;
 pub const EMPTY: Id = 0;
 pub const SLOW: Id = 1 << 63;
+/// With `SLOW`: not a place in the intern tables but a hash of the ID's bytes (`key_at`).
+pub const HASHED: Id = SLOW | 1 << 62;
 
 const HIGH: u64 = 0x8080_8080_8080_8080;
 const ONES: u64 = 0x0101_0101_0101_0101;
@@ -65,6 +68,29 @@ pub unsafe fn pack_at(p: *const u8, len: usize) -> Id {
     (squeeze(word.swap_bytes()) << 7) | ninth
 }
 
+/// An ID that is only ever compared for equality (an `event_id`: nothing reads its bytes or
+/// orders it): `pack_at` for up to 9 bytes, and for more a hash of the bytes with `HASHED` on
+/// top. One ID in eight is 33 bytes, each `event_id` is its own, and interning two and a
+/// half million of them was half of the parse at 20M events. Two long IDs get one key with a
+/// chance of 2^-62 a pair: about one run in 200,000 at 60M events.
+///
+/// # Safety
+/// As `pack_at`, and `len` bytes readable at `p`.
+#[inline(always)]
+pub unsafe fn key_at(p: *const u8, len: usize) -> Id {
+    if len > 9 {
+        return unsafe { hashed_at(p, len) };
+    }
+    unsafe { pack_at(p, len) }
+}
+
+#[inline(never)]
+unsafe fn hashed_at(p: *const u8, len: usize) -> Id {
+    let mut hasher = Mixer::default();
+    hasher.write(unsafe { std::slice::from_raw_parts(p, len) });
+    HASHED | hasher.finish() >> 2
+}
+
 /// The ID of `bytes`, for cold paths: the lookup files, tests.
 pub fn pack(bytes: &[u8]) -> Id {
     if bytes.len() > 9 {
@@ -87,7 +113,7 @@ pub fn spread(id: Id) -> (u64, u8, usize) {
 /// Appends the ID's bytes to `out`.
 pub fn unpack(id: Id, out: &mut Vec<u8>) {
     if id & SLOW != 0 {
-        out.extend_from_slice(&interner().lock().unwrap().list[(id & !SLOW) as usize]);
+        with_bytes(id, |bytes| out.extend_from_slice(bytes));
         return;
     }
     let (word, ninth, len) = spread(id);
@@ -155,15 +181,70 @@ pub mod wide {
     }
 }
 
+/// The slow path's IDs, in `SHARDS` tables picked by the bytes' hash: an ID is its table's
+/// number and its place in that table's list. (As one table behind one mutex, every worker
+/// of the parse queued for it once one ID in eight was longer than 9 bytes: 6.3 s of a 6.7 s
+/// run at 20M events.)
 #[derive(Default)]
-struct Interner {
-    map: HashMap<Box<[u8]>, Id>,
+struct Shard {
+    map: HashMap<Box<[u8]>, Id, BuildHasherDefault<Mixer>>,
     list: Vec<Box<[u8]>>,
 }
 
-fn interner() -> &'static Mutex<Interner> {
-    static INTERNER: OnceLock<Mutex<Interner>> = OnceLock::new();
-    INTERNER.get_or_init(Default::default)
+const SHARD_BITS: u32 = 10;
+const SHARDS: usize = 1 << SHARD_BITS;
+/// Bits of an ID's place in its shard's list, below the shard's number.
+const PLACE_BITS: u32 = 40;
+
+/// A multiply and a fold a word: the IDs are short, and the default hasher was most of the
+/// time spent here.
+#[derive(Default)]
+struct Mixer(u64);
+
+impl Mixer {
+    #[inline(always)]
+    fn mix(&mut self, word: u64) {
+        let wide = u128::from(self.0 ^ word) * 0x9E37_79B9_7F4A_7C15_F39C_C060_5CED_C835u128;
+        self.0 = (wide as u64) ^ (wide >> 64) as u64;
+    }
+}
+
+impl Hasher for Mixer {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.mix(u64::from_le_bytes(chunk.try_into().expect("8 bytes")));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut last = [0u8; 8];
+            last[..rest.len()].copy_from_slice(rest);
+            self.mix(u64::from_le_bytes(last) ^ (rest.len() as u64) << 56);
+        }
+    }
+
+    #[inline]
+    fn write_usize(&mut self, value: usize) {
+        self.mix(value as u64);
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+fn shards() -> &'static [Mutex<Shard>] {
+    static SHARDS_OF: OnceLock<Vec<Mutex<Shard>>> = OnceLock::new();
+    SHARDS_OF.get_or_init(|| (0..SHARDS).map(|_| Mutex::default()).collect())
+}
+
+/// The bytes of slow-path ID `id`, handed to `read`.
+fn with_bytes<T>(id: Id, read: impl FnOnce(&[u8]) -> T) -> T {
+    let (shard, place) = (((id & !SLOW) >> PLACE_BITS) as usize, (id & ((1 << PLACE_BITS) - 1)) as usize);
+    let shard = shards()[shard].lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    read(&shard.list[place])
 }
 
 #[cold]
@@ -174,13 +255,17 @@ unsafe fn intern_at(p: *const u8, len: usize) -> Id {
 
 /// Only for bytes that cannot pack, or one string would get two IDs.
 fn intern(bytes: &[u8]) -> Id {
-    let mut interner = interner().lock().unwrap();
-    if let Some(&id) = interner.map.get(bytes) {
+    let mut hasher = Mixer::default();
+    hasher.write(bytes);
+    // Not the bits the table itself takes from this hash: its low ones and its top seven.
+    let number = (hasher.finish() >> 32) as usize & (SHARDS - 1);
+    let mut shard = shards()[number].lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(&id) = shard.map.get(bytes) {
         return id;
     }
-    let id = SLOW | interner.list.len() as u64;
-    interner.list.push(bytes.into());
-    interner.map.insert(bytes.into(), id);
+    let id = SLOW | (number as u64) << PLACE_BITS | shard.list.len() as u64;
+    shard.list.push(bytes.into());
+    shard.map.insert(bytes.into(), id);
     id
 }
 
