@@ -434,6 +434,14 @@ impl Users {
         // slot's key mine" was a quarter of the parse's wrong guesses). A key goes into the
         // first empty slot of the first line that has one, and no key ever leaves: a lookup
         // that meets an empty slot has seen every place its key could be.
+        //
+        // Where the key is and where the first empty slot is are both taken from ONE
+        // reading of the line. From two readings, another thread's claim of that slot
+        // for this same key between them was seen by neither: the first found no such
+        // key, the second found the slot taken and went on to the next, and the key got
+        // a second slot and a second number (a user counted as two). A build that
+        // optimizes made one reading of the two; the tests' build did not, and failed
+        // one run in five.
         let mut at = (mix(key) >> self.short_shift) as usize & !(LINE - 1);
         for _ in 0..PROBES / LINE {
             // SAFETY: `at` is masked to the table, whose slots are a multiple of `LINE`: the
@@ -441,11 +449,10 @@ impl Users {
             let line = unsafe { std::slice::from_raw_parts(self.short.as_ptr().add(at & mask).cast::<AtomicU64>(), 2 * LINE) };
             loop {
                 // Bit `2 * n` for slot `n`.
-                let hit = Self::keys(line, key);
+                let (hit, empty) = Self::keys(line, key);
                 if hit != 0 {
                     return Self::numbered(&line[(hit.trailing_zeros() as usize + 1) & (2 * LINE - 1)]);
                 }
-                let empty = Self::keys(line, 0);
                 if empty == 0 {
                     break;
                 }
@@ -466,9 +473,10 @@ impl Users {
         self.overflow()
     }
 
-    /// Which of a line's four keys (its even words) are `key`: bit `2 * n` for slot `n`.
+    /// Which of a line's four keys (its even words) are `key`, and which of its slots are
+    /// empty, as one reading of the line has them: bit `2 * n` for slot `n`.
     #[inline(always)]
-    fn keys(line: &[AtomicU64], key: u64) -> u32 {
+    fn keys(line: &[AtomicU64], key: u64) -> (u32, u32) {
         debug_assert!(line.len() == 2 * LINE);
         // The line's 64 bytes in one register (the table is aligned far above a line, and a
         // line begins at a multiple of four slots).
@@ -478,16 +486,19 @@ impl Users {
         // here is zero or a key some thread put there, as a relaxed load of it would be.
         unsafe {
             use core::arch::x86_64::*;
-            let slots = _mm512_load_si512(line.as_ptr().cast());
-            u32::from(_mm512_cmpeq_epi64_mask(slots, _mm512_set1_epi64(key as i64)) & 0x55)
+            // Volatile: one reading, whatever the build makes of the code around it.
+            let slots = line.as_ptr().cast::<__m512i>().read_volatile();
+            (u32::from(_mm512_cmpeq_epi64_mask(slots, _mm512_set1_epi64(key as i64)) & 0x55), u32::from(_mm512_testn_epi64_mask(slots, slots) & 0x55))
         }
         #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
         {
-            let mut hit = 0u32;
+            let (mut hit, mut empty) = (0u32, 0u32);
             for slot in 0..LINE {
-                hit |= u32::from(line[2 * slot].load(Relaxed) == key) << (2 * slot);
+                let held = line[2 * slot].load(Relaxed);
+                hit |= u32::from(held == key) << (2 * slot);
+                empty |= u32::from(held == 0) << (2 * slot);
             }
-            hit
+            (hit, empty)
         }
     }
 
@@ -808,6 +819,36 @@ mod tests {
             }
         }
         assert_eq!(place(b""), NO_USER);
+    }
+
+    /// Every thread looks the same new keys up at the same moment, round after round: a
+    /// key has one number whichever thread claimed its slot.
+    #[test]
+    fn threads_that_meet_on_a_new_key_get_one_number() {
+        const THREADS: usize = 8;
+        const KEYS: u64 = 4;
+        for round in 0..3_000u64 {
+            let users = Users::new(64, 64);
+            let go = std::sync::Barrier::new(THREADS);
+            let got: Vec<Vec<u32>> = std::thread::scope(|scope| {
+                let threads: Vec<_> = (0..THREADS)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            go.wait();
+                            // Keys of one line of the table, taken in one order by all.
+                            (0..KEYS).map(|n| users.short(1 + round * KEYS + n)).collect::<Vec<u32>>()
+                        })
+                    })
+                    .collect();
+                threads.into_iter().map(|thread| thread.join().unwrap()).collect()
+            });
+            for mine in &got[1..] {
+                assert_eq!(mine, &got[0], "round {round}");
+            }
+            for n in 0..KEYS {
+                assert_eq!(users.short(1 + round * KEYS + n), got[0][n as usize], "round {round}");
+            }
+        }
     }
 
     #[test]
