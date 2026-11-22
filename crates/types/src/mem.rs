@@ -86,6 +86,44 @@ impl<T> Zeroed<T> {
             }
         }
     }
+
+    /// `SS_TAIL=small`: the memory past the 2 MB steps that hold the first `len` values kept
+    /// on 4 KB pages (`MADV_NOHUGEPAGE`), for a table whose values past `len` are read and
+    /// never written. A read of an untouched address maps the kernel's zero page: where the
+    /// memory may have huge pages that is the 2 MB zero page, whose 32,768 lines reads at
+    /// random spread over, past L2; on 4 KB pages it is one page of 64 lines. Returns
+    /// whether the memory was so marked.
+    pub fn small_tail(&self, len: usize) -> bool {
+        if crate::env::pick("SS_TAIL", &["huge", "small"]) == 0 {
+            return false;
+        }
+        let from = (len.min(self.len) * size_of::<T>()).next_multiple_of(HUGE);
+        let to = self.layout.size() & !4095;
+        // SAFETY: whole pages of the memory, past every value written.
+        to > from && unsafe { advise_small(self.at.as_ptr().cast::<u8>().add(from), to - from) }
+    }
+}
+
+/// Marks `addr..addr + len` as kept on 4 KB pages (`MADV_NOHUGEPAGE`). Returns whether the
+/// kernel did it.
+///
+/// # Safety
+/// Whole pages of anonymous memory the caller owns.
+unsafe fn advise_small(addr: *mut u8, len: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn madvise(addr: *mut core::ffi::c_void, len: usize, advice: core::ffi::c_int) -> core::ffi::c_int;
+        }
+        const MADV_NOHUGEPAGE: core::ffi::c_int = 15;
+        // SAFETY: the range of the caller; a refusal changes nothing.
+        unsafe { madvise(addr.cast(), len, MADV_NOHUGEPAGE) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (addr, len);
+        false
+    }
 }
 
 /// Writes to piece `piece` of `pieces` of a table of atomics, changing nothing: one word in
