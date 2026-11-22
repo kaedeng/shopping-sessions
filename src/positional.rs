@@ -29,7 +29,7 @@ use ingest::pos::{Link, PosOut, PosPlan};
 use sessions::{Agg, Click};
 use types::hash::person_hash;
 use types::par;
-use types::pos::{POS_ODD_USER, POS_VALID, PosEvent, click_key_id};
+use types::pos::{POS_ODD_USER, POS_VALID, PosClick, PosEvent, click_id_of};
 use types::record::{ClickRec, PAY_CATEGORY_SHIFT, PAY_PRICE_MASK, PersonEvent, VALID};
 use types::rows::NO_CATEGORY;
 use types::rows::UserDaily;
@@ -361,6 +361,8 @@ struct Share {
     /// The aliases of those clicks, and whether one is over the masks.
     masks: Vec<u64>,
     over: Vec<u8>,
+    /// The persons with a click that has no key (`click_word`).
+    mixed: Vec<u32>,
 }
 
 /// In `Cut::s_ord`: the session's first event is also its run's first.
@@ -534,8 +536,8 @@ pub fn run(
     for extra in &extras {
         flags[extra.person as usize] |= EXTRA;
     }
-    // A click of a numbered user whose `click_id` is spelled another way is not among the
-    // person's grouped clicks: the person takes the classic lane, where it meets them.
+    // A click of a numbered user that no `PosClick` holds is not among the person's grouped
+    // clicks: the person takes the classic lane, where it meets them.
     for click in parsed.iter().flat_map(|out| &out.odd_id_clicks) {
         flags[(click.u >> ALIAS_BITS) as usize] |= UNFIT;
     }
@@ -1156,7 +1158,7 @@ fn fused_stages(shared: &Fused, works: &mut Vec<Work>, slow_events: &mut Vec<Per
                     // SAFETY: an unfit person's clicks are read here only, and written nowhere.
                     let (click, alias) = unsafe { (*group.clicks.0.add(i), *group.aliases.0.add(i)) };
                     let u = (person as u32) << ALIAS_BITS | u32::from(alias);
-                    work.slow_clicks.push(ClickRec { user: shared.links.person(u), click: click_key_id(click.id), ts: click.ts, campaign: click.campaign });
+                    work.slow_clicks.push(ClickRec { user: shared.links.person(u), click: click_id_of(click.id), ts: click.ts, campaign: click.campaign });
                 }
             }
         }
@@ -1349,7 +1351,7 @@ fn split_stages(
                         // SAFETY: an unfit person's clicks are read here only, and written nowhere.
                         let (click, alias) = unsafe { (*grouped.clicks.0.add(i), *grouped.aliases.0.add(i)) };
                         let u = (person as u32) << ALIAS_BITS | u32::from(alias);
-                        work.slow_clicks.push(ClickRec { user: links.person(u), click: click_key_id(click.id), ts: click.ts, campaign: click.campaign });
+                        work.slow_clicks.push(ClickRec { user: links.person(u), click: click_id_of(click.id), ts: click.ts, campaign: click.campaign });
                     }
                 }
             }
@@ -1589,7 +1591,7 @@ unsafe fn group_clicks_wide(
     let first = range << plan.click_shift;
     let persons = (1usize << plan.click_shift).min(plan.persons as usize - first);
     par::each(works, |worker, work| {
-        let Share { counts, masks, over } = &mut work.share;
+        let Share { counts, masks, over, .. } = &mut work.share;
         counts.clear();
         counts.resize(persons, 0);
         masks.clear();
@@ -1630,7 +1632,8 @@ unsafe fn group_clicks_wide(
     par::each(works, |worker, work| {
         // The wrappers whole, not their pointers: those are what may cross threads.
         let (click_room, alias_room) = (click_room, alias_room);
-        let counts = &mut work.share.counts;
+        let Share { counts, mixed, .. } = &mut work.share;
+        mixed.clear();
         parsed[worker].clicks.for_each(range, |piece| {
             for click in piece {
                 let at = &mut counts[(click.u() >> ALIAS_BITS) as usize - first];
@@ -1638,13 +1641,17 @@ unsafe fn group_clicks_wide(
                 // person's, by the counts of these same clicks: all workers' together are a
                 // permutation of the range's positions, inside the reserved room.
                 unsafe {
-                    click_room.0.add(*at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.key() });
+                    click_room.0.add(*at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click_word(click, &parsed[worker].odd_ids, mixed) });
                     alias_room.0.add(*at as usize).write((click.u() & ALIAS_MASK) as u16);
                 }
                 *at += 1;
             }
         });
     });
+    for work in works.iter() {
+        // SAFETY: the range is grouped, and nothing else runs.
+        unsafe { unmix(&work.share.mixed, grouped) };
+    }
 }
 
 /// Cuts a placed partition into sessions, 16 slots a step: the kept events' `ts` and users are
@@ -1828,6 +1835,7 @@ unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_al
     }
     debug_assert_eq!(at, grouped.bases[range + 1]);
     let (click_room, alias_room) = (grouped.clicks.0, grouped.aliases.0);
+    let mut mixed: Vec<u32> = Vec::new();
     for out in parsed {
         out.clicks.for_each(range, |piece| {
             for click in piece {
@@ -1835,11 +1843,45 @@ unsafe fn group_clicks(range: usize, plan: &PosPlan, parsed: &[PosOut], click_al
                 // SAFETY: the counts above are of these same clicks, so the positions are a
                 // permutation of the range's, inside the room reserved for all the clicks.
                 unsafe {
-                    click_room.add(*at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.key() });
+                    click_room.add(*at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click_word(click, &out.odd_ids, &mut mixed) });
                     alias_room.add(*at as usize).write((click.u() & ALIAS_MASK) as u16);
                 }
                 *at += 1;
             }
         });
+    }
+    // SAFETY: the range's persons are grouped now, and this task's alone.
+    unsafe { unmix(&mixed, grouped) };
+}
+
+/// A click's word in the grouped clicks: its key, or its `click_id` itself when it has none
+/// (`odd_ids` is its worker's `PosOut::odd_ids`), with its person noted in `mixed`.
+#[inline(always)]
+fn click_word(click: &PosClick, odd_ids: &[Id], mixed: &mut Vec<u32>) -> u64 {
+    match click.odd_index() {
+        None => click.key(),
+        Some(index) => odd_click(click, odd_ids[index], mixed),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn odd_click(click: &PosClick, id: Id, mixed: &mut Vec<u32>) -> u64 {
+    mixed.push(click.u() >> ALIAS_BITS);
+    id
+}
+
+/// Every click of the persons `mixed` with its `click_id` itself as its word: a person with a
+/// click that has no key has them all compared as IDs (`types::pos::click_id_of`).
+///
+/// # Safety
+/// The persons' clicks are grouped, and no other thread touches them.
+unsafe fn unmix(mixed: &[u32], grouped: &Grouped) {
+    for &person in mixed {
+        for at in grouped.range(person as usize) {
+            // SAFETY: the positions are the person's, inside the clicks.
+            let click = unsafe { &mut *grouped.clicks.0.add(at) };
+            click.id = click_id_of(click.id);
+        }
     }
 }

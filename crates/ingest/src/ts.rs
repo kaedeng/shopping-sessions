@@ -63,6 +63,10 @@ pub(crate) struct Dates {
     /// The table again, month by month, for `wide::date_wide`.
     #[cfg_attr(not(all(feature = "pipe-positional", target_arch = "x86_64", target_feature = "avx512f")), allow(dead_code))]
     months: Vec<Month>,
+    /// What a parse makes of the table once and keeps for the run (the kernel's memo of the
+    /// dates, `pos`).
+    #[cfg_attr(not(feature = "pipe-positional"), allow(dead_code))]
+    pub(crate) kept: std::sync::OnceLock<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 /// The dates of the table in one calendar month: they are consecutive days of it.
@@ -120,7 +124,7 @@ impl Dates {
                 if keys.iter().all(|key| slots[(key.tail.wrapping_mul(mul) >> shift) as usize].replace(*key).is_none()) {
                     // A free slot holds a date that hashes elsewhere, so no text can match it there.
                     let slots = slots.into_iter().map(|slot| slot.unwrap_or(keys[0])).collect();
-                    return Dates { slots, mul, shift, origin: ctx.origin, f3_len, months };
+                    return Dates { slots, mul, shift, origin: ctx.origin, f3_len, months, kept: std::sync::OnceLock::new() };
                 }
             }
         }

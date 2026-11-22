@@ -121,6 +121,7 @@ impl PosOut {
             odd_users: Vec::new(),
             odd_clicks: Vec::new(),
             odd_id_clicks: Vec::new(),
+            odd_ids: Vec::new(),
             scratch: Scratch::new(),
             // What `Ingest::read` takes for a chunk: untouched until read into, or `touch`.
             input: vec![0; crate::READ_ROOM + chunk + crate::READ_SLACK + 1 + crate::PAD],
@@ -222,7 +223,9 @@ pub struct PosOut {
     /// Every other valid click whose `user_id` is not such a number, as the classic record
     /// (`user` as read).
     pub odd_clicks: Vec<ClickRec>,
-    /// The valid clicks of numbered users whose `click_id` has no key.
+    /// The `click_id` of each click in `clicks` that has no key (`PosClick::odd`).
+    pub odd_ids: Vec<Id>,
+    /// The valid clicks of numbered users whose campaign is past a `PosClick`'s bits.
     pub odd_id_clicks: Vec<OddIdClick>,
     scratch: Scratch,
     /// The chunk being parsed, when it is read and not mapped (`Ingest::read`), and the file
@@ -589,9 +592,9 @@ unsafe fn clicks<T: Tok, M: Mode>(p: *const u8, len: usize, ctx: &Ctx, dates: &D
         return unsafe { wide::fused::kern::clicks::<M>(p, len, lead, ctx, dates, campaigns, plan, out) };
     }
     let _ = campaigns;
-    let PosOut { clicks, odd_clicks, odd_id_clicks, scratch, .. } = out;
+    let PosOut { clicks, odd_clicks, odd_id_clicks, odd_ids, scratch, .. } = out;
     let mut pending = Pending::new();
-    unsafe { T::lines::<4>(p, len, scratch, |fields| click_row::<M>(ctx, dates, plan, fields, &mut pending, clicks, odd_clicks, odd_id_clicks)) };
+    unsafe { T::lines::<4>(p, len, scratch, |fields| click_row::<M>(ctx, dates, plan, fields, &mut pending, clicks, odd_clicks, odd_id_clicks, odd_ids)) };
     pending.flush::<M>(clicks);
     clicks.fence();
 }
@@ -704,6 +707,7 @@ unsafe fn click_row<M: Mode>(
     clicks: &mut Chunks<PosClick>,
     odd_clicks: &mut Vec<ClickRec>,
     odd_id_clicks: &mut Vec<OddIdClick>,
+    odd_ids: &mut Vec<Id>,
 ) {
     let [click, user, campaign, ts] = *fields;
     let key = unsafe { click_key_at(click.p, click.len) };
@@ -719,8 +723,16 @@ unsafe fn click_row<M: Mode>(
                 // SAFETY: the person is below `persons`, so the list is below `click_parts`.
                 unsafe { pending.push::<M>(list, PosClick::new(key, number as u32, ts as u32, campaign), clicks) };
             }
-            // A `click_id` spelled another way (or a campaign past the record's bits): the
-            // click as it is, and its person leaves the fast lane (`src/positional.rs`).
+            // A `click_id` spelled another way (one line in 200,000 has its IDs in upper
+            // case): the click with its person's, and the ID kept beside the lists.
+            (Some(number), None) if number >> ALIAS_BITS < u64::from(plan.persons) && (campaign as usize) < CLICK_CAMPAIGNS => {
+                let list = (number >> ALIAS_BITS >> plan.click_shift) as usize;
+                odd_ids.push(click);
+                // SAFETY: as above.
+                unsafe { pending.push::<M>(list, PosClick::odd(odd_ids.len() - 1, number as u32, ts as u32, campaign), clicks) };
+            }
+            // A campaign past the record's bits: the click as it is, and its person leaves
+            // the fast lane (`src/positional.rs`).
             (Some(number), _) if number >> ALIAS_BITS < u64::from(plan.persons) => {
                 odd_id_clicks.push(OddIdClick { u: number as u32, click, ts: ts as u32, campaign });
             }
@@ -1713,16 +1725,17 @@ pub(crate) mod wide {
             clicks: &mut Chunks<PosClick>,
             odd_clicks: &mut Vec<ClickRec>,
             odd_id_clicks: &mut Vec<OddIdClick>,
+            odd_ids: &mut Vec<Id>,
         ) {
             // SAFETY: one line of the segment, 64 bytes readable at its first; a shape's
             // fields are inside the line.
             unsafe {
                 let line = p.add(at);
                 if let Some(shape) = click_shape(line) {
-                    return click_row::<M>(ctx, dates, plan, &shape.fields(line), pending, clicks, odd_clicks, odd_id_clicks);
+                    return click_row::<M>(ctx, dates, plan, &shape.fields(line), pending, clicks, odd_clicks, odd_id_clicks, odd_ids);
                 }
                 let bytes = line_end(p, len, at) - at;
-                Scalar::lines::<4>(line, bytes, &mut Scratch::new(), |fields| click_row::<M>(ctx, dates, plan, fields, pending, clicks, odd_clicks, odd_id_clicks));
+                Scalar::lines::<4>(line, bytes, &mut Scratch::new(), |fields| click_row::<M>(ctx, dates, plan, fields, pending, clicks, odd_clicks, odd_id_clicks, odd_ids));
             }
         }
 

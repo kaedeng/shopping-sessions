@@ -85,8 +85,8 @@ pub struct PosPay {
     pub pay: u32,
 }
 
-/// One valid click of a numbered user whose `click_id` has no key (`click_key_at`): the click
-/// as the classic lane takes it, with the user's number.
+/// One valid click of a numbered user that a `PosClick` cannot hold (a campaign past its
+/// bits): the click as the classic lane takes it, with the user's number.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OddIdClick {
     /// `person << 9 | alias`.
@@ -142,6 +142,13 @@ pub unsafe fn click_key_at(p: *const u8, len: usize) -> Option<u64> {
     Some(sextets << 4 | digits as u64)
 }
 
+/// The `click_id` behind a grouped click's word: the word is a key, or, for a person some of
+/// whose clicks have none, the packed ID itself (which is never below 2^56).
+#[inline]
+pub fn click_id_of(word: u64) -> Id {
+    if word >> CLICK_KEY_BITS == 0 { click_key_id(word) } else { word }
+}
+
 /// The `click_id` a key stands for, packed (`types::id`).
 pub fn click_key_id(key: u64) -> Id {
     let (digits, sextets) = ((key & 15) as usize, key >> 4);
@@ -155,6 +162,20 @@ impl PosClick {
     #[inline(always)]
     pub fn new(key: u64, u: u32, ts: u32, campaign: u32) -> PosClick {
         PosClick { low: u64::from(u) | u64::from(ts) << 32, rest: key | u64::from(campaign) << CLICK_KEY_BITS }
+    }
+
+    /// A click whose `click_id` has no key: `index` is where the parse kept the ID
+    /// (`PosOut::odd_ids`), held where the key is with no digits counted, which no key has.
+    #[inline(always)]
+    pub fn odd(index: usize, u: u32, ts: u32, campaign: u32) -> PosClick {
+        PosClick::new((index as u64) << 4, u, ts, campaign)
+    }
+
+    /// For a click made by `odd`, its index.
+    #[inline(always)]
+    pub fn odd_index(&self) -> Option<usize> {
+        let key = self.key();
+        (key & 15 == 0).then_some((key >> 4) as usize)
     }
 
     /// A click from its two words: `u | ts << 32`, `key | campaign << CLICK_KEY_BITS`.
