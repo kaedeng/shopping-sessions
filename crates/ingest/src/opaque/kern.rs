@@ -135,13 +135,13 @@ static IDK: [IdRow; ID_ROWS] = id_rows(b'k');
 /// One ID alone, in the 16 bytes that end at its comma: what a half of an `IdRow` is.
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
-struct OneRow {
-    ctrl: [u8; 16],
-    base: [u8; 16],
+pub(super) struct OneRow {
+    pub(super) ctrl: [u8; 16],
+    pub(super) base: [u8; 16],
 }
 
 /// Rows of a `ONE_*` table, by the ID's raw width.
-const fn one_rows(letter: u8) -> [OneRow; 16] {
+pub(super) const fn one_rows(letter: u8) -> [OneRow; 16] {
     // No shape: the letter's byte reads 0xFF.
     let mut bad = OneRow { ctrl: [0x80; 16], base: [0; 16] };
     bad.base[6] = 1;
@@ -164,9 +164,9 @@ const fn one_rows(letter: u8) -> [OneRow; 16] {
     table
 }
 
-static ONE_E: [OneRow; 16] = one_rows(b'e');
-static ONE_U: [OneRow; 16] = one_rows(b'u');
-static ONE_K: [OneRow; 16] = one_rows(b'k');
+pub(super) static ONE_E: [OneRow; 16] = one_rows(b'e');
+pub(super) static ONE_U: [OneRow; 16] = one_rows(b'u');
+pub(super) static ONE_K: [OneRow; 16] = one_rows(b'k');
 
 /// One shape of the two timestamps: lane 0 the `ts` (the 16 bytes before its comma), lane 1
 /// the `ingest_ts` (16 bytes of it from its fifth, or sixth when wrapped).
@@ -378,7 +378,7 @@ struct KindRow {
 }
 
 /// In a row's word: the type is `purchase`. The low half holds the residues.
-const PURCHASE: u64 = 1 << 32;
+pub(super) const PURCHASE: u64 = 1 << 32;
 
 const fn kind(table: &mut [KindRow; 256], word: &[u8], quoted: bool, purchase: bool) {
     let (mut cand, mut mask) = ([0u8; 16], [0u8; 16]);
@@ -498,7 +498,7 @@ static TAIL: [TailRow; TAIL_ROWS] = tail_rows();
 /// digits, a colon, a digit; only the fixed ones are compared), and its midnight.
 #[repr(C, align(32))]
 #[derive(Clone, Copy)]
-struct Day {
+pub(super) struct Day {
     text: [u8; 16],
     /// Milliseconds after `Ctx::origin`.
     ms: i64,
@@ -511,15 +511,15 @@ struct Day {
 /// match it there: a text equal to that date would have been looked up at that date's own
 /// index. Entry 0 is such an entry (no date has day `00`); its midnight is `-origin`, which is
 /// what a `ts` of 13 digits, looked up there with nothing compared, has to have added.
-struct Memo {
-    days: [Day; 128],
+pub(super) struct Memo {
+    pub(super) days: [Day; 128],
     /// The earliest midnight of the table.
-    first_ms: i64,
+    pub(super) first_ms: i64,
 }
 
 impl Memo {
     /// The run's memo: made by the first chunk parsed, read by every worker after.
-    fn of<'a>(ctx: &Ctx, dates: &'a Dates) -> &'a Memo {
+    pub(super) fn of<'a>(ctx: &Ctx, dates: &'a Dates) -> &'a Memo {
         dates.kept.get_or_init(|| Box::new(Memo::new(ctx, dates))).downcast_ref().expect("the kernel's memo")
     }
 
@@ -671,7 +671,7 @@ fn pack_words(parts: __m256i) -> __m256i {
 /// about a millisecond after the last one; a 256-bit multiply asks for the licence the line
 /// kernel's own multiplies already hold.
 #[inline(always)]
-fn mul_halves(x: __m512i, by: __m256i) -> __m512i {
+pub(super) fn mul_halves(x: __m512i, by: __m256i) -> __m512i {
     let (low, high): (__m256i, __m256i);
     // SAFETY: two AVX2 instructions on registers; `low` is written before `b` and `by` are
     // read, so it is a register of its own (`out`, not `lateout`).
@@ -683,22 +683,22 @@ fn mul_halves(x: __m512i, by: __m256i) -> __m512i {
 }
 
 /// The registers every line's checks use.
-struct Lanes {
-    comma: __m256i,
+pub(super) struct Lanes {
+    pub(super) comma: __m256i,
     newline: __m256i,
     quote: __m256i,
     /// Per half of the IDs: bytes 0..7 must be 0; byte 7 0..=8 or a letter less `'1'`; bytes
     /// 8..16 0..=9 or a letter less `'0'`.
-    to_letter: __m256i,
-    digit_max: __m256i,
-    letter_max: __m256i,
+    pub(super) to_letter: __m256i,
+    pub(super) digit_max: __m256i,
+    pub(super) letter_max: __m256i,
     /// The bytes of an `ingest_ts`'s date text that are compared: the date, `T`, a colon.
     date_mask: __m128i,
 }
 
 impl Lanes {
     #[inline(always)]
-    fn new() -> Lanes {
+    pub(super) fn new() -> Lanes {
         // SAFETY: register arithmetic.
         #[allow(unused_unsafe)]
         unsafe {
@@ -747,7 +747,7 @@ unsafe fn hex32(p: *const u8) -> (u64, u64, u32) {
 /// # Safety
 /// The 16 bytes before `comma` are readable, and for `raw` of 33 or 35 the `raw` before it.
 #[inline(always)]
-unsafe fn one_id(comma: *const u8, raw: usize, table: &[OneRow; 16], letter: u8, lanes: &Lanes) -> (u64, u64, u64, bool) {
+pub(super) unsafe fn one_id(comma: *const u8, raw: usize, table: &[OneRow; 16], letter: u8, lanes: &Lanes) -> (u64, u64, u64, bool) {
     // SAFETY: the caller's contract; a table row is picked by a width below 16.
     unsafe {
         if raw < 16 {
@@ -772,14 +772,14 @@ unsafe fn one_id(comma: *const u8, raw: usize, table: &[OneRow; 16], letter: u8,
 }
 
 /// What an event line's fields after the `user_id` give.
-struct Tail {
+pub(super) struct Tail {
     /// The `ts` and the `ingest_ts`, a half each, in milliseconds after `Ctx::origin`.
-    times: __m256i,
+    pub(super) times: __m256i,
     /// Residues: zero for fields as the generator writes them.
-    bad: __m256i,
-    low: u32,
+    pub(super) bad: __m256i,
+    pub(super) low: u32,
     /// `PURCHASE`, or 0.
-    class: u64,
+    pub(super) class: u64,
 }
 
 /// An event line from the comma after its `user_id`, at `t`, on: the comma after its `ts` is
@@ -789,7 +789,7 @@ struct Tail {
 /// The 16 bytes before `t` and everything from there to 32 bytes past `end` are readable;
 /// `end` is at least 45 bytes past `t`.
 #[inline(always)]
-unsafe fn tail(t: *const u8, gap: usize, end: *const u8, days: *const u8, lanes: &Lanes) -> Tail {
+pub(super) unsafe fn tail(t: *const u8, gap: usize, end: *const u8, days: *const u8, lanes: &Lanes) -> Tail {
     // SAFETY: the caller's contract; table indexes are bounded by the counts they are made
     // of (a width is clamped, a count of zeros is at most 32).
     unsafe {
@@ -1253,7 +1253,7 @@ unsafe fn others(
 /// The first byte after the line at `at`.
 #[cold]
 #[inline(never)]
-unsafe fn line_end(p: *const u8, len: usize, at: usize) -> usize {
+pub(super) unsafe fn line_end(p: *const u8, len: usize, at: usize) -> usize {
     // SAFETY: `at..len` is inside the segment.
     let rest = unsafe { std::slice::from_raw_parts(p.add(at), len - at) };
     at + memchr::memchr(b'\n', rest).map_or(rest.len(), |newline| newline + 1)
@@ -1266,7 +1266,7 @@ unsafe fn line_end(p: *const u8, len: usize, at: usize) -> usize {
 #[cold]
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn slow_line(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>) {
+pub(super) unsafe fn slow_line(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dates, plan: &Plan, events: &mut Chunks<Ev>, long_events: &mut Chunks<EvL>) {
     // SAFETY: one line of the segment.
     unsafe {
         let bytes = line_end(p, len, at) - at;
@@ -1296,7 +1296,7 @@ unsafe fn slow_click(p: *const u8, len: usize, at: usize, ctx: &Ctx, dates: &Dat
 /// the newline at `next - 1`, each wrapped in quotes when it begins with one, and both
 /// commas are in the 32 bytes before the newline.
 #[inline(always)]
-unsafe fn purchase(next: *const u8, ctx: &Ctx) -> (u32, bool) {
+pub(super) unsafe fn purchase(next: *const u8, ctx: &Ctx) -> (u32, bool) {
     // SAFETY: the caller's contract; a field's bytes have 16 readable after them.
     unsafe {
         let end = next.sub(1);

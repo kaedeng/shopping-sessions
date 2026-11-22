@@ -47,6 +47,18 @@ use crate::{Ingest, ingest_slow, price_cents};
     target_feature = "lzcnt"
 ))]
 mod kern;
+#[cfg(all(
+    feature = "tok-shape",
+    target_arch = "x86_64",
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512dq",
+    target_feature = "avx512cd",
+    target_feature = "avx512vl",
+    target_feature = "bmi2",
+    target_feature = "lzcnt"
+))]
+mod lean;
 
 /// How lines are decoded, the pick first (`SS_DECODE`): by the kernel's tables where the
 /// build has them, or every line through the row code.
@@ -61,7 +73,7 @@ mod kern;
     target_feature = "bmi2",
     target_feature = "lzcnt"
 ))]
-const DECODES: &[&str] = &["kernel", "row"];
+const DECODES: &[&str] = &["kernel", "row", "lean"];
 #[cfg(not(all(
     feature = "tok-shape",
     target_arch = "x86_64",
@@ -201,6 +213,8 @@ pub struct Plan {
     pub long_bits: u32,
     /// Lines decoded by the kernel (`DECODES`).
     kernel: bool,
+    /// Event lines by the lean kernel (`lean`).
+    lean: bool,
     /// Long `click_id`s kept whole (`click_id_at`).
     pub(crate) whole_clicks: bool,
     /// `k & ask_step == 0` after a row is when the kernel asks for the directory's lines of
@@ -264,7 +278,8 @@ impl Ingest {
             users: Users::for_rows(self.event_rows + self.click_rows + self.link_rows, grow),
             part_bits,
             long_bits: part_bits.saturating_sub(3).max(1),
-            kernel: DECODES[types::env::pick("SS_DECODE", DECODES)] == "kernel",
+            kernel: DECODES[types::env::pick("SS_DECODE", DECODES)] != "row",
+            lean: DECODES[types::env::pick("SS_DECODE", DECODES)] == "lean",
             whole_clicks,
             ask_step: if types::env::pick("SS_ASK", &["rows", "batch"]) == 0 { 63 } else { usize::MAX },
         }
@@ -375,7 +390,7 @@ unsafe fn events(p: *const u8, len: usize, ctx: &Ctx, dates: &Dates, plan: &Plan
     ))]
     if plan.kernel && dates.few_months() {
         let lead = out.lead;
-        return unsafe { kern::events(p, len, lead, ctx, dates, plan, out) };
+        return unsafe { if plan.lean { lean::events(p, len, lead, ctx, dates, plan, out) } else { kern::events(p, len, lead, ctx, dates, plan, out) } };
     }
     let Out { events, long_events, scratch, .. } = out;
     unsafe { Scalar::lines::<7>(p, len, scratch, |fields| event_row(ctx, dates, plan, fields, events, long_events)) };
@@ -487,7 +502,7 @@ mod tests {
     fn rows_go_by_their_ids_spelling() {
         let ctx = Ctx::new(parse_f1(b"2026-10-08T00:00:00Z").unwrap(), parse_f1(b"2026-10-22T00:00:00Z").unwrap(), &[], &[]).unwrap();
         let dates = Dates::new(&ctx);
-        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, whole_clicks: false, ask_step: 63 };
+        let plan = Plan { users: Users::new(64, 64), part_bits: 3, long_bits: 1, kernel: false, lean: false, whole_clicks: false, ask_step: 63 };
         let (mut events, mut long_events) = (Chunks::<Ev>::new(8, 1 << 16), Chunks::<EvL>::new(2, 1 << 16));
         let text = b"\ne1,u1,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,view,p1,\n\
 e02423c3d84ab053af78764ce49f23b5c,u02423c3d84ab053af78764ce49f23b5c,2026-10-09T10:00:00Z,2026-10-09T10:00:05Z,cart,p1,\n\

@@ -277,6 +277,49 @@ pub fn mix_long(hi: u64, lo: u64) -> u64 {
     (wide as u64) ^ (wide >> 64) as u64
 }
 
+/// The short table as the first step of a lookup sees it, for a loop that keeps it in
+/// registers (`Users::short_lines`): the line a key's lookup begins at, and the number of a
+/// key that line already holds. Through `Users::short` a loop read the table's address, its
+/// shift and its mask again for every key, 34 instructions a lookup; this way it is 15.
+#[derive(Clone, Copy)]
+pub struct ShortLines {
+    base: *const [AtomicU64; 2],
+    shift: u32,
+}
+
+impl ShortLines {
+    /// The cache line the lookup of `key` begins at.
+    #[inline(always)]
+    pub fn line(&self, key: u64) -> *const AtomicU64 {
+        self.base.wrapping_add((mix(key) >> self.shift) as usize & !(LINE - 1)).cast()
+    }
+
+    /// One more than the number of the user with key `key` (not 0), when the line its
+    /// lookup begins at holds the key and its number: nearly every lookup after a user's
+    /// first. 0 when the lookup has more to do, which `Users::short` then does.
+    #[inline(always)]
+    pub fn hit(&self, key: u64) -> u32 {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
+        // SAFETY: the line is four slots of the table, 64 bytes aligned to 64 (`Users::keys`
+        // has why reading them whole is sound), and a hit's number is the word after its key.
+        unsafe {
+            use core::arch::x86_64::*;
+            let line = self.line(key);
+            let hit = _mm512_cmpeq_epi64_mask(_mm512_load_si512(line.cast()), _mm512_set1_epi64(key as i64)) & 0x55;
+            if hit == 0 {
+                return 0;
+            }
+            // 0 while the thread that claimed the slot is between its claim and its store.
+            (*line.add(hit.trailing_zeros() as usize + 1)).load(Relaxed) as u32
+        }
+        #[cfg(not(all(target_arch = "x86_64", target_feature = "avx512f")))]
+        {
+            let _ = key;
+            0
+        }
+    }
+}
+
 impl Users {
     /// A directory of `short` and `long` slots, each rounded up to a power of two (at least
     /// 64). No page of it is touched until a key lands there.
@@ -359,6 +402,12 @@ impl Users {
     /// the caller starts over with a larger directory.
     pub fn overflowed(&self) -> bool {
         self.full.load(Relaxed)
+    }
+
+    /// The short table for a loop of lookups (`ShortLines`).
+    #[inline(always)]
+    pub fn short_lines(&self) -> ShortLines {
+        ShortLines { base: self.short.as_ptr(), shift: self.short_shift }
     }
 
     /// Asks for the cache line a short key's lookup begins at.
