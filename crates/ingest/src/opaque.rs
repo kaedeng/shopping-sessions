@@ -27,7 +27,7 @@ use std::sync::OnceLock;
 use types::chunks::Chunks;
 use types::hash::hash;
 use types::id::{self, Id, pack_at};
-use types::record::{ClickRec, PAY_CATEGORY_SHIFT};
+use types::record::{ClickN, PAY_CATEGORY_SHIFT};
 use types::time::DAY;
 use types::users::{NO_USER, UserKey, Users, key_at_wide, long_key_at, mix_long, short_key_at};
 use types::Ctx;
@@ -344,10 +344,13 @@ fn words(user: u32, ts: u32, valid: bool, ingest: u32, pay: u32) -> (u64, u64) {
 /// ms into a parse of 208 at 20M events (241 of 1,100 at 60M), and the clicks' chunks are
 /// the last the parse takes: a click chunk taken after that writes its clicks once. One
 /// taken before it writes them to the list, as before (`ClickSink`).
+///
+/// What is written is a `ClickN`, 16 bytes: within its bucket a person is its number's low
+/// `shift` bits, which fit a word beside the `ts` and the campaign.
 pub struct Placing {
     /// Per user's number: 1 + the root of its component, 0 for a root.
     up: *const u32,
-    /// The shift from a root's number to its bucket.
+    /// The shift from a root's number to its bucket: `ClickN::SPAN_BITS` at the most.
     pub shift: u32,
     /// Buckets a number of the directory can fall in.
     pub lists: usize,
@@ -362,6 +365,7 @@ impl Placing {
     /// `up` holds an entry for every number the directory can give, is not written again,
     /// and outlives every use of this; `lists` is more than any number shifted by `shift`.
     pub unsafe fn new(up: *const u32, shift: u32, lists: usize) -> Placing {
+        assert!(shift <= ClickN::SPAN_BITS, "a bucket of 2^{shift} persons");
         Placing { up, shift, lists }
     }
 
@@ -378,11 +382,11 @@ impl Placing {
 /// before the chunk was taken (`Placing`), to the worker's list otherwise.
 pub(crate) struct ClickSink<'a> {
     listed: &'a mut Chunks<Ck>,
-    placed: Option<(&'a Placing, &'a mut Chunks<ClickRec>)>,
+    placed: Option<(&'a Placing, &'a mut Chunks<ClickN>)>,
 }
 
 impl<'a> ClickSink<'a> {
-    fn new(listed: &'a mut Chunks<Ck>, placed: Option<&'a mut Chunks<ClickRec>>, plan: &'a Plan) -> ClickSink<'a> {
+    fn new(listed: &'a mut Chunks<Ck>, placed: Option<&'a mut Chunks<ClickN>>, plan: &'a Plan) -> ClickSink<'a> {
         ClickSink { listed, placed: plan.placing.get().zip(placed) }
     }
 
@@ -400,7 +404,8 @@ impl<'a> ClickSink<'a> {
         }
     }
 
-    /// One valid click of user `user`.
+    /// One valid click of user `user`; `campaign` is below `ClickN::CAMPAIGNS` where clicks
+    /// are placed.
     ///
     /// # Safety
     /// `user` is a number the directory gave.
@@ -412,7 +417,8 @@ impl<'a> ClickSink<'a> {
             match &mut self.placed {
                 Some((placing, placed)) => {
                     let root = placing.root(user);
-                    placed.push_at((root >> placing.shift) as usize, ClickRec { user: u64::from(root) + 1, click, ts, campaign });
+                    // The person within its bucket: the number's low `shift` bits.
+                    placed.push_at((root >> placing.shift) as usize, ClickN::new(click, root & ((1 << placing.shift) - 1), campaign, ts));
                 }
                 None => self.listed.push_at(0, Ck { click, user_ts: u64::from(user) | u64::from(ts) << 32, campaign: u64::from(campaign) }),
             }
@@ -487,7 +493,7 @@ pub struct Out {
     pub clicks: Chunks<Ck>,
     /// List `Placing`'s bucket of the click's person: the valid clicks of every other
     /// chunk, as the sessions stage reads them. Made by the first such chunk.
-    pub placed: Option<Chunks<ClickRec>>,
+    pub placed: Option<Chunks<ClickN>>,
     /// Bytes a worker's share of the clicks takes as placed records.
     placed_room: usize,
     /// Lines the kernel left to the row code (`SS_TIMING` reports them).
@@ -549,7 +555,7 @@ impl Ingest {
             long_events: Chunks::new(long_parts, room(self.event_rows / 4, size_of::<EvL>(), long_parts)),
             clicks: Chunks::new(1, room(self.click_rows, size_of::<Ck>(), 1)),
             placed: None,
-            placed_room: room(self.click_rows, size_of::<ClickRec>(), 0),
+            placed_room: room(self.click_rows, size_of::<ClickN>(), 0),
             slow: 0,
             scratch: Scratch::new(),
             input: vec![0; crate::READ_ROOM + crate::chunk_bytes() + crate::READ_SLACK + 1 + crate::PAD],

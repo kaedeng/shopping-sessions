@@ -36,7 +36,7 @@ mod sort_times;
 #[cfg(test)]
 mod tests;
 
-use types::record::{ClickRec, PersonEvent};
+use types::record::{ClickN, ClickRec, PersonEvent};
 use types::rows::{CampaignDaily, UserDaily};
 use types::{Ctx, Id};
 
@@ -257,6 +257,8 @@ pub struct DensePay {
 ///   the key `person << 32 | ts`; it is called twice, with the same pieces.
 /// - `pays` does the same with the purchases among those events, once.
 /// - `clicks` does the same with the bucket's clicks, twice; a click's `user` is its person.
+/// - `placed` does the same with the bucket's clicks that are `ClickN`s, twice: those the
+///   parse placed itself, a click's person being its place among the bucket's.
 ///
 /// The rows are `bucket`'s, with the person's number as the row's `person`.
 #[cfg(feature = "pipe-positional")]
@@ -267,9 +269,10 @@ pub fn bucket_dense(
     events: &dyn Fn(&mut dyn FnMut(&[u64])),
     pays: &dyn Fn(&mut dyn FnMut(&[DensePay])),
     clicks: &dyn Fn(&mut dyn FnMut(&[ClickRec])),
+    placed: &dyn Fn(&mut dyn FnMut(&[ClickN])),
     agg: &mut Agg,
 ) {
-    partitioned::bucket_dense(ctx, base, span, events, pays, clicks, agg)
+    partitioned::bucket_dense(ctx, base, span, events, pays, clicks, placed, agg)
 }
 
 /// `bucket` with the assists counted per stretch of a person's sessions (`attr-interval`): for

@@ -20,7 +20,7 @@ use ingest::opaque::{Ev, EvL, EvN, LinkRec, Out, Placing, Plan};
 use types::chunks::Chunks;
 use types::hash::{hash, person_hash};
 use types::parts::{Combine, Mode, Parts, Plain};
-use types::record::{ClickRec, PersonEvent};
+use types::record::{ClickN, ClickRec, PersonEvent};
 use types::mem::Zeroed;
 use types::users::{Users, mix_long};
 use types::{Ctx, Id, par};
@@ -630,7 +630,8 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
     // every click chunk wait for the links, so that all are placed (for tests). Buckets
     // by hash are filled by the next stage only.
     let click_mode = types::env::pick("SS_CLICKS", &["placed", "listed", "wait"]);
-    let place_clicks = dense_buckets && click_mode != 1;
+    // (A placed click names its campaign in 16 bits, `ClickN`.)
+    let place_clicks = dense_buckets && click_mode != 1 && ctx.campaigns.len() <= ClickN::CAMPAIGNS;
     plan.wait_for_placing = place_clicks && click_mode == 2;
     let plan = plan;
     // Each worker makes its lists, and before that puts its piece of the directory onto
@@ -669,9 +670,10 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
             if place_clicks && let Some(persons) = persons.get() {
                 // The buckets by the users numbered so far: the linked ones and those of
                 // the lines read until now. The rest only add buckets of the same width
-                // (there are at most twice as many as `SS_BUCKET_BITS` asks for).
+                // (there are at most twice as many as `SS_BUCKET_BITS` asks for). A bucket
+                // is no wider than a placed click can name a person of.
                 let count = plan.users.count().max(1);
-                let shift = (usize::BITS - (count - 1).leading_zeros()).saturating_sub(ctx.bucket_bits);
+                let shift = (usize::BITS - (count - 1).leading_zeros()).saturating_sub(ctx.bucket_bits).min(ClickN::SPAN_BITS);
                 // SAFETY: the array has an entry a number of the directory, the unions are
                 // done, and it lives in `Names` to the end of the run.
                 drop(plan.placing.set(unsafe { Placing::new(persons.up.as_ptr(), shift, ((plan.users.bound() - 1) >> shift) + 1) }));

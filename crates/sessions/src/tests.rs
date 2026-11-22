@@ -284,6 +284,16 @@ fn matches_the_reference_on_random_buckets() {
                 numbered.swap(at, rng.below(at as u64 + 1) as usize);
             }
             let cut = rng.below(keys.len() as u64 + 1) as usize;
+            // Every other click as the parse places it, where one fits that record.
+            let (mut wide, mut placed): (Vec<ClickRec>, Vec<types::record::ClickN>) = (Vec::new(), Vec::new());
+            for (at, click) in numbered.iter().enumerate() {
+                let place = click.user as u32 - base;
+                if at % 2 == 1 && place < 1 << 16 && click.campaign < 1 << 16 {
+                    placed.push(types::record::ClickN::new(click.click, place, click.campaign, click.ts));
+                } else {
+                    wide.push(*click);
+                }
+            }
             for (net, wide_walk) in [(true, true), (false, true), (true, false), (false, false)] {
                 let mut agg = Agg::new(&ctx);
                 crate::partitioned::bucket_dense_as(
@@ -295,7 +305,8 @@ fn matches_the_reference_on_random_buckets() {
                         each(&keys[cut..]);
                     },
                     &|each| each(&paid),
-                    &|each| each(&numbered),
+                    &|each| each(&wide),
+                    &|each| each(&placed),
                     &mut agg,
                     net,
                     wide_walk,

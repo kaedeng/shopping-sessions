@@ -10,7 +10,7 @@ use std::cmp::Ordering;
 
 use types::hash::person_hash;
 use types::id::Id;
-use types::record::{ClickRec, PersonEvent};
+use types::record::{ClickN, ClickRec, PersonEvent};
 use types::Ctx;
 
 use crate::{Agg, Click};
@@ -325,6 +325,7 @@ pub fn bucket_dense(
     events: &dyn Fn(&mut dyn FnMut(&[u64])),
     pays: &dyn Fn(&mut dyn FnMut(&[crate::DensePay])),
     clicks: &dyn Fn(&mut dyn FnMut(&[ClickRec])),
+    placed: &dyn Fn(&mut dyn FnMut(&[ClickN])),
     agg: &mut Agg,
 ) {
     // `SS_TIME_SORT=net|std`: a person's times by `sort_times`, or by `sort_unstable`.
@@ -332,7 +333,7 @@ pub fn bucket_dense(
     // (`dense_walk`), or person by person.
     static PICKS: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
     let (net, wide_walk) = *PICKS.get_or_init(|| (types::env::pick("SS_TIME_SORT", &["net", "std"]) == 0, types::env::pick("SS_DENSE_WALK", &["wide", "person"]) == 0));
-    bucket_dense_as(ctx, base, span, events, pays, clicks, agg, net, wide_walk)
+    bucket_dense_as(ctx, base, span, events, pays, clicks, placed, agg, net, wide_walk)
 }
 
 /// `bucket_dense` with its two choices given: `net` sorts a person's times by `sort_times`,
@@ -346,6 +347,7 @@ pub(crate) fn bucket_dense_as(
     events: &dyn Fn(&mut dyn FnMut(&[u64])),
     pays: &dyn Fn(&mut dyn FnMut(&[crate::DensePay])),
     clicks: &dyn Fn(&mut dyn FnMut(&[ClickRec])),
+    placed: &dyn Fn(&mut dyn FnMut(&[ClickN])),
     agg: &mut Agg,
     net: bool,
     wide_walk: bool,
@@ -469,6 +471,25 @@ pub(crate) fn bucket_dense_as(
                 unsafe { *counts.add(at + 1) += 1 };
             }
         });
+        // The clicks the parse placed: a person is its place already.
+        placed(&mut |piece| {
+            let (counts, span) = (counts, span);
+            let mut chunks = piece.chunks_exact(8);
+            for chunk in &mut chunks {
+                let at: [usize; 8] = std::array::from_fn(|k| chunk[k].place());
+                assert!(at.iter().all(|&at| at < span), "a click outside its bucket");
+                for at in at {
+                    // SAFETY: `at < span`, and `click_ends` has `span + 1` entries.
+                    unsafe { *counts.add(at + 1) += 1 };
+                }
+            }
+            for click in chunks.remainder() {
+                let at = click.place();
+                assert!(at < span, "a click outside its bucket");
+                // SAFETY: as above.
+                unsafe { *counts.add(at + 1) += 1 };
+            }
+        });
     }
     let mut kept = 0u32;
     for end in click_ends.iter_mut() {
@@ -503,6 +524,34 @@ pub(crate) fn bucket_dense_as(
                 unsafe {
                     let slot = next.add((click.user as u32).wrapping_sub(base) as usize);
                     out.add(*slot as usize).write(Click { ts: click.ts, campaign: click.campaign, id: click.click });
+                    *slot += 1;
+                }
+            }
+        });
+        placed(&mut |piece| {
+            let (out, next) = (out, next);
+            let mut chunks = piece.chunks_exact(8);
+            for chunk in &mut chunks {
+                let mut at = [0u32; 8];
+                for (at, click) in at.iter_mut().zip(chunk) {
+                    // SAFETY: the count pass indexed the same persons, below `span`.
+                    unsafe {
+                        let slot = next.add(click.place());
+                        *at = *slot;
+                        *slot = *at + 1;
+                    }
+                }
+                for (at, click) in at.into_iter().zip(chunk) {
+                    // SAFETY: the positions are a permutation of `0..kept`, inside the
+                    // reserved room.
+                    unsafe { out.add(at as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.click }) };
+                }
+            }
+            for click in chunks.remainder() {
+                // SAFETY: as above.
+                unsafe {
+                    let slot = next.add(click.place());
+                    out.add(*slot as usize).write(Click { ts: click.ts(), campaign: click.campaign(), id: click.click });
                     *slot += 1;
                 }
             }
