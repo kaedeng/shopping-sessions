@@ -47,11 +47,11 @@ impl<T> Zeroed<T> {
 const HUGE: usize = 2 << 20;
 
 impl<T> Zeroed<T> {
-    /// The indexes of one value in each 2 MB of the memory, those of piece `piece` of
-    /// `pieces`.
-    fn firsts(&self, piece: usize, pieces: usize) -> impl Iterator<Item = usize> + use<T> {
+    /// The indexes of one value in each 2 MB of the first `len` values, those of piece
+    /// `piece` of `pieces`.
+    fn firsts(&self, len: usize, piece: usize, pieces: usize) -> impl Iterator<Item = usize> + use<T> {
         let step = (HUGE / size_of::<T>().max(1)).max(1);
-        let steps = self.len.div_ceil(step);
+        let steps = len.min(self.len).div_ceil(step);
         (steps * piece / pieces..steps * (piece + 1) / pieces).map(move |at| at * step)
     }
 
@@ -101,12 +101,39 @@ impl<T> Zeroed<T> {
 ///
 /// The write is a compare-and-swap, which writes whether or not it succeeds. An atomic `or`
 /// of 0 does not: the compiler knows it changes nothing and makes it a fenced load.
-pub fn touch<T>(table: &Zeroed<T>, piece: usize, pieces: usize, word: impl Fn(&T) -> &std::sync::atomic::AtomicU64) {
-    use std::sync::atomic::Ordering::Relaxed;
+pub fn touch<T, W: Poke>(table: &Zeroed<T>, piece: usize, pieces: usize, word: impl Fn(&T) -> &W) {
+    touch_prefix(table, table.len, piece, pieces, word);
+}
+
+/// An atomic word that `touch` writes without changing it.
+pub trait Poke {
+    /// A compare-and-swap of 0 for 0.
+    fn poke(&self);
+}
+
+impl Poke for std::sync::atomic::AtomicU64 {
+    #[inline(always)]
+    fn poke(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self.compare_exchange(0, std::hint::black_box(0), Relaxed, Relaxed);
+    }
+}
+
+impl Poke for std::sync::atomic::AtomicU32 {
+    #[inline(always)]
+    fn poke(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let _ = self.compare_exchange(0, std::hint::black_box(0), Relaxed, Relaxed);
+    }
+}
+
+/// `touch` for the table's first `len` values: their whole 2 MB steps, and the rest of the
+/// table as it was.
+pub fn touch_prefix<T, W: Poke>(table: &Zeroed<T>, len: usize, piece: usize, pieces: usize, word: impl Fn(&T) -> &W) {
     // `SS_POPULATE`: every page of the piece backed in one call (`populate`), for a machine
     // without huge pages: there each page of the table is otherwise a fault of its own, at
     // the first key that lands on it.
-    let bytes = table.len * size_of::<T>();
+    let bytes = len.min(table.len) * size_of::<T>();
     let steps = bytes.div_ceil(HUGE);
     let (from, to) = (steps * piece / pieces * HUGE, (steps * (piece + 1) / pieces * HUGE).min(bytes & !4095));
     // `SS_COLLAPSE`: 2 MB pages asked for by name (`collapse`), after the writes below.
@@ -120,8 +147,8 @@ pub fn touch<T>(table: &Zeroed<T>, piece: usize, pieces: usize, word: impl Fn(&T
             return;
         }
     }
-    for at in table.firsts(piece, pieces) {
-        let _ = word(&table[at]).compare_exchange(0, std::hint::black_box(0), Relaxed, Relaxed);
+    for at in table.firsts(len, piece, pieces) {
+        word(&table[at]).poke();
     }
     if huge {
         // SAFETY: as above; every 2 MB step of the piece has a page written.

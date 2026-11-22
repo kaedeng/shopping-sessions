@@ -219,9 +219,17 @@ impl Users {
 
     /// Piece `piece` of `pieces` of both tables onto whole 2 MB pages (`mem::touch`): a
     /// lookup reads a slot before anything is written to it. At any time, by any thread.
+    ///
+    /// With `SS_COLLAPSE=on`, also the numbers' slots (`slot_of`) up to half the short
+    /// table's slots, room for twice the users of generated data (the numbers are dense
+    /// from 0): naming a person reads its name's slot at random (`key`), 1.4M times at 20M
+    /// events, each a page walk on 4 KB pages; its 8 MB are four collapses.
     pub fn touch(&self, piece: usize, pieces: usize) {
         crate::mem::touch(&self.short, piece, pieces, |slot| &slot[0]);
         crate::mem::touch(&self.long, piece, pieces, |slot| &slot[0]);
+        if crate::mem::collapse_on() {
+            crate::mem::touch_prefix(&self.slot_of, self.short.len() / 2, piece, pieces, |number| number);
+        }
     }
 
     /// A bound on the numbers: every user's is below this. Far more than the users there
