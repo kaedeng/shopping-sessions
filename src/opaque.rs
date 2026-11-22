@@ -260,14 +260,25 @@ fn dedup<'p, R: Row + 'p>(lists: impl Iterator<Item = &'p Chunks<R>> + Clone, li
     }
 }
 
+/// Rows a placing loop asks for the person of ahead of the row it is at.
+///
+/// The persons' array is 4 bytes a user, 18 MB at 60M events, and a list's rows name users
+/// in no order: every lookup is a line from outside the caches. Asked for all at once before
+/// the loop, a list's lines (31,000 of them at 60M) were gone from L2 again before the loop
+/// came to read them, and that one load was a tenth of a run's cycles.
+const AHEAD_ROWS: usize = 32;
+
 /// The valid ones of `kept` to their persons' buckets.
 #[inline(always)]
 fn scatter<R: Row, M: Mode>(kept: &[R], persons: &Persons, bucket_bits: u32, out: &mut Parts<PersonEvent>) {
     let shift = 64 - bucket_bits;
-    for row in kept {
+    for row in kept.iter().take(AHEAD_ROWS) {
         persons.prefetch(row.words().0 as u32);
     }
-    for row in kept {
+    for (at, row) in kept.iter().enumerate() {
+        if let Some(coming) = kept.get(at + AHEAD_ROWS) {
+            persons.prefetch(coming.words().0 as u32);
+        }
         let (user_ts, ingest_pay) = row.words();
         let ts = (user_ts >> 32) as u32;
         // No `ts`: the row that won its `event_id` is not valid.
@@ -286,10 +297,13 @@ fn scatter<R: Row, M: Mode>(kept: &[R], persons: &Persons, bucket_bits: u32, out
 /// `(person - 1) >> shift`, an event the key `person << 32 | ts`.
 #[inline(always)]
 fn scatter_dense<R: Row>(kept: &[R], persons: &Persons, shift: u32, out: &mut DenseBuckets) {
-    for row in kept {
+    for row in kept.iter().take(AHEAD_ROWS) {
         persons.prefetch(row.words().0 as u32);
     }
-    for row in kept {
+    for (at, row) in kept.iter().enumerate() {
+        if let Some(coming) = kept.get(at + AHEAD_ROWS) {
+            persons.prefetch(coming.words().0 as u32);
+        }
         let (user_ts, ingest_pay) = row.words();
         let ts = (user_ts >> 32) as u32;
         if ts != 0 {
@@ -308,16 +322,24 @@ fn scatter_dense<R: Row>(kept: &[R], persons: &Persons, shift: u32, out: &mut De
 /// `scatter_clicks` into the same buckets.
 #[inline(always)]
 fn scatter_clicks_dense(from: &Out, persons: &Persons, shift: u32, out: &mut DenseBuckets) {
-    from.clicks.for_each(0, |piece| {
-        for click in piece {
-            persons.prefetch(click.user_ts as u32);
-        }
+    let mut place = |piece: &[ingest::opaque::Ck]| {
         for click in piece {
             let root = persons.of(click.user_ts as u32);
             let rec = ClickRec { user: u64::from(root) + 1, click: click.click, ts: (click.user_ts >> 32) as u32, campaign: click.campaign as u32 };
             out.clicks.push((root >> shift) as usize, rec);
         }
+    };
+    // A piece is a chunk of the list, 168 clicks: its persons are asked for when it comes,
+    // and placed is the piece before it, asked for a piece ago.
+    let mut asked: &[ingest::opaque::Ck] = &[];
+    from.clicks.for_each(0, |piece| {
+        for click in piece {
+            persons.prefetch(click.user_ts as u32);
+        }
+        place(asked);
+        asked = piece;
     });
+    place(asked);
     out.clicks.fence();
 }
 
