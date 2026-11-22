@@ -522,11 +522,14 @@ pub fn stages(ctx: &Ctx, ingest: &Ingest, grow: u32, whole_clicks: bool, paralle
             dense: None,
         },
     });
-    // `SS_RECYCLE=on|off`: the buckets' lists written into the chunks of the parse's lists
-    // as the dedup has read them (`Chunks::give`), for buckets that are ranges of numbers.
-    // `off`: into fresh memory, and the parse's lists handed back to the kernel after the
-    // stage.
-    let recycle = dense.is_some() && types::env::pick("SS_RECYCLE", &["on", "off"]) == 0;
+    // `SS_RECYCLE=off|on`. `on`: the buckets' lists written into the chunks of the parse's
+    // lists as the dedup has read them (`Chunks::give`), for buckets that are ranges of
+    // numbers. `off`, the pick: into fresh memory, and the parse's lists handed back to the
+    // kernel after the stage. On 4 KB pages here `on` is 4% faster; on the scorer it was not
+    // (0.6122 s against 0.6076 without, one submission each). The likely reason: a list is
+    // written with streaming stores, and a chunk the task has just read is in its caches,
+    // which an Intel core has to empty of the line first.
+    let recycle = dense.is_some() && types::env::pick("SS_RECYCLE", &["off", "on"]) == 1;
     {
         let (parsed, persons) = (&parsed[..], &persons);
         // The clicks' tasks are taken first: each is a worker's whole list, as long as
