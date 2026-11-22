@@ -204,6 +204,127 @@ fn code2() -> u64 {
     ((kernel * 2 + u64::from(mitigated)) * 2 + u64::from(collapsed)) * 2 + u64::from(set_aside)
 }
 
+/// CRC-32 as zip and Python's `zlib.crc32` compute it, a bit at a time: it hashes two short
+/// names for `machine`.
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = !0u32;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    !crc
+}
+
+/// The size of each block of `machine`'s codes, in its order.
+const MACHINE_BLOCKS: [u64; 6] = [24, 108, 18, 24, 43, 72];
+
+/// `SS_PROBE=machine`: which machine it is, so that the same can be rented, in steps of
+/// 40 ms (the scorer's runs vary by 5 to 10 ms). The run sleeps 40 ms times one more than
+/// this number before it ends, so `(time - the usual time) / 0.04 s - 1`, rounded, is the
+/// number, and the usual time means the probe did not run. `scripts/decode_machine.py`
+/// reads it and names the instance types, sizes and CPUs that agree.
+///
+/// The facts, each read in a container as on the host:
+///
+/// - the vendor and the product, `/sys/class/dmi/id/sys_vendor` and `product_name` (AWS
+///   names the instance type there; Azure says `Virtual Machine` and GCP `Google Compute
+///   Engine`, so their sizes come from the CPUs and the memory);
+/// - `cpus`, the host's CPUs (`/sys/devices/system/cpu/present`, which a cgroup does not
+///   narrow): 6 classes, at most 8, 16, 24, 36, 48, more; 3 classes, at most 8, 36, more;
+/// - `memory`, `MemTotal` per host CPU: 0 under 3 GiB (or unreadable), 1 under 6, 2 more
+///   (2, 4 and 8 GiB a vCPU are the compute, general and memory families of every cloud);
+/// - `ghz`, the nominal clock in the CPU's name (`@ 3.00GHz`): 0 none, 1 under 2.45, 2 2.5,
+///   3 2.6, 4 2.7 to 2.8, 5 2.9, 6 3.0, 7 3.1, 8 3.2 to 3.4, 9 3.5 to 3.6, 10 3.7 to 3.8,
+///   11 3.9 and over;
+/// - `workstation`, a one-socket part (`Core(TM)` or `Xeon(R) W-` in its name): 1 yes;
+/// - `hypervisor`, the `hypervisor` CPU flag: 1 a virtual machine.
+///
+/// One block of numbers per kind of vendor, first to last (the lowest digit first):
+///
+/// - 0-23, the vendor unreadable (no DMI: WSL2, a microVM): `hypervisor + 2 * ghz`;
+/// - 24-131, `Amazon EC2`: `crc32(product) % 3 + 3 * (cpus6 + 6 * (memory + 3 * fast))`,
+///   `fast` 1 for a 3.7 to 3.8 GHz CPU (the 8252C of m5zn and x2iezn, the one AWS
+///   Cascade Lake that could be faster than our c5.12xlarge);
+/// - 132-149, `Microsoft` (Azure, Hyper-V): `cpus6 + 6 * memory`;
+/// - 150-173, `Google`: `cpus6 + 6 * kind`, `kind` 0 for 3.1 GHz (C2), else 1 + `memory`;
+/// - 174-216, any other vendor with the `hypervisor` flag (QEMU, Xen, VMware, a hosting
+///   company): `crc32(vendor) % 43`;
+/// - 217-288, any other vendor without it (bare metal): `cpus3 + 3 * (ghz + 12 *
+///   workstation)`.
+///
+/// At most 288: 11.56 s. Also returns what was read, for the log.
+fn machine() -> (u64, String) {
+    let text = |path: &str| read(path).map(|text| text.trim().to_owned()).unwrap_or_default();
+    let (vendor, product) = (text("/sys/class/dmi/id/sys_vendor"), text("/sys/class/dmi/id/product_name"));
+    let cpuinfo = read("/proc/cpuinfo").unwrap_or_default();
+    let field = |key: &str| cpuinfo.lines().find(|line| line.starts_with(key)).and_then(|line| line.split_once(':')).map(|(_, value)| value.trim().to_owned()).unwrap_or_default();
+    let model = field("model name");
+    let hypervisor = field("flags").split_whitespace().any(|flag| flag == "hypervisor");
+    let cpus: u64 = text("/sys/devices/system/cpu/present")
+        .split(',')
+        .filter_map(|range| {
+            let (first, last) = range.split_once('-').unwrap_or((range, range));
+            (last.trim().parse::<u64>().ok()? + 1).checked_sub(first.trim().parse().ok()?)
+        })
+        .sum();
+    let memory_kb: u64 = read("/proc/meminfo").unwrap_or_default().lines().find_map(|line| line.strip_prefix("MemTotal:")).and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok()).unwrap_or(0);
+    let centi_ghz = model.split_once('@').and_then(|(_, clock)| clock.trim().strip_suffix("GHz")).and_then(|ghz| ghz.trim().parse::<f64>().ok()).map_or(0, |ghz| (ghz * 100.0).round() as u64);
+    let cpus6 = match cpus {
+        ..=8 => 0,
+        ..=16 => 1,
+        ..=24 => 2,
+        ..=36 => 3,
+        ..=48 => 4,
+        _ => 5,
+    };
+    let cpus3 = match cpus {
+        ..=8 => 0,
+        ..=36 => 1,
+        _ => 2,
+    };
+    const GIB_KB: u64 = 1 << 20;
+    let memory = if cpus == 0 || memory_kb < 3 * GIB_KB * cpus {
+        0
+    } else if memory_kb < 6 * GIB_KB * cpus {
+        1
+    } else {
+        2
+    };
+    let ghz = match centi_ghz {
+        0 => 0,
+        ..245 => 1,
+        ..255 => 2,
+        ..265 => 3,
+        ..285 => 4,
+        ..295 => 5,
+        ..305 => 6,
+        ..315 => 7,
+        ..345 => 8,
+        ..365 => 9,
+        ..385 => 10,
+        _ => 11,
+    };
+    let workstation = u64::from(model.contains("Core(TM)") || model.contains("Xeon(R) W-"));
+    let (block, local) = if vendor.is_empty() {
+        (0, u64::from(hypervisor) + 2 * ghz)
+    } else if vendor.starts_with("Amazon") {
+        let fast = u64::from(ghz == 10);
+        (1, u64::from(crc32(product.as_bytes())) % 3 + 3 * (cpus6 + 6 * (memory + 3 * fast)))
+    } else if vendor.starts_with("Microsoft") {
+        (2, cpus6 + 6 * memory)
+    } else if vendor.starts_with("Google") {
+        (3, cpus6 + 6 * if ghz == 7 { 0 } else { 1 + memory })
+    } else if hypervisor {
+        (4, u64::from(crc32(vendor.as_bytes())) % 43)
+    } else {
+        (5, cpus3 + 3 * (ghz + 12 * workstation))
+    };
+    let code = MACHINE_BLOCKS[..block].iter().sum::<u64>() + local;
+    (code, format!("vendor {vendor:?}, product {product:?}, {cpus} cpus, MemTotal {memory_kb} kB, {model:?}, hypervisor {hypervisor}"))
+}
+
 impl Probe {
     /// `Some` when `SS_PROBE` is set. Call before the workers are started.
     pub fn start() -> Option<Probe> {
@@ -211,8 +332,8 @@ impl Probe {
         Some(Probe { vmstat: read("/proc/vmstat").unwrap_or_default(), stat: read("/proc/stat").unwrap_or_default(), allowed: types::par::pin::allowed(), started: Instant::now() })
     }
 
-    /// The report. `data` is the input folder. With `SS_PROBE=sleep`, the machine's number
-    /// (`code`) as a wait instead.
+    /// The report. `data` is the input folder. With `SS_PROBE=sleep`, `sleep2` or `machine`,
+    /// the machine's number (`code`, `code2`, `machine`) as a wait instead.
     pub fn finish(&self, data: &std::path::Path) {
         if std::env::var_os("SS_PROBE").is_some_and(|value| value == "sleep") {
             let code = code(&self.allowed);
@@ -224,6 +345,12 @@ impl Probe {
             let code = code2();
             eprintln!("probe: code2 {code}");
             std::thread::sleep(std::time::Duration::from_millis(200 * code));
+            return;
+        }
+        if std::env::var_os("SS_PROBE").is_some_and(|value| value == "machine") {
+            let (code, read) = machine();
+            eprintln!("probe: machine {code} ({read})");
+            std::thread::sleep(std::time::Duration::from_millis(40 * (code + 1)));
             return;
         }
         let mut out = String::new();
