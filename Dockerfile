@@ -71,5 +71,5 @@ WORKDIR /app
 #
 # The two set here are what scored best on the scorer: 0.6351 s without them, 0.6115 s
 # with them, 0.6076 s with the two parse and sessions commits that followed.
-ENV SS_RUN=1 SS_POPULATE=1024 SS_PART_BITS_OPAQUE=10
+ENV SS_RUN=1 SS_POPULATE=1024 SS_COLLAPSE=on SS_DECODE=lean SS_PART_BITS_OPAQUE=11 SS_CHUNK_KB=128 SS_TAIL=small SS_SESS_WIDTH=256 SS_ATTR_HEAVY=flat SS_RECYCLE=on SS_SLOW_TOK=mask SS_DEDUP_READ=40 SS_DEDUP_PROBE=tag SS_BUCKET_BITS=11
 CMD ["/app/shopping-sessions"]
